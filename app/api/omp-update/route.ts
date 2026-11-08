@@ -35,7 +35,7 @@ export async function POST(request: Request) {
     const keys = Object.keys(body);
     if (body.action === "check") {
       // selfUpdateSupported: whether "Update now" can run here (never in the compiled binary, lib/self-update.ts).
-      return Response.json({ ...await checkOmpUpdate(body.force === true), selfUpdateSupported: getSelfUpdateSupport().supported });
+      return Response.json({ ...await checkOmpUpdate(body.force === true), selfUpdateSupported: getSelfUpdateSupport(OMP_KIND).supported });
     }
     if (body.action === "restart" && keys.length === 1) {
       const sessionsRestarted = await restartAllRpcSessions();

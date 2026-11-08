@@ -20,7 +20,7 @@ import { dirname, join, posix, resolve, win32 } from "path";
 import { promisify } from "util";
 import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
 import { checkOmpUpdate } from "./omp/updates";
-import { DISABLE_AUTOUPDATE_ENV_VAR, isUpdateDisabled } from "./update-policy";
+import { DISABLE_AUTOUPDATE_ENV_VAR, getAppUpdateBlockedReason, isUpdateDisabled } from "./update-policy";
 
 const LEASE_MS = 30 * 60 * 1000;
 const TERMINAL_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
@@ -58,9 +58,10 @@ export class SelfUpdateError extends Error {
 
 type Kind = "app" | "omp";
 
-function assertUpdatesEnabled(): void {
-  if (!isUpdateDisabled()) return;
-  throw new SelfUpdateError("updates_disabled", `Updates are disabled by ${DISABLE_AUTOUPDATE_ENV_VAR}`, 403);
+function assertUpdatesEnabled(kind: Kind): void {
+  if (isUpdateDisabled()) throw new SelfUpdateError("updates_disabled", `Updates are disabled by ${DISABLE_AUTOUPDATE_ENV_VAR}`, 403);
+  const reason = kind === "app" ? getAppUpdateBlockedReason() : null;
+  if (reason) throw new SelfUpdateError("manual_update_required", reason, 403);
 }
 
 export function resolveSelfUpdateTempRoot(
@@ -344,11 +345,13 @@ async function detectSystemdService(launcherPid: number): Promise<SystemdService
   }
   return Number(stdout.trim()) === launcherPid ? service : null;
 }
-export function getSelfUpdateSupport(): { supported: boolean; reason?: string; packageDir: string } {
+export function getSelfUpdateSupport(kind: Kind = "app"): { supported: boolean; reason?: string; packageDir: string } {
   const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
   if (isUpdateDisabled()) {
     return { supported: false, reason: `Updates are disabled by ${DISABLE_AUTOUPDATE_ENV_VAR}`, packageDir };
   }
+  const reason = kind === "app" ? getAppUpdateBlockedReason() : null;
+  if (reason) return { supported: false, reason, packageDir };
   if (Bun.isStandaloneExecutable) return { supported: false, reason: "The ompweb binary updates by download", packageDir };
   // simplified: always supported if packageDir exists
   try {
@@ -366,7 +369,7 @@ function detectManager(packageDir: string): { manager: "npm" | "bun"; managerPat
 }
 
 export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResult> {
-  assertUpdatesEnabled();
+  assertUpdatesEnabled(kind);
   // The compiled binary has no npm install to replace and no runtime for the worker: its updates run from a terminal.
   if (Bun.isStandaloneExecutable) {
     throw new SelfUpdateError("self_update_unsupported", "In-app updates are not available in the ompweb binary: update from a terminal", 409);
@@ -428,7 +431,7 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
 }
 
 export function validateCommitSelfUpdate(attemptId: string, kind: Kind = "app"): "ready" | "replay" {
-  assertUpdatesEnabled();
+  assertUpdatesEnabled(kind);
   const status = readStateJson<StoredStatus>(statusPath(kind));
   if (!status || status.attemptId !== attemptId) throw new SelfUpdateError("attempt_not_found", "Update attempt not found", 404);
   if (status.state === "running") return "replay";
@@ -440,6 +443,7 @@ export function validateCommitSelfUpdate(attemptId: string, kind: Kind = "app"):
   return "ready";
 }
 export function markSelfUpdateStopping(attemptId: string, kind: Kind = "app"): void {
+  assertUpdatesEnabled(kind);
   const status = readStateJson<StoredStatus>(statusPath(kind));
   if (!status || status.attemptId !== attemptId) return;
   // The worker gets a full lease from here: a running attempt past it counts as lost.
@@ -453,6 +457,7 @@ export function markSelfUpdateStopping(attemptId: string, kind: Kind = "app"): v
 }
 
 export async function armSelfUpdateLauncher(attemptId: string, kind: Kind = "app"): Promise<void> {
+  assertUpdatesEnabled(kind);
   const armed = markerPath(attemptId, "armed.json", kind);
   atomicWrite(armed, JSON.stringify({ attemptId, armedAt: new Date().toISOString(), protocol: 1 }));
   // settle
@@ -460,7 +465,7 @@ export async function armSelfUpdateLauncher(attemptId: string, kind: Kind = "app
 }
 
 export async function commitSelfUpdate(attemptId: string, kind: Kind = "app"): Promise<{ accepted: true; attemptId: string }> {
-  assertUpdatesEnabled();
+  assertUpdatesEnabled(kind);
   const status = readStateJson<StoredStatus>(statusPath(kind));
   if (!status || status.attemptId !== attemptId) throw new SelfUpdateError("attempt_not_found", "Update attempt not found", 404);
   // write go marker

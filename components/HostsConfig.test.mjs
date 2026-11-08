@@ -142,6 +142,20 @@ async function showHosts(hosts) {
   return view;
 }
 
+test("fork host guidance offers source-only updates while keeping the OMP runtime action available", async (t) => {
+  const source = "https://github.com/nanogram/ompweb";
+  t.mock.method(globalThis, "fetch", async () => Response.json(updateInfo({
+    ompweb: software({ currentVersion: "0.6.0-nanogram.1", availableVersion: null, updateAvailable: false, canUpdate: false, blockedReason: "manual fork update", updatesDisabled: true, manualUpdateSource: source, updateCommand: source, installMethod: "npm", protocolVersion: null }),
+  })));
+  await showHosts([hostRow()]);
+  await screen.findByText(/Automatic application and daemon updates are disabled for the nanogram fork/);
+  screen.getByText("Current: 0.6.0-nanogram.1");
+  assert.equal(screen.queryByRole("button", { name: "Update ompweb host" }), null);
+  assert.equal(screen.getByRole("button", { name: "Update omp runtime" }).disabled, false);
+  assert.ok(screen.getByRole("link", { name: source }).href === source);
+});
+
+
 test("local host shows both installed versions and a blocked candidate with its server reason", async (t) => {
   const urls = [];
   t.mock.method(globalThis, "fetch", async (url) => {

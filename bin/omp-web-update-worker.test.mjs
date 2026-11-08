@@ -10,10 +10,12 @@ const WORKER = fileURLToPath(new URL("./omp-web-update-worker.js", import.meta.u
 const ATTEMPT = "11111111-2222-3333-4444-555555555555";
 
 // Runs the worker for a systemd unit with stub `systemctl` and `npm` on PATH.
-function runWorker(t, { npmExit = 0, startExit = 0, activeExit = 0 } = {}) {
+function runWorker(t, { npmExit = 0, startExit = 0, activeExit = 0, metadata = { repository: { url: "git+https://github.com/kahme247/ompweb.git" } }, expectedExit = 0, disabled = "0" } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "update-worker-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const log = join(dir, "calls.log");
+  writeFileSync(log, "");
+  if (metadata !== null) writeFileSync(join(dir, "package.json"), typeof metadata === "string" ? metadata : JSON.stringify(metadata));
   writeFileSync(join(dir, "systemctl"), `#!/bin/sh\necho "systemctl $*" >> "${log}"\n[ "$2" = start ] && exit ${startExit}\n[ "$2" = is-active ] && { echo failed; exit ${activeExit}; }\nexit 0\n`, { mode: 0o755 });
   writeFileSync(join(dir, "npm"), `#!/bin/sh\necho "npm $*" >> "${log}"\nexit ${npmExit}\n`, { mode: 0o755 });
   writeFileSync(join(dir, "status.json"), JSON.stringify({ attemptId: ATTEMPT, state: "running" }), { mode: 0o600 });
@@ -29,10 +31,10 @@ function runWorker(t, { npmExit = 0, startExit = 0, activeExit = 0 } = {}) {
     "--kind", "app",
     "--systemd-unit", "ompweb.service",
     "--systemd-user", "1",
-  ], { env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH}` }, timeout: 20000 });
-  assert.equal(result.status, 0, String(result.stderr));
+  ], { env: { ...process.env, OMP_WEB_DISABLE_AUTOUPDATE: disabled, PATH: `${dir}${delimiter}${process.env.PATH}` }, timeout: 20000 });
+  assert.equal(result.status, expectedExit, String(result.stderr));
   return {
-    calls: readFileSync(log, "utf8").trim().split("\n"),
+    calls: readFileSync(log, "utf8").trim().split("\n").filter(Boolean),
     status: JSON.parse(readFileSync(join(dir, "status.json"), "utf8")),
   };
 }
@@ -65,4 +67,28 @@ test("a new release that does not stay up fails the update", { skip: process.pla
   const { status } = runWorker(t, { activeExit: 3 });
   assert.equal(status.state, "failed");
   assert.match(status.error, /systemctl is-active ompweb\.service failed: failed/);
+});
+
+test("a detached fork worker fails before any package manager or service command", (t) => {
+  const { calls, status } = runWorker(t, { metadata: { name: "@kahme247/ompweb", version: "0.6.0-nanogram.1", repository: { url: "git+https://github.com/nanogram/ompweb.git" } }, expectedExit: 1 });
+  assert.deepEqual(calls, []);
+  assert.equal(status.state, "failed");
+  assert.equal(status.cleanupReady, true);
+  assert.match(status.error, /nanogram fork/);
+  assert.match(status.error, /https:\/\/github\.com\/nanogram\/ompweb/);
+});
+
+test("a detached worker cannot treat missing or unreadable repository metadata as upstream", (t) => {
+  for (const metadata of [null, "{", {}, { repository: "https://github.com/nanogram/ompweb" }]) {
+    const { calls, status } = runWorker(t, { metadata, expectedExit: 1 });
+    assert.deepEqual(calls, []);
+    assert.equal(status.state, "failed");
+    assert.match(status.error, /Cannot verify the local application repository/);
+  }
+});
+
+test("a detached worker preserves the generic update opt-out before stopping a unit", (t) => {
+  const { calls, status } = runWorker(t, { disabled: " yes ", expectedExit: 1 });
+  assert.deepEqual(calls, []);
+  assert.match(status.error, /OMP_WEB_DISABLE_AUTOUPDATE/);
 });

@@ -1,14 +1,14 @@
 {
   "name": "@kahme247/ompweb",
-  "version": "0.6.0",
+  "version": "0.6.0-nanogram.1",
   "description": "Web UI for the oh-my-pi (omp) coding agent",
-  "homepage": "https://github.com/kahme247/ompweb#readme",
+  "homepage": "https://github.com/nanogram/ompweb#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kahme247/ompweb.git"
+    "url": "git+https://github.com/nanogram/ompweb.git"
   },
   "bugs": {
-    "url": "https://github.com/kahme247/ompweb/issues"
+    "url": "https://github.com/nanogram/ompweb/issues"
   },
   "license": "MIT",
   "engines": {

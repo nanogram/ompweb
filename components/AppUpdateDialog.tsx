@@ -124,6 +124,8 @@ export interface AppUpdateInfo {
   updateCommand?: string;
   selfUpdateSupported?: boolean;
   updatesDisabled?: boolean;
+  blockedReason?: string;
+  manualUpdateSource?: string;
   selfUpdateStatus?: {
     attemptId: string;
     state: string;

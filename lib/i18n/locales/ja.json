@@ -1989,5 +1989,8 @@
   "errors.invalid_run_boundary": "ホストが無効な会話履歴境界を返しました。",
   "errors.invalid_model": "有効なプロバイダーとモデルを選択してください。",
   "errors.invalid_thinking_level": "有効な思考レベルを選択してください。",
+  "sessionSidebar.showAppName": "ompweb の名前を表示",
+  "sessionSidebar.showAppVersion": "ompweb のバージョンを表示",
+  "settingsConfig.forkUpdatesManual": "nanogram フォークではアプリとデーモンの自動更新は無効です。フォークのソースから手動で更新してください。",
   "errors.prompt_boundary_unavailable": "プロンプトは実行された可能性がありますが、履歴境界が返されませんでした。再送信する前にセッションを開き直してください。"
 }

@@ -1,12 +1,12 @@
 import { isIP } from "node:net";
 
-const DEFAULT_NAME = "omp web";
+const DEFAULT_NAME = "omp web · nanogram";
 // OMP_WEB_NAME values (case-insensitive) that derive the name from the request.
 const FROM_REQUEST = ["url", "host", "domain"];
 
 /**
  * Display-only label shared by installation metadata and browser titles.
- * `OMP_WEB_NAME` decides it: unset or blank keeps `omp web`; `url`, `host` or
+ * `OMP_WEB_NAME` decides it: unset or blank keeps `omp web · nanogram`; `url`, `host` or
  * `domain` derives it from the request's Host header; anything else is used
  * verbatim.
  */

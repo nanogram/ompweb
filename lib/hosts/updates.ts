@@ -8,7 +8,7 @@ import packageJson from "../../package.json";
 import { checkNpmUpdate, detectInstallMethod, isNewerVersion } from "../npm-update";
 import { checkOmpUpdate, runOmpUpdate } from "../omp/updates";
 import { createChildProcessEnvironment } from "../project-command-env";
-import { isUpdateDisabled } from "../update-policy";
+import { APP_UPDATE_SOURCE_URL, getAppUpdateBlockedReason, isUpdateDisabled } from "../update-policy";
 import { parseSystemdServiceCgroup } from "../self-update";
 import type { HostSoftwareUpdate, HostUpdateCompatibility, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
 import { assertOwnedPath, ensureHostUpdateRoot, fetchHostUpdateBytes, finishHostUpdate, HOST_VERSION_PATTERN, hostReleaseName, hostUpdateRoot, installedHostVersionMatches, isHostUpdateProcessAlive, processStartIdentity, pruneHostUpdateArtifacts, readHostUpdateState, sharedHostInstallReason, verifyHostServiceInstall, writeHostUpdateJson, type HostUpdateDescriptor } from "./update-worker";
@@ -209,11 +209,13 @@ export async function checkHostUpdates(compatibility: HostUpdateCompatibility, f
   const npm = npmResult.status === "fulfilled" ? npmResult.value : null;
   const omp = ompResult.status === "fulfilled" ? ompResult.value : null;
   const installMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(installDirectory());
-  const ompweb: HostUpdateInfo["ompweb"] = { ...base, ...npm, currentVersion: packageJson.version, installMethod, protocolVersion: null, updateCommand: installMethod === "binary" ? "https://github.com/kahme247/ompweb/releases/latest" : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb" };
+  const appBlockedReason = getAppUpdateBlockedReason();
+  const ompweb: HostUpdateInfo["ompweb"] = { ...base, ...npm, currentVersion: packageJson.version, installMethod, protocolVersion: null, updateCommand: appBlockedReason ? APP_UPDATE_SOURCE_URL : npm?.updateCommand ?? "", blockedReason: appBlockedReason, updatesDisabled: Boolean(appBlockedReason) };
   const runtime: HostUpdateInfo["omp"] = { ...base, ...omp, updateCommand: "omp update", updatesDisabled: Boolean(disabled) };
   if (disabled) ompweb.blockedReason = runtime.blockedReason = disabled;
   else {
-    if (!npm || !npm.availableVersion || !HOST_VERSION_PATTERN.test(npm.availableVersion)) ompweb.blockedReason = "Could not check the host's ompweb update version";
+    if (appBlockedReason) ompweb.blockedReason = appBlockedReason;
+    else if (!npm || !npm.availableVersion || !HOST_VERSION_PATTERN.test(npm.availableVersion)) ompweb.blockedReason = "Could not check the host's ompweb update version";
     else if (npm.updateAvailable) {
       ompweb.protocolVersion = await candidateProtocol(npm.availableVersion, force);
       if (ompweb.protocolVersion === null) ompweb.blockedReason = "The candidate's daemon link protocol could not be verified; update is blocked";
@@ -267,6 +269,8 @@ export async function startHostUpdate(target: HostUpdateTarget, version: string,
   if (target !== "ompweb" && target !== "omp") throw new HostUpdateError("invalid_target", "Invalid host software target", 400);
   if (typeof version !== "string" || version.length > 100 || !HOST_VERSION_PATTERN.test(version)) throw new HostUpdateError("invalid_version", "Invalid host update version", 400);
   if (isUpdateDisabled()) throw new HostUpdateError("updates_disabled", "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE", 403);
+  const appBlockedReason = target === "ompweb" ? getAppUpdateBlockedReason() : null;
+  if (appBlockedReason) throw new HostUpdateError("manual_update_required", appBlockedReason, 403);
   const id = randomUUID();
   const root = claimUpdate(id);
   let claimed = false;

@@ -28,7 +28,7 @@ export interface HostUpdateOperation {
 }
 
 export interface HostUpdateInfo {
-  ompweb: HostSoftwareUpdate & Pick<NpmUpdateStatus, "installMethod"> & { protocolVersion: number | null };
+  ompweb: HostSoftwareUpdate & Pick<NpmUpdateStatus, "installMethod" | "updatesDisabled" | "manualUpdateSource"> & { protocolVersion: number | null };
   omp: HostSoftwareUpdate & Pick<OmpUpdateStatus, "updatesDisabled">;
   operation: HostUpdateOperation | null;
 }

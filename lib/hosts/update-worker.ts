@@ -493,7 +493,10 @@ function validateDescriptor(path: string): HostUpdateDescriptor {
     if (!existsSync(join(d.installDir, process.platform === "win32" ? "ompweb.exe" : "ompweb")) || !existsSync(join(d.installDir, "dist", "index.html")) || !existsSync(join(d.installDir, "lib", "omp", "session-edit-extension.mjs"))) throw new Error("Incomplete host binary release layout");
   } else {
     if (basename(d.installDir) !== "ompweb" || basename(dirname(d.installDir)) !== "@kahme247" || basename(dirname(dirname(d.installDir))) !== "node_modules") throw new Error("Package updates require an installed npm/bun package layout");
-    const current = JSON.parse(readFileSync(join(d.installDir, "package.json"), "utf8"));
+    let current;
+    try { current = JSON.parse(readFileSync(join(d.installDir, "package.json"), "utf8")); }
+    catch { throw new Error("Cannot verify the local application repository; automatic updates are blocked. Update manually from https://github.com/nanogram/ompweb."); }
+    if (!current || typeof current !== "object") throw new Error("Cannot verify the local application repository; automatic updates are blocked. Update manually from https://github.com/nanogram/ompweb.");
     if (current.name !== "@kahme247/ompweb" || (!d.restartOnly && current.version !== d.fromVersion)) throw new Error("Host install changed since this update was requested");
   }
   return d;
@@ -507,10 +510,17 @@ export async function runHostUpdateWorker(path: string): Promise<number> {
   let stagingCreated = false;
   try {
     d = validateDescriptor(path);
+    // Copied workers cannot import the server policy. Fail closed on local
+    // metadata before staging a package/binary, controlling services or signalling.
+    if (["1", "true", "yes", "on"].includes((process.env.OMP_WEB_DISABLE_AUTOUPDATE || "").trim().toLowerCase())) throw new Error("Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE");
+    let current: { repository?: { url?: unknown } };
+    try { current = JSON.parse(readFileSync(join(d.installDir, "package.json"), "utf8")); }
+    catch { throw new Error("Cannot verify the local application repository; automatic updates are blocked. Update manually from https://github.com/nanogram/ompweb."); }
+    if (!current || typeof current.repository?.url !== "string") throw new Error("Cannot verify the local application repository; automatic updates are blocked. Update manually from https://github.com/nanogram/ompweb.");
+    if (current.repository.url !== "git+https://github.com/kahme247/ompweb.git") throw new Error("Automatic application and daemon updates are disabled for the nanogram fork. Update manually from https://github.com/nanogram/ompweb.");
     const workerLease = join(dirname(path), "worker.lock");
     try { writeFileSync(workerLease, String(process.pid), { flag: "wx", mode: 0o600 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return 1; throw error; }
-    if (["1", "true", "yes", "on"].includes((process.env.OMP_WEB_DISABLE_AUTOUPDATE || "").trim().toLowerCase())) throw new Error("Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE");
     const restartCandidateMissing = "The shared installation no longer contains the requested ompweb version; refresh the host updates";
     if (d.restartOnly && !(await installedHostVersionMatches(d.installMethod, d.installDir, d.version))) throw new Error(restartCandidateMissing);
     const state = readHostUpdateState()!;

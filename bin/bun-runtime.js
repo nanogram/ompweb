@@ -2,13 +2,12 @@
 
 // getBuiltinModule: the lint config forbids require(), and bin/ files may not add eslint-disable comments.
 const { spawnSync } = process.getBuiltinModule("node:child_process");
-const { existsSync, statSync } = process.getBuiltinModule("node:fs");
+const { existsSync, readFileSync, statSync } = process.getBuiltinModule("node:fs");
 const path = process.getBuiltinModule("node:path");
 
 const MIN_BUN_VERSION = "1.4.4";
 // The postinstall replaces bin/bun.exe (a 450-byte placeholder) with the real ~100 MB binary.
 const PLACEHOLDER_LIMIT = 1024 * 1024;
-const REINSTALL = "npm install -g @kahme247/ompweb";
 // bun@1.4.4's optionalDependencies, by `${process.platform}-${process.arch}` (Android uses the linux-*-android builds).
 const PLATFORM_PACKAGES = {
   "darwin-arm64": ["@oven/bun-darwin-aarch64"],
@@ -71,7 +70,13 @@ function resolveBunBinary(packageDir, env = process.env) {
   if (onPath && versionAtLeast(onPath, MIN_BUN_VERSION)) return "bun";
 
   const found = onPath ? ` (bun ${onPath} on PATH is older than ${MIN_BUN_VERSION})` : "";
-  throw new Error(`Bun runtime not found${found}. Reinstall ompweb with: ${REINSTALL}`);
+  let upstream = false;
+  try {
+    const metadata = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
+    upstream = metadata?.repository?.url === "git+https://github.com/kahme247/ompweb.git";
+  } catch { /* Missing release identity must never recommend installing upstream. */ }
+  const repair = upstream ? "Reinstall ompweb with: npm install -g @kahme247/ompweb" : "Repair this local fork build from https://github.com/nanogram/ompweb (install its pinned dependencies with lifecycle scripts enabled), or provide a compatible Bun on PATH. Do not reinstall the upstream npm package over the fork.";
+  throw new Error(`Bun runtime not found${found}. ${repair}`);
 }
 
 module.exports = { MIN_BUN_VERSION, PLATFORM_PACKAGES, resolveBunBinary };

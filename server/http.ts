@@ -136,8 +136,8 @@ export function renderIndex(html: string, request: Request): string {
   // manifestHref only lets a 6-digit hex color through, so the href needs no escaping.
   const manifest = manifestHref(new Bun.CookieMap(request.headers.get("cookie") ?? "").get(THEME_COLOR_COOKIE));
   return html
-    .replace("<title>omp web</title>", () => `<title>${name}</title>`)
-    .replace('<meta name="apple-mobile-web-app-title" content="omp web"', () => `<meta name="apple-mobile-web-app-title" content="${name}"`)
+    .replace("<title>omp web · nanogram</title>", () => `<title>${name}</title>`)
+    .replace('<meta name="apple-mobile-web-app-title" content="omp web · nanogram"', () => `<meta name="apple-mobile-web-app-title" content="${name}"`)
     .replace("</head>", () => `<link rel="manifest" href="${manifest}" crossorigin="use-credentials"></head>`);
 }
 

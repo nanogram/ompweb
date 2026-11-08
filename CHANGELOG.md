@@ -8,6 +8,8 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Added
 
+- **Distinct nanogram fork identity.** Version `0.6.0-nanogram.1`, a persistent sidebar badge, a version popup available without Git metadata, and the default browser/PWA name `omp web · nanogram`. Existing explicit app names, URLs, storage and install scopes are unchanged.
+- **Fork-safe manual application updates.** Settings and host controls link `nanogram/ompweb`; application/daemon update discovery, mutation routes and detached workers cannot install upstream packages over the fork. Independent OMP runtime updates remain available. macOS service installation defaults to the current local fork build.
 - **Outcome-aware session status.** Errors and exhausted usage show red, pending questions show a static amber question mark, and green marks only successful completions not yet viewed. Folder status follows descendant error → question → unread completion priority without an idle/running status decoration.
 - **Optional last-chat startup.** Reopen this browser's last-viewed chat in new tabs or on reload, preserving its host. Explicit chat/workspace links win, and temporary offline failures do not erase the saved destination.
 - **Progressive large-session history.** Initial chat loads use the newest 50 messages and a soft 256 KiB page budget, with older-page prepend and deferred thinking/media. Normal display reads retain the latest 128 MiB without deleting canonical history or shrinking OMP's model context. A bounded display-only IndexedDB cache paints recent messages while authoritative HTTP revalidates.
@@ -43,6 +45,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Fixes & Improvements
 
+- **Windows native tray starts the Bun application.** Production launches the fork's Node entry point and detects `dist/index.html`; development uses the existing Bun runtime resolver with hot reload. Argument boundaries and custom config/log paths are preserved. The bundled tray executable is rebuilt from this source.
 - **Fresh sends no longer depend on the viewer staying active.** The server owns the first prompt alongside startup, coalesces matching creation keys and attaches uploads through the owning host. Pre-created sessions hand off before observation/model/history waits; captured run boundaries use the shared HTTP/WebSocket response.
 - **History remains responsive and safe across changes.** Metadata-first cooperative indexing reuses verified append prefixes, bounds retained caches and negotiates history gzip asynchronously. Owning-host list refreshes no longer cancel otherwise valid history reads with HTTP 500; explicit edit/delete invalidation stays strict.
 - **Mobile loading and storage recovery.** Failed initial lists show an actionable error even with the sidebar closed, and foreground/online retries recover. Blocked browser storage cannot crash sound preference initialization; cached transcripts never authorize sends before revalidation.

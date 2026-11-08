@@ -1,17 +1,26 @@
-# ompweb
+# ompweb · nanogram
 
-[![npm version](https://img.shields.io/npm/v/@kahme247/ompweb.svg?logo=npm&color=e05d44)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![node version](https://img.shields.io/node/v/@kahme247/ompweb.svg?logo=node.js&color=44cc11)](https://nodejs.org)
-[![license](https://img.shields.io/github/license/kahme247/ompweb.svg?color=44cc11)](./LICENSE)
-[![npm downloads](https://img.shields.io/npm/dm/@kahme247/ompweb.svg?color=44cc11)](https://www.npmjs.com/package/@kahme247/ompweb)
-[![GitHub stars](https://img.shields.io/github/stars/kahme247/ompweb.svg?logo=github)](https://github.com/kahme247/ompweb/stargazers)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/kahme247/ompweb/pulls)
+[![node version](https://img.shields.io/badge/node-%3E%3D24-44cc11?logo=node.js)](https://nodejs.org)
+[![license](https://img.shields.io/github/license/nanogram/ompweb.svg?color=44cc11)](./LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/nanogram/ompweb.svg?logo=github)](https://github.com/nanogram/ompweb/stargazers)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/nanogram/ompweb/pulls)
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
 Community: [Join the OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 
 A clean, modern web UI for the [oh-my-pi (omp)](https://github.com/can1357/oh-my-pi) coding agent. It reads your local omp sessions and gives you a browser workspace to chat with the agent, browse projects, manage settings, and preview files.
+
+This is the [nanogram fork](https://github.com/nanogram/ompweb) of
+[kahme247/ompweb](https://github.com/kahme247/ompweb), version
+`0.6.0-nanogram.1`. The sidebar badge, version popup, browser title and default
+installed-app name identify the fork. An explicit `OMP_WEB_NAME` still wins.
+The npm name `@kahme247/ompweb` is retained for compatibility, but its registry
+releases are upstream builds, **not this fork**.
+
+Automatic application and daemon updates are disabled so an upstream package
+cannot replace these patches. Settings links the fork source for manual updates;
+OMP runtime updates remain independent and available.
 
 ![ompweb — live session demo](docs/demo.gif)
 
@@ -146,27 +155,40 @@ push permission, so they can remain visible until opened or dismissed.
 
 ## Quick Start
 
-**Run directly without installing:**
+Build and run the fork from its source checkout (the commands below run from
+that directory):
 
 ```bash
-npx @kahme247/ompweb@latest
+git clone https://github.com/nanogram/ompweb.git
+cd ompweb
+npm ci
+npm run build
+node bin/omp-web.js --no-open
 ```
 
-or
+In a second terminal, from the same checkout:
+
 ```bash
-nix run github:kahme247/ompweb
+node bin/omp-web.js host
 ```
 
-**Or install globally:**
-
-```bash
-npm install -g @kahme247/ompweb
-ompweb
-```
-
-**Or download the single binary** (no Node or npm): see [Single binary](#single-binary).
+Keep that checkout in place while services use it. Do not use
+`npx @kahme247/ompweb@latest` or an upstream release to install/update this fork.
+For a compiled fork build, see [Single binary](#single-binary).
 
 Open [http://127.0.0.1:30177](http://127.0.0.1:30177) in your browser.
+
+**Migrating an older Next.js installation:** pushing GitHub does not change an
+installed tray or service. An old web server owns its OMP children directly;
+its first shutdown interrupts them, and the new daemon cannot adopt those
+processes. Wait until those runs are finished before replacing the installation.
+After the fork's separate daemon owns sessions, restarting only the web server
+does not stop them. Never restart the daemon to refresh just the web UI.
+
+Before the first upgraded web/daemon start, explicitly choose upload retention.
+Set `"uploadRetentionDays": null` in the server's `omp-web-settings.json` to
+retain existing sent uploads rather than applying the 30-day default. Preserve
+any retention policy you already selected. Canonical chat histories are separate.
 
 ### CLI Options
 
@@ -239,10 +261,9 @@ linked to the web server over loopback. The service installers (`ompweb systemd 
 `ompweb launchd install`, `ompweb --install-tray`) install both: the web
 service and `ompweb-host`. Uninstall removes both.
 
-**Running ompweb in the foreground** (`ompweb` in a terminal, or `npx
-@kahme247/ompweb@latest`) installs no service, so nothing runs the daemon: keep
-`ompweb host` (with npx: `npx @kahme247/ompweb@latest host`) running in a
-second terminal. Without it "This machine" stays offline. The web server writes
+**Running from source** (`node bin/omp-web.js`) installs no service: keep
+`node bin/omp-web.js host` running in a second terminal.
+Without it "This machine" stays offline. The web server writes
 the daemon's link when it starts, so start the web server first.
 
 - **Restarting or redeploying the web server does not interrupt runs.** The daemon
@@ -265,15 +286,15 @@ the daemon's link when it starts, so start the web server first.
 
 ### Single binary
 
-Each [release](https://github.com/kahme247/ompweb/releases/latest) also ships
-ompweb as one compiled program with the files it serves beside it:
-`ompweb-linux-x64.tar.gz`, `ompweb-linux-arm64.tar.gz`, `ompweb-darwin-x64.tar.gz`,
-`ompweb-darwin-arm64.tar.gz` and `ompweb-windows-x64.zip`. It needs no Node, npm
-or Bun; only omp must be installed. The x64 builds use Bun's baseline runtime, so
-they also run on CPUs without AVX2. Each archive carries the licenses of what it
-bundles in `licenses/`. Every commit on `main` that passes CI is also published as a
-[prerelease](https://github.com/kahme247/ompweb/releases) named after the time it was
-built (for example `2026-11-01T10:30:00Z`), with the same five archives.
+Build this fork with `npm run build:binary` (or pass
+`-- --target bun-<os>-<arch>` for another supported platform). The output is one
+compiled program with its web files beside it, packaged as
+`ompweb-linux-x64.tar.gz`, `ompweb-linux-arm64.tar.gz`,
+`ompweb-darwin-x64.tar.gz`, `ompweb-darwin-arm64.tar.gz` or
+`ompweb-windows-x64.zip`. These need no Node, npm or Bun; only omp must be
+installed. The x64 builds use Bun's baseline runtime for CPUs without AVX2.
+Each archive includes its dependency licenses in `licenses/`.
+Upstream release downloads do not contain this fork's patches.
 
 ```bash
 tar -xzf ompweb-linux-x64.tar.gz -C ~/.local/share   # unpacks ompweb-linux-x64/
@@ -291,9 +312,9 @@ tar -xzf ompweb-linux-x64.tar.gz -C ~/.local/share   # unpacks ompweb-linux-x64/
   `curl` reaches it, allow your terminal (or `ompweb`) under System Settings →
   Privacy & Security → Local Network. A server reached over a VPN such as
   Tailscale, or a host started from an SSH session, is not affected.
-- **No tray, service installers or in-app update.** To update, stop `ompweb` and
-  `ompweb host`, replace the directory with the new release, and start both again;
-  **Settings → System** links the release page when a new version is out.
+- **No tray, service installers or in-app update.** To update, wait for daemon
+  sessions to finish, stop both processes, replace the fork build directory and
+  start both again. Settings links the fork source for manual updates.
   Your sessions and settings live in `~/.omp`, not in that directory.
 - **As systemd user services**, write the two units yourself (adjust the paths;
   add omp's directory to `PATH`, or set `OMP_WEB_OMP_BIN`):
@@ -366,25 +387,26 @@ Shortcuts are created on the Desktop and Start Menu. The service restarts automa
 Install ompweb as a launchd user agent that starts at login and restarts on crash:
 
 ```bash
-npx --yes @kahme247/ompweb@latest ompweb-launchd install
+node bin/omp-web-launchd.js install
 ```
 
 Manage it with:
 
 ```bash
-npx --yes @kahme247/ompweb@latest ompweb-launchd status      # Show service state
-npx --yes @kahme247/ompweb@latest ompweb-launchd uninstall   # Stop and remove
+node bin/omp-web-launchd.js status      # Show service state
+node bin/omp-web-launchd.js uninstall   # Stop and remove
 ```
 
-The service runs `npx --yes @kahme247/ompweb@latest`; pass a package spec to pin a
-version, e.g. `ompweb-launchd install @kahme247/ompweb@0.3.6`. All
-[environment variables](#environment-variables) are read at install time and baked
-into the plist, plus `OMP_WEB_PKG` (package spec, same as the positional argument).
+The fork's default service target is this local build, not an upstream npm
+package. Keep the checkout in place. All
+[environment variables](#environment-variables) are read at install time and
+baked into the plist; `OMP_WEB_PKG` or a positional argument can explicitly
+select another package target.
 As a service, the browser is **not** auto-opened by default — install with
 `OMP_WEB_NO_OPEN=0` to restore that.
 
 ```bash
-OMP_WEB_PASSWORD=secret npx --yes @kahme247/ompweb@latest ompweb-launchd install
+OMP_WEB_PASSWORD=secret node bin/omp-web-launchd.js install
 ```
 
 `OMP_WEB_PASSWORD` is hashed at install time; the plist holds the hash, never
@@ -409,18 +431,17 @@ Install ompweb as a systemd **user** service that starts at login and restarts
 on crash:
 
 ```bash
-npx --yes --package=@kahme247/ompweb@latest ompweb-systemd install
+node bin/omp-web-systemd.js install
 ```
 The installer creates `~/.omp/agent/web-service.env` automatically with mode
-`600`; no manual file creation is required. The explicit `--package` form makes
-`npx` run the systemd executable from the selected package.
+`600`; no manual file creation is required.
 
 To bind the service to all IPv4 interfaces for LAN access, set a password while
 installing:
 
 ```bash
 OMP_WEB_HOSTNAME=0.0.0.0 OMP_WEB_PASSWORD='change-me' \
-  npx --yes --package=@kahme247/ompweb@latest ompweb-systemd install
+  node bin/omp-web-systemd.js install
 ```
 
 The password is hashed before it is written to `web-service.env`.
@@ -428,9 +449,9 @@ The password is hashed before it is written to `web-service.env`.
 Manage it with:
 
 ```bash
-npx --yes --package=@kahme247/ompweb@latest ompweb-systemd status    # Show service state
-npx --yes --package=@kahme247/ompweb@latest ompweb-systemd restart   # start / stop / restart
-npx --yes --package=@kahme247/ompweb@latest ompweb-systemd uninstall # Stop and remove
+node bin/omp-web-systemd.js status    # Show service state
+node bin/omp-web-systemd.js restart   # start / stop / restart
+node bin/omp-web-systemd.js uninstall # Stop and remove
 ```
 
 The service runs the locally installed `ompweb` binary resolved at install time
@@ -464,9 +485,9 @@ view logs, expose the web UI to the network, change the port, set the web
 password, toggle autostart, and quit the tray.
 
 ```bash
-npx --yes @kahme247/ompweb@latest ompweb-tray --install      # Icons + autostart + start tray
-npx --yes @kahme247/ompweb@latest ompweb-tray --status       # Tray and service status
-npx --yes @kahme247/ompweb@latest ompweb-tray --uninstall    # Remove autostart, stop tray
+node bin/omp-web-tray.js --install      # Icons + autostart + start tray
+node bin/omp-web-tray.js --status       # Tray and service status
+node bin/omp-web-tray.js --uninstall    # Remove autostart, stop tray
 ```
 
 **Expose to Network** rebinds the service from `127.0.0.1` to `0.0.0.0` so the
@@ -485,7 +506,7 @@ host (KDE Plasma, and most Wayland/X11 desktops).
 
 One ompweb can start and watch omp sessions on other machines. Each machine keeps
 its own `omp` install, `~/.omp/agent` directory, sessions, and credentials;
-ompweb only routes. The remote machine needs `omp` and either Node 24 (for `npx`) or
+ompweb only routes. The remote machine needs `omp` and either Node 24 with a fork checkout or
 the [single binary](#single-binary), and must be able to reach the ompweb server over
 HTTP(S). It dials out, so it can sit behind NAT.
 
@@ -495,7 +516,7 @@ HTTP(S). It dials out, so it can sit behind NAT.
    an argument, so it does not show up in `ps`:
 
    ```bash
-   npx @kahme247/ompweb@latest host login --url https://your-ompweb.example.com
+   node bin/omp-web.js host login --url https://your-ompweb.example.com
    ```
 
    Paste the token when prompted (or pipe it in). It is saved to
@@ -503,45 +524,31 @@ HTTP(S). It dials out, so it can sit behind NAT.
 3. Start the link and leave it running:
 
    ```bash
-   npx @kahme247/ompweb@latest host
+   node bin/omp-web.js host
    ```
 
    The host shows **online** in Settings → Hosts, the sidebar gets a group for it,
    and the new-session screen gets a host picker.
 
-**Settings → Hosts** also shows each machine's ompweb daemon and OMP runtime
-versions, available updates and update actions, including **This machine**.
-Checks and installations run on the selected host, not on the web server. A host
-update whose link protocol is incompatible with the current web app stays visible
-but is blocked with a reason; update the web server first. An unverifiable target
-protocol is blocked too. OMP updates are independent of the link protocol.
-Before updating a daemon, close its session processes: the updater refuses to
-interrupt sessions or subagents. Updating OMP leaves existing processes on their
-loaded version until they restart. **Settings → System** keeps the web server's
-own application update and service settings.
-Hosts need a daemon build that supports these update operations; older builds
-show an unsupported message and need one manual update first. If the daemon
-shares its installation with the web server, update the server first, then use
-the host's restart-only update. Unsupported service wrappers and detected restart
-scripts show a manual-update reason. Stop external restart loops before updating
-a foreground daemon.
+**Settings → Hosts** shows the daemon and OMP runtime versions for each machine,
+including **This machine**. This fork disables automatic daemon installation
+and links its source for manual updates; application updates follow the same
+policy in **Settings → System**. OMP checks and updates still run independently
+on the selected host. Existing OMP processes keep their loaded runtime until
+they restart.
 
-A daemon update is carried out by a separate updater process on the host. It
-stops the daemon, swaps in the new release and starts it again, and on a failure
-it restores the previous release. If that updater is itself killed after stopping
-the daemon (a reboot, an out-of-memory kill), nothing restarts the host, which
-stays offline. Recover on the host: in the folder containing the installation,
-`.ompweb-backup-<id>` is the previous release. If it is there, move the
-installation aside and rename the backup back to the installation's name; then
-start `ompweb host` (or its service) again. Settings → Hosts reports the update
-as interrupted.
+Update fork web servers before their daemons so link protocol versions remain
+compatible. Wait until a daemon has no active sessions or subagents before
+stopping it for a manual upgrade; stop external restart loops too. If the web
+server and daemon share one installation, coordinate both against the same fork
+build. Never replace the directory while either process is still using it.
 
 `https://` is required. Plain `http://` is accepted only for loopback addresses, or
 with `--allow-http` (for example on a tailnet):
 
 ```bash
-npx @kahme247/ompweb@latest host login --url http://100.64.0.1:30177
-npx @kahme247/ompweb@latest host --allow-http
+node bin/omp-web.js host login --url http://100.64.0.1:30177
+node bin/omp-web.js host --allow-http
 ```
 
 If the connection drops, the daemon reconnects by itself (1 s backoff doubling to
@@ -610,7 +617,7 @@ These run the [single binary](#single-binary) in host mode. On Linux and Windows
 service keeps the link up across logouts and reboots; on macOS a script keeps it
 running in a terminal (see below for why). Unpack the release for the machine first,
 then save the link once with `ompweb host login --url …` as in step 2 (with the
-binary's path in place of `npx @kahme247/ompweb@latest`). Each setup starts
+binary's path in place of `node bin/omp-web.js`). Each setup starts
 `ompweb host` again 10 seconds after it fails, but not after exit 0: that means a
 newer link with the same token replaced it, and restarting would take the link back
 every 10 seconds. Add `--allow-http` after `host` if
@@ -745,8 +752,8 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 | `OMP_WEB_PASSWORD_HASH` | Optional scrypt hash of the web login password, from `ompweb hash-password`. Required for a non-loopback bind | _None (auth disabled)_ |
 | `OMP_WEB_TRUSTED_HEADER_SHA256` | SHA-256 hex digest of the secret a trusted reverse proxy sends in `X-Omp-Web-Auth` to skip the password for that request; see [Skipping the password on trusted networks](#skipping-the-password-on-trusted-networks) | _None (disabled)_ |
 | `OMP_WEB_NO_OPEN` | Set to `1` to prevent auto-opening browser | `0` |
-| `OMP_WEB_DISABLE_AUTOUPDATE` | Set to `1` to disable update checks and in-app updates; restart after changing | `0` |
-| `OMP_WEB_NAME` | Name shown in browser tabs and installed-app names. `url`, `host` or `domain` (any case) uses the hostname the browser connected to, without port; localhost and IP addresses keep `omp web`. Any other value is used as-is. Restart after changing | `omp web` |
+| `OMP_WEB_DISABLE_AUTOUPDATE` | Set to `1` to disable OMP runtime checks and updates too; fork application/daemon updates are always manual. Restart after changing | `0` |
+| `OMP_WEB_NAME` | Name shown in browser tabs and installed-app names. `url`, `host` or `domain` (any case) uses the connected hostname without its port; localhost and IP addresses keep the default fork name. Any other value is used as-is. Restart after changing | `omp web · nanogram` |
 | `OMP_WEB_OMP_BIN` | Path to `omp` binary if not on `PATH` | _auto-detected_ |
 | `PI_CODING_AGENT_DIR` | Custom omp agent directory | `~/.omp/agent` |
 | `OMP_WEB_STT_ENDPOINT` | OpenAI-compatible transcription endpoint URL. Leave unset to transcribe with `OMP_WEB_STT_MODEL` through omp's own credentials | _None_ |
@@ -867,9 +874,9 @@ addresses you list in `set_real_ip_from`:
 ## Development
 
 ```bash
-git clone https://github.com/kahme247/ompweb.git
+git clone https://github.com/nanogram/ompweb.git
 cd ompweb
-npm install
+npm ci
 npm run dev
 ```
 

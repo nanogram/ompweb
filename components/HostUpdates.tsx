@@ -185,7 +185,12 @@ export function HostUpdates({ host }: { host: HostRow }) {
               <div style={{ marginTop: 3, fontFamily: "var(--font-mono)" }}>{t("hostUpdates.current", { version: software?.currentVersion ?? (target === "omp" ? host.ompVersion : host.ompwebVersion) ?? t("hostUpdates.unknown") })}</div>
               {software?.updateAvailable && software.availableVersion && <div style={{ color: "var(--accent)" }}>{t("hostUpdates.available", { version: software.availableVersion })}</div>}
               {software?.currentVersion && !software.updateAvailable && !software.blockedReason && !error && !busy && !unavailableReason && <div>{t("hostUpdates.upToDate")}</div>}
-              {software?.blockedReason && <div style={{ marginTop: 3, color: "var(--status-warning)" }}>{t("hostUpdates.blocked", { reason: software.blockedReason })}</div>}
+              {target === "ompweb" && info?.ompweb.manualUpdateSource ? (
+                <div style={{ marginTop: 3, color: "var(--status-warning)" }}>
+                  <div>{t("settingsConfig.forkUpdatesManual")}</div>
+                  <a href={info.ompweb.manualUpdateSource} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)" }}>{info.ompweb.manualUpdateSource}</a>
+                </div>
+              ) : software?.blockedReason && <div style={{ marginTop: 3, color: "var(--status-warning)" }}>{t("hostUpdates.blocked", { reason: software.blockedReason })}</div>}
               {software?.updateAvailable && !software.canUpdate && !software.blockedReason && <div>{t("hostUpdates.manualOnly")}</div>}
             </div>
             {software?.updateAvailable && software.availableVersion && <button type="button" className="ui-focus-ring" aria-label={t("hostUpdates.updateAria", { software: label })} disabled={updateDisabled} style={{ ...buttonStyle, opacity: updateDisabled ? 0.6 : 1, cursor: updateDisabled ? "not-allowed" : "pointer" }} onClick={() => setConfirm(target)}><Download size={13} aria-hidden="true" />{t("hostUpdates.update")}</button>}

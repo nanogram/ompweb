@@ -45,7 +45,7 @@ import { customLocalLabel, DEFAULT_LOCAL_LABEL, HostRegistryUnreadableError, hos
 import type { SessionOps } from "./session-ops";
 import { validateHostTools } from "./shared-requests";
 import type { HostSoftwareUpdate, HostUpdateInfo, HostUpdateOperation, HostUpdateTarget } from "./update-types";
-import { isUpdateDisabled } from "../update-policy";
+import { APP_UPDATE_SOURCE_URL, getAppUpdateBlockedReason, isUpdateDisabled } from "../update-policy";
 import { WORKSPACE_OP_PARAMS, type WorkspaceFileEvent, type WorkspaceOps } from "../workspace-types";
 import { validWorkspaceResult } from "./workspace-results";
 
@@ -1515,6 +1515,8 @@ export async function getHostSoftwareUpdates(id: string, force = false): Promise
     throw new HostOpError(502, "host_bad_result", "The host returned an invalid update status");
   }
   const info = result as unknown as HostUpdateInfo;
+  const appBlockedReason = getAppUpdateBlockedReason();
+  if (appBlockedReason) return { ...info, ompweb: { ...info.ompweb, availableVersion: null, updateAvailable: false, canUpdate: false, updatesDisabled: true, manualUpdateSource: APP_UPDATE_SOURCE_URL, updateCommand: APP_UPDATE_SOURCE_URL, blockedReason: appBlockedReason } };
   const protocol = info.ompweb.protocolVersion;
   if (info.ompweb.updateAvailable && (protocol === null || protocol < MIN_LINK_PROTOCOL_VERSION || protocol > LINK_PROTOCOL_VERSION)) {
     return { ...info, ompweb: { ...info.ompweb, canUpdate: false, blockedReason: protocol === null
@@ -1525,6 +1527,9 @@ export async function getHostSoftwareUpdates(id: string, force = false): Promise
 }
 
 export async function updateHostSoftware(id: string, target: HostUpdateTarget, version: string): Promise<{ accepted: true; operation: HostUpdateOperation }> {
+  requireUpdateHost(id);
+  const appBlockedReason = target === "ompweb" ? getAppUpdateBlockedReason() : null;
+  if (appBlockedReason) throw new HostOpError(403, "manual_update_required", appBlockedReason);
   const checked = await getHostSoftwareUpdates(id, true);
   const candidate = checked[target];
   if (!candidate.updateAvailable || !candidate.canUpdate || candidate.availableVersion !== version) {

@@ -2030,5 +2030,8 @@
   "errors.invalid_run_boundary": "The host returned an invalid transcript boundary.",
   "errors.invalid_model": "Choose a valid provider and model.",
   "errors.invalid_thinking_level": "Choose a valid thinking level.",
+  "sessionSidebar.showAppName": "Show ompweb name",
+  "sessionSidebar.showAppVersion": "Show ompweb version",
+  "settingsConfig.forkUpdatesManual": "Automatic application and daemon updates are disabled for the nanogram fork. Update manually from the fork source.",
   "errors.prompt_boundary_unavailable": "The prompt may have run, but its history boundary was not returned. Reopen the session before sending again."
 }

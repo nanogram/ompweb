@@ -314,17 +314,18 @@ function useScramble(target: string, running: boolean, reducedMotion: boolean): 
   return display;
 }
 function OmpWebTitle() {
+  const { t } = useI18n();
   const [showVersion, setShowVersion] = useState(false);
   const [scrambling, setScrambling] = useState(false);
   const revertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrambleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reducedMotion = usePrefersReducedMotion();
+  const appVersion = process.env.OMP_WEB_PUBLIC_APP_VERSION ?? "0.0.0";
   const commitHash = process.env.OMP_WEB_PUBLIC_COMMIT_HASH;
   const commitDate = process.env.OMP_WEB_PUBLIC_COMMIT_DATE;
   const hasCommitDetails = Boolean(commitHash && commitDate);
-  const VersionTrigger = hasCommitDetails ? Popover.Trigger : "button";
 
-  const target = showVersion ? `v${process.env.OMP_WEB_PUBLIC_APP_VERSION ?? "0.0.0"}` : "omp web";
+  const target = showVersion ? `v${appVersion}` : "omp web";
   const display = useScramble(target, scrambling, reducedMotion);
 
   const triggerScramble = useCallback((toVersion: boolean) => {
@@ -350,44 +351,53 @@ function OmpWebTitle() {
 
   return (
     <Popover.Root open={showVersion} onOpenChange={handleVersionChange}>
-      <VersionTrigger
+      <Popover.Trigger
         type="button"
-        onClick={hasCommitDetails ? undefined : () => handleVersionChange(!showVersion)}
         style={{
           background: "none", border: "none", padding: 0, cursor: "pointer",
           fontWeight: 700, fontSize: 14, letterSpacing: "-0.01em",
           fontFamily: "var(--font-mono)",
-          minWidth: "6ch",
-          lineHeight: 1,
+          minWidth: 0,
+          maxWidth: "100%",
+          lineHeight: 1.2,
+          textAlign: "left",
           display: "inline-flex",
           alignItems: "center",
           gap: 7,
         }}
-        title={showVersion ? "Show ompweb name" : "Show ompweb version"}
+        title={t(showVersion ? "sessionSidebar.showAppName" : "sessionSidebar.showAppVersion")}
+        aria-label={t(showVersion ? "sessionSidebar.showAppName" : "sessionSidebar.showAppVersion")}
       >
         <OmpWebLogo size={20} />
-        {!scrambling && !showVersion ? (
-          <span>
-            <span style={{ color: "var(--accent)" }}>omp</span>
-            <span style={{ color: "var(--text)" }}>web</span>
-          </span>
-        ) : (
-          <span style={{ color: showVersion ? "var(--accent)" : "var(--text)" }}>{display}</span>
-        )}
-      </VersionTrigger>
-      {hasCommitDetails && (
-        <Popover.Portal>
-          <Popover.Positioner side="bottom" align="start" sideOffset={8} collisionPadding={8} style={{ zIndex: 220 }}>
-            <Popover.Popup
-              className="picker-panel ui-focus-ring"
-              style={{ padding: 12, width: 280, maxWidth: "calc((100vw - 16px) / var(--ui-scale, 1))", fontFamily: "var(--font-mono)", fontSize: 12 }}
-            >
-              <Popover.Title style={{ margin: "0 0 6px", fontSize: 12, color: "var(--text-muted)" }}>{commitDate}</Popover.Title>
-              <Popover.Description style={{ margin: 0, overflowWrap: "anywhere", color: "var(--text)" }}>{commitHash}</Popover.Description>
-            </Popover.Popup>
-          </Popover.Positioner>
-        </Popover.Portal>
-      )}
+        <span style={{ display: "grid", gap: 3, minWidth: 0 }}>
+          {!scrambling && !showVersion ? (
+            <span>
+              <span style={{ color: "var(--accent)" }}>omp</span>
+              <span style={{ color: "var(--text)" }}>web</span>
+            </span>
+          ) : (
+            <span style={{ color: showVersion ? "var(--accent)" : "var(--text)", fontSize: showVersion ? 11 : undefined, overflowWrap: "anywhere" }}>{display}</span>
+          )}
+          <span style={{ color: "var(--text-muted)", fontSize: 9, fontWeight: 500, letterSpacing: "0.03em" }}>nanogram</span>
+        </span>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Positioner side="bottom" align="start" sideOffset={8} collisionPadding={8} style={{ zIndex: 220 }}>
+          <Popover.Popup
+            className="picker-panel ui-focus-ring"
+            style={{ padding: 12, width: 280, maxWidth: "calc((100vw - 16px) / var(--ui-scale, 1))", fontFamily: "var(--font-mono)", fontSize: 12 }}
+          >
+            <Popover.Title style={{ margin: "0 0 6px", fontSize: 12, color: "var(--text-muted)" }}>ompweb · nanogram</Popover.Title>
+            <Popover.Description style={{ margin: 0, overflowWrap: "anywhere", color: "var(--text)" }}>v{appVersion}</Popover.Description>
+            {hasCommitDetails && (
+              <>
+                <p style={{ margin: "8px 0 6px", color: "var(--text-muted)" }}>{commitDate}</p>
+                <p style={{ margin: 0, overflowWrap: "anywhere", color: "var(--text)" }}>{commitHash}</p>
+              </>
+            )}
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
     </Popover.Root>
   );
 }

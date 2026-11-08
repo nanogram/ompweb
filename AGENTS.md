@@ -15,6 +15,27 @@ npm run typecheck && npm run lint
 The dev server needs the `omp` binary installed (on `PATH`, or set `OMP_WEB_OMP_BIN`).
 All live-agent features go through it; session browsing works without it.
 
+## Fork identity and deployment
+
+This checkout is `nanogram/ompweb`, version `0.6.0-nanogram.1`, derived from
+`kahme247/ompweb`. Keep the original license and attribution. The retained npm
+name is upstream's registry identity, not a fork release channel. Application
+and daemon self-updates must fail closed before installing or stopping anything;
+Settings links the fork source. OMP runtime updates are unaffected unless the
+independent `OMP_WEB_DISABLE_AUTOUPDATE` policy is enabled.
+
+Pushing GitHub does not redirect an installed service. Never migrate a live
+Next.js-owned OMP tree by restarting it: those processes cannot be adopted by
+the new separate daemon. First cutover requires a quiescent old installation.
+Choose upload retention before starting the upgraded web server or daemon
+(`uploadRetentionDays: null` preserves sent uploads).
+
+The native Windows tray launches `bin/omp-web.js` for production and
+`bin/bun-runtime.js --hot server/dev.ts` for development. Build detection uses
+`dist/index.html`, not `.next`. When changing `native/tray/Program.cs`, rebuild
+the tracked `bin/omp-web-tray.exe`; publishing source alone leaves installations
+on the old launcher.
+
 ---
 
 ## Architecture

@@ -186,8 +186,8 @@ test("serveFile follows a static directory swapped while it runs", async (t) => 
   assert.equal(await get(), "new");
 });
 
-test("renderIndex escapes the install name into the titles and adds the manifest link", () => {
-  const html = '<html><head><title>omp web</title><meta name="apple-mobile-web-app-title" content="omp web" /></head><body></body></html>';
+test("renderIndex escapes the install name into the titles and adds the manifest link", async () => {
+  const html = await Bun.file(path.join(root, "app", "index.html")).text();
   const previous = process.env.OMP_WEB_NAME;
   process.env.OMP_WEB_NAME = "<script>";
   try {

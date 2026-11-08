@@ -9,6 +9,8 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
+> 此儲存庫是 [nanogram/ompweb](https://github.com/nanogram/ompweb) 分支，版本為 `0.6.0-nanogram.1`，不是上游 npm 發行版。側欄、版本資訊及預設應用程式名稱會標示分支身分。應用程式與常駐程式僅支援手動更新，OMP 執行環境更新不受影響。請依 [英文 README 的分支安裝說明](./README.md#quick-start) 從原始碼建置；下方保留的上游 npm 安裝範例不包含此分支修改。舊版 Next.js 首次遷移必須等工作結束，無法藉由重新啟動保留其執行中的 OMP 子行程。
+
 社群交流：[加入 OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 
 專為 [oh-my-pi (omp)](https://github.com/can1357/oh-my-pi) 程式設計代理打造的簡潔、現代化 Web UI。它能直接讀取本機 omp 對話紀錄，提供瀏覽器工作區讓你與代理交談、瀏覽專案、管理設定與預覽檔案。

@@ -8,7 +8,7 @@ require("./node-version").exitIfUnsupportedNode();
 //
 // Usage (installed as the `ompweb-launchd` bin, or run via npx / node directly):
 //   ompweb-launchd [install [package-spec]|uninstall|status]
-//   npx -p @kahme247/ompweb@latest ompweb-launchd install
+//   node /path/to/ompweb/bin/omp-web-launchd.js install
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { spawnSync } = require("node:child_process");
@@ -102,10 +102,30 @@ function buildHostEnv({ svcPath, ompBin, agentDir }) {
   };
 }
 
+/** Fork services run this local build, never an upstream registry default. */
+function launchArguments(packageDir, pkgArg, env = process.env) {
+  let metadata;
+  try { metadata = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")); }
+  catch { throw new Error("Cannot verify the local application repository. Install manually from https://github.com/nanogram/ompweb."); }
+  if (!metadata || typeof metadata.repository?.url !== "string") throw new Error("Cannot verify the local application repository. Install manually from https://github.com/nanogram/ompweb.");
+  if (metadata.repository.url === "git+https://github.com/kahme247/ompweb.git") {
+    const siblingNpx = path.join(path.dirname(process.execPath), "npx");
+    const npxBin = isExecutableFile(siblingNpx) ? siblingNpx : which("npx");
+    if (!npxBin) throw new Error("npx not found on PATH");
+    return [npxBin, "--yes", pkgArg ?? env.OMP_WEB_PKG ?? "@kahme247/ompweb@latest"];
+  }
+  if (pkgArg || env.OMP_WEB_PKG) throw new Error("Fork launchd services use this local build, not a registry package. Omit the package argument and OMP_WEB_PKG; update manually from https://github.com/nanogram/ompweb.");
+  for (const file of ["bin/omp-web.js", "bin/omp-web-host.js", "dist/index.html"]) {
+    if (!fs.existsSync(path.join(packageDir, file))) throw new Error("The local fork build is incomplete. Prepare the application from https://github.com/nanogram/ompweb before installing services.");
+  }
+  return [process.execPath, path.join(packageDir, "bin", "omp-web.js")];
+}
+
 function install(pkgArg) {
   const nodeBin = process.execPath;
-  const siblingNpx = path.join(path.dirname(nodeBin), "npx");
-  const npxBin = isExecutableFile(siblingNpx) ? siblingNpx : (which("npx") ?? fail("npx not found on PATH"));
+  let args;
+  try { args = launchArguments(path.resolve(__dirname, ".."), pkgArg); }
+  catch (error) { fail(error instanceof Error ? error.message : String(error)); }
 
   const ompBin = process.env.OMP_WEB_OMP_BIN ?? which("omp");
   if (process.env.OMP_WEB_OMP_BIN) {
@@ -118,7 +138,6 @@ function install(pkgArg) {
     console.warn("warning: omp binary not found; live-agent features will be unavailable (set OMP_WEB_OMP_BIN)");
   }
 
-  const pkg = pkgArg ?? process.env.OMP_WEB_PKG ?? "@kahme247/ompweb@latest";
   const port = process.env.PORT ?? "30177";
   const hostname = process.env.OMP_WEB_HOSTNAME ?? "127.0.0.1";
   const noOpen = process.env.OMP_WEB_NO_OPEN ?? "1";
@@ -139,7 +158,7 @@ function install(pkgArg) {
   const svcPath = [
     ...(ompBin ? [path.dirname(ompBin)] : []),
     ...(asdfBin ? [path.dirname(asdfBin)] : []),
-    path.dirname(npxBin),
+    path.dirname(args[0]),
     path.dirname(nodeBin),
     "/usr/bin",
     "/bin",
@@ -159,10 +178,10 @@ function install(pkgArg) {
     ...(ompBin ? { OMP_WEB_OMP_BIN: ompBin } : {}),
     ...(agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {}),
   };
-  const web = buildPlist({ label: LABEL, args: [npxBin, "--yes", pkg], env, logName: "ompweb" });
+  const web = buildPlist({ label: LABEL, args, env, logName: "ompweb" });
   const host = buildPlist({
     label: HOST_LABEL,
-    args: [npxBin, "--yes", pkg, "host"],
+    args: [...args, "host"],
     env: buildHostEnv({ svcPath, ompBin, agentDir }),
     logName: "ompweb-host",
     // host.json does not exist until the web server first starts; the daemon exits until then.
@@ -228,4 +247,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { HOST_LABEL, LABEL, buildHostEnv, buildPlist };
+module.exports = { HOST_LABEL, LABEL, buildHostEnv, buildPlist, launchArguments };

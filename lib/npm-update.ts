@@ -1,5 +1,5 @@
 import packageJson from "../package.json";
-import { isUpdateDisabled } from "./update-policy";
+import { APP_UPDATE_SOURCE_URL, getAppUpdateBlockedReason, isUpdateDisabled } from "./update-policy";
 import { homedir } from "os";
 import { join, normalize, sep } from "path";
 
@@ -16,6 +16,8 @@ export interface NpmUpdateStatus {
   /** The terminal command that updates this install; for "binary", the release download page. */
   updateCommand: string;
   updatesDisabled?: boolean;
+  blockedReason?: string;
+  manualUpdateSource?: string;
 }
 
 let cached: { checkedAt: number; status: NpmUpdateStatus } | null = null;
@@ -43,10 +45,11 @@ export async function checkNpmUpdate(force = false): Promise<NpmUpdateStatus> {
   const currentVersion = packageJson.version;
   const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
   const installMethod = typeof Bun !== "undefined" && Bun.isStandaloneExecutable ? "binary" : detectInstallMethod(packageDir);
-  const updateCommand = installMethod === "binary" ? RELEASES_URL : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb";
+  const blockedReason = getAppUpdateBlockedReason();
+  const updateCommand = blockedReason ? APP_UPDATE_SOURCE_URL : installMethod === "binary" ? RELEASES_URL : installMethod === "bun" ? "bun add -g @kahme247/ompweb" : "npm install -g @kahme247/ompweb";
 
-  if (isUpdateDisabled()) {
-    return { currentVersion, availableVersion: null, updateAvailable: false, installMethod, updateCommand, updatesDisabled: true };
+  if (blockedReason) {
+    return { currentVersion, availableVersion: null, updateAvailable: false, installMethod, updateCommand, updatesDisabled: true, blockedReason, ...(!isUpdateDisabled() ? { manualUpdateSource: APP_UPDATE_SOURCE_URL } : {}) };
   }
   if (!force && cached && Date.now() - cached.checkedAt < CHECK_TTL_MS) return cached.status;
 

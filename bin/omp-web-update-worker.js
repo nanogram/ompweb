@@ -216,6 +216,20 @@ async function main() {
   if (!/^[0-9a-f-]{36}$/i.test(attemptId || "") || !root || !packageDir || !target) {
     process.exit(1);
   }
+  // This worker is copied outside the package. Recheck local release identity
+  // without imports: the retained npm identifier must never replace the fork.
+  let blockedReason = ["1", "true", "yes", "on"].includes((process.env.OMP_WEB_DISABLE_AUTOUPDATE || "").trim().toLowerCase())
+    ? "Updates are disabled by OMP_WEB_DISABLE_AUTOUPDATE" : null;
+  if (!blockedReason && kind !== "omp") {
+    const pkg = readJson(path.join(packageDir, "package.json"));
+    if (!pkg || typeof pkg.repository?.url !== "string") blockedReason = "Cannot verify the local application repository; automatic updates are blocked. Update manually from https://github.com/nanogram/ompweb.";
+    else if (pkg.repository.url !== "git+https://github.com/kahme247/ompweb.git") blockedReason = "Automatic application and daemon updates are disabled for the nanogram fork. Update manually from https://github.com/nanogram/ompweb.";
+  }
+  if (blockedReason) {
+    updateStatus({ state: "failed", error: blockedReason, finishedAt: new Date().toISOString(), cleanupReady: true });
+    process.exitCode = 1;
+    return;
+  }
   // Check abort
   if (fs.existsSync(abortFile())) {
     updateStatus({ state: "failed", error: (readJson(abortFile()) || {}).reason || "aborted", finishedAt: new Date().toISOString(), cleanupReady: true });

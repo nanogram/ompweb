@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -124,7 +125,7 @@ class TrayApplication : IDisposable
         _icoPath = Path.Combine(_repoRoot, "public", "omp-web.ico");
         _pngPath = Path.Combine(_repoRoot, "public", "icon.png");
 
-        var logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".omp", "agent", "logs");
+        var logDir = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(_configPath))!, "logs");
         Directory.CreateDirectory(logDir);
         _logFile = Path.Combine(logDir, "omp-web-service.log");
         try
@@ -177,8 +178,8 @@ class TrayApplication : IDisposable
         if (_openBrowser) { /* explicit */ }
         else if (!_startup && cfgOpenBrowser == true) _openBrowser = true;
 
-        var nextDir = Path.Combine(_repoRoot, ".next");
-        if (_effectiveMode == "start" && !Directory.Exists(nextDir))
+        var clientIndex = Path.Combine(_repoRoot, "dist", "index.html");
+        if (_effectiveMode == "start" && !File.Exists(clientIndex))
         {
             _effectiveMode = "dev";
             if (_effectivePort == 30177) _effectivePort = 30178;
@@ -263,21 +264,25 @@ class TrayApplication : IDisposable
             RedirectStandardError = true,
         };
 
-        if (_effectiveMode == "start")
+        var production = _effectiveMode == "start";
+        psi.ArgumentList.Add(Path.Combine(_repoRoot, "bin", production ? "omp-web.js" : "bun-runtime.js"));
+        if (!production)
         {
-            var launcher = Path.Combine(_repoRoot, "bin", "omp-web.js");
-            psi.Arguments = $"\"{launcher}\" -p {_effectivePort} -H {_effectiveHostname} --no-open";
+            psi.ArgumentList.Add("--hot");
+            psi.ArgumentList.Add(Path.Combine(_repoRoot, "server", "dev.ts"));
         }
-        else
-        {
-            var nextBin = Path.Combine(_repoRoot, "node_modules", "next", "dist", "bin", "next");
-            psi.Arguments = $"\"{nextBin}\" dev -H {_effectiveHostname} -p {_effectivePort}";
-        }
+        var port = _effectivePort.ToString(CultureInfo.InvariantCulture);
+        psi.ArgumentList.Add("-p");
+        psi.ArgumentList.Add(port);
+        psi.ArgumentList.Add("-H");
+        psi.ArgumentList.Add(_effectiveHostname);
+        if (production) psi.ArgumentList.Add("--no-open");
 
-        psi.EnvironmentVariables["OMP_WEB_PORT"] = _effectivePort.ToString();
+        psi.EnvironmentVariables["OMP_WEB_PACKAGE_DIR"] = _repoRoot;
+        psi.EnvironmentVariables["OMP_WEB_PORT"] = port;
         psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = _effectiveHostname;
         psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1";
-        psi.EnvironmentVariables["PORT"] = _effectivePort.ToString();
+        psi.EnvironmentVariables["PORT"] = port;
         // bin/omp-web.js refuses a non-loopback bind without a password hash. A plaintext
         // OMP_WEB_PASSWORD is passed through only so the server can refuse it with instructions.
         if (string.IsNullOrEmpty(SetChildCredential(psi, "OMP_WEB_PASSWORD_HASH")))
@@ -499,7 +504,7 @@ class TrayApplication : IDisposable
 
         _menuConfig = new ToolStripMenuItem("Edit Configuration", null, (s, e) =>
         {
-            var cfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".omp", "agent", "web-service.json");
+            var cfg = _configPath;
             if (!File.Exists(cfg))
             {
                 // create via autostart check

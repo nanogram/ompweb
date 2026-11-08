@@ -1989,5 +1989,8 @@
   "errors.invalid_run_boundary": "主机返回了无效的对话记录边界。",
   "errors.invalid_model": "请选择有效的提供商和模型。",
   "errors.invalid_thinking_level": "请选择有效的思考级别。",
+  "sessionSidebar.showAppName": "显示 ompweb 名称",
+  "sessionSidebar.showAppVersion": "显示 ompweb 版本",
+  "settingsConfig.forkUpdatesManual": "nanogram 分支已禁用应用和守护进程自动更新。请从分支源码手动更新。",
   "errors.prompt_boundary_unavailable": "提示可能已执行，但未返回历史边界。再次发送前请重新打开会话。"
 }

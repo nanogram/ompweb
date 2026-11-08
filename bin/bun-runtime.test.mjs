@@ -59,3 +59,21 @@ test("uses bun on PATH last and refuses an old one", { skip: isWindows }, (t) =>
 test("no Bun anywhere", (t) => {
   assert.throws(() => resolveBunBinary(tempDir(t), { PATH: "" }), /Bun runtime not found/);
 });
+
+test("fork and unverifiable Bun repair guidance never recommends replacing the fork with upstream", (t) => {
+  for (const metadata of [null, "{", {}, { repository: { url: "git+https://github.com/nanogram/ompweb.git" } }]) {
+    const dir = tempDir(t);
+    if (metadata !== null) writeFile(path.join(dir, "package.json"), typeof metadata === "string" ? metadata : JSON.stringify(metadata));
+    assert.throws(() => resolveBunBinary(dir, { PATH: "" }), (error) => {
+      assert.match(error.message, /https:\/\/github\.com\/nanogram\/ompweb/);
+      assert.doesNotMatch(error.message, /npm install -g @kahme247\/ompweb/);
+      return true;
+    });
+  }
+});
+
+test("verified upstream Bun repair guidance retains the upstream reinstall command", (t) => {
+  const dir = tempDir(t);
+  writeFile(path.join(dir, "package.json"), JSON.stringify({ repository: { url: "git+https://github.com/kahme247/ompweb.git" } }));
+  assert.throws(() => resolveBunBinary(dir, { PATH: "" }), /npm install -g @kahme247\/ompweb/);
+});

@@ -2030,5 +2030,8 @@
   "errors.invalid_run_boundary": "主機傳回了無效的對話記錄邊界。",
   "errors.invalid_model": "請選擇有效的供應商和模型。",
   "errors.invalid_thinking_level": "請選擇有效的思考等級。",
+  "sessionSidebar.showAppName": "顯示 ompweb 名稱",
+  "sessionSidebar.showAppVersion": "顯示 ompweb 版本",
+  "settingsConfig.forkUpdatesManual": "nanogram 分支已停用應用程式和常駐程式自動更新。請從分支原始碼手動更新。",
   "errors.prompt_boundary_unavailable": "提示可能已執行，但未傳回歷史邊界。再次傳送前請重新開啟對話。"
 }

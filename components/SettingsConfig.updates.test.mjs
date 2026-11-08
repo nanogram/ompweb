@@ -71,3 +71,20 @@ test("a binary install's ompweb update links the release page instead of showing
   const { container: npm } = await renderSystemTab(t, { appUpdate: { ...appUpdate, installMethod: "npm", updateCommand: "npm install -g @kahme247/ompweb" } });
   assert.ok([...npm.querySelectorAll("code")].some((code) => code.textContent === "npm install -g @kahme247/ompweb"), "the npm command is gone");
 });
+
+test("fork System updates show the installed version and manual source without upstream install controls", async (t) => {
+  const source = "https://github.com/nanogram/ompweb";
+  let requested = false;
+  const { container } = await renderSystemTab(t, {
+    appUpdate: { currentVersion: "0.6.0-nanogram.1", availableVersion: null, updateAvailable: false, updatesDisabled: true, selfUpdateSupported: false, manualUpdateSource: source, updateCommand: source },
+    onRequestAppUpdate: () => { requested = true; },
+  });
+  assert.ok(container.textContent.includes("0.6.0-nanogram.1"));
+  assert.ok(container.textContent.includes("Automatic application and daemon updates are disabled for the nanogram fork"));
+  assert.ok(!container.textContent.includes("npm install -g @kahme247/ompweb"));
+  assert.ok(!buttonLabels(container).includes("Update and restart"));
+  const refresh = container.querySelector('button[aria-label="Check ompweb updates"]');
+  assert.equal(refresh?.disabled, true);
+  assert.ok(container.querySelector(`a[href="${source}"]`));
+  assert.equal(requested, false);
+});
