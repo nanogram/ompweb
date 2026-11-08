@@ -17,12 +17,35 @@ All live-agent features go through it; session browsing works without it.
 
 ## Fork identity and deployment
 
-This checkout is `nanogram/ompweb`, version `0.6.0-nanogram.1`, derived from
+This checkout is `nanogram/ompweb`, version `0.6.0-n1`, derived from
 `kahme247/ompweb`. Keep the original license and attribution. The retained npm
-name is upstream's registry identity, not a fork release channel. Application
-and daemon self-updates must fail closed before installing or stopping anything;
-Settings links the fork source. OMP runtime updates are unaffected unless the
-independent `OMP_WEB_DISABLE_AUTOUPDATE` policy is enabled.
+name is upstream's registry identity, not a fork release channel. Registry
+application/daemon replacement stays blocked; OMP runtime updates are independent
+unless `OMP_WEB_DISABLE_AUTOUPDATE` is enabled.
+
+The production Node launcher owns a stable `bin/omp-web-channel.js` supervisor.
+Settings → System → ompweb application selects upstream Main or this fork,
+prepares a separate source build and applies it only on explicit web restart.
+Main keeps its upstream identity/behavior plus the minimal shared channel-control
+overlay, so the way back is never lost. `bin/app-channel-packages.js` owns source
+preparation; its build HOME/PI are isolated and its repository is allowlisted.
+Ready selections are atomically persisted per installation/bind under the agent's
+`omp-web/app-channels/`. A failed candidate startup restores the previous web
+build. The supervisor never starts/stops the separate host daemon or its OMPs.
+Direct Bun/dev/compiled launches expose an unsupported reason, not a fake switch.
+
+Keep cache directory identifiers compact: a Windows executable below a full
+revision-plus-fingerprint directory can exceed the loader's path limit even
+when filesystem reads succeed. Ready markers retain and verify both full hashes.
+Service operations resolve `OMP_WEB_CHANNEL_MANAGER_ROOT`, not the currently
+selected upstream directory. `OMP_WEB_CHANNEL_CONTROL_TOKEN` is private to the
+supervisor/web bridge and is stripped from project/plugin child environments.
+
+`GET /api/app-channel` exposes current/next-start releases, preparation and errors.
+Same-origin JSON `POST` accepts exactly `{action:"select", channel:"main"|"fork"}`
+or `{action:"restart"}`; selection returns before its background build completes.
+Selecting never stops the web process. A restart uses only a validated ready
+selection, and the UI reloads after the supervisor confirms activation.
 
 Pushing GitHub does not redirect an installed service. Never migrate a live
 Next.js-owned OMP tree by restarting it: those processes cannot be adopted by

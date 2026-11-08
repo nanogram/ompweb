@@ -575,6 +575,10 @@ async function main() {
     process.exitCode = 1;
     return;
   }
+  if (!process.env.OMP_WEB_CHANNEL_CHILD) {
+    await module.require("./omp-web-channel").runChannelLauncher({ managerRoot: pkgDir, args: process.argv.slice(2), port, hostname });
+    return;
+  }
   let command;
   try {
     command = serverCommand();

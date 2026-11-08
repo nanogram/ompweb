@@ -67,6 +67,9 @@ export const DEFAULT_WEB_SERVICE_CONFIG: WebServiceConfig = {
 };
 
 export function getRepoRoot(): string {
+  if (process.env.OMP_WEB_CHANNEL_MANAGER_ROOT && existsSync(process.env.OMP_WEB_CHANNEL_MANAGER_ROOT)) {
+    return process.env.OMP_WEB_CHANNEL_MANAGER_ROOT;
+  }
   if (process.env.OMP_WEB_PACKAGE_DIR && existsSync(process.env.OMP_WEB_PACKAGE_DIR)) {
     return process.env.OMP_WEB_PACKAGE_DIR;
   }

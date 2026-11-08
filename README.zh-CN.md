@@ -9,7 +9,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
-> 本仓库是 [nanogram/ompweb](https://github.com/nanogram/ompweb) 分支，版本为 `0.6.0-nanogram.1`，不是上游 npm 发行版。侧栏、版本信息和默认应用名称会显示分支身份。应用与守护进程仅支持手动更新，OMP 运行时更新不受影响。请按 [英文 README 的分支安装说明](./README.md#quick-start) 从源码构建；下文保留的上游 npm 安装示例不包含本分支修改。旧版 Next.js 首次迁移必须等任务结束，不能通过重启保留其运行中的 OMP 子进程。
+> 本仓库是 [nanogram/ompweb](https://github.com/nanogram/ompweb) 分支，版本为 `0.6.0-n1`。侧栏、版本信息和默认应用名称会显示分支身份。设置中的应用更新区可选择上游 Main 或本分支；后台准备完成后，重启 Web 服务才会切换。上游保留最小的切换 UI/API，便于切回；不会重启守护进程或运行中的 OMP。请参阅 [英文 README 的安装和切换说明](./README.md)。下文保留的上游 npm 示例不包含本分支修改。旧版 Next.js 的首次迁移仍须等其 OMP 任务结束。
 
 社区：[加入 OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 

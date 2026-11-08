@@ -33,7 +33,7 @@ for (const [field, label] of [
     const stored = { autoResumeSessions: false, agentToolsEnabled: false, uploadRetentionDays: 30 };
     const pending = [];
     globalThis.fetch = async (url, init) => {
-      if (String(url) !== "/api/web-settings") return Response.json({});
+      if (String(url) !== "/api/web-settings") return Response.json({}, { status: 404 });
       if (init?.method !== "PUT") return Response.json(stored);
       const change = JSON.parse(init.body);
       return new Promise((resolve) => pending.push((status) => {

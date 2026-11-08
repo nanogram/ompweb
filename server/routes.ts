@@ -5,6 +5,7 @@ import * as agentId from "@/app/api/agent/[id]/route";
 import * as agentNew from "@/app/api/agent/new/route";
 import * as agents from "@/app/api/agents/route";
 import * as appInfo from "@/app/api/app-info/route";
+import * as appChannel from "@/app/api/app-channel/route";
 import * as appUpdateNotes from "@/app/api/app-update/notes/route";
 import * as appUpdate from "@/app/api/app-update/route";
 import * as authAccountsProvider from "@/app/api/auth/accounts/[provider]/route";
@@ -104,6 +105,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "agent/new": agentNew,
   "agents": agents,
   "app-info": appInfo,
+  "app-channel": appChannel,
   "app-update/notes": appUpdateNotes,
   "app-update": appUpdate,
   "auth/accounts/[provider]": authAccountsProvider,

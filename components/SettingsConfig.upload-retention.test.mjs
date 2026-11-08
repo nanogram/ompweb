@@ -27,7 +27,7 @@ function fakeSettings(t, stored) {
   let putStatus = 200;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    if (String(url) !== "/api/web-settings") return Response.json({});
+    if (String(url) !== "/api/web-settings") return Response.json({}, { status: 404 });
     if (init?.method === "PUT") {
       puts.push(init.body);
       return Response.json({}, { status: putStatus });

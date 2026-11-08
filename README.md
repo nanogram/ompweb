@@ -13,14 +13,30 @@ A clean, modern web UI for the [oh-my-pi (omp)](https://github.com/can1357/oh-my
 
 This is the [nanogram fork](https://github.com/nanogram/ompweb) of
 [kahme247/ompweb](https://github.com/kahme247/ompweb), version
-`0.6.0-nanogram.1`. The sidebar badge, version popup, browser title and default
+`0.6.0-n1`. The sidebar badge, version popup, browser title and default
 installed-app name identify the fork. An explicit `OMP_WEB_NAME` still wins.
 The npm name `@kahme247/ompweb` is retained for compatibility, but its registry
 releases are upstream builds, **not this fork**.
 
-Automatic application and daemon updates are disabled so an upstream package
-cannot replace these patches. Settings links the fork source for manual updates;
-OMP runtime updates remain independent and available.
+Registry application and daemon updates cannot replace these patches. In
+**Settings → System → ompweb application**, choose **Main (upstream)** or
+**nanogram fork**. The app stages/builds the selected version in the background;
+it does not change the running web server until you restart OMPweb. The explicit
+**Restart OMPweb** action and a normal tray/launcher restart use that ready
+selection. A failed candidate launch restores the previous web build.
+
+Main is the actual `kahme247/ompweb` GitHub `main` source, pinned to its fetched
+commit, with only the shared channel-control UI/API added so you can switch back.
+It is not the fork relabeled and not an older npm release. Preparing Main needs
+Git, Node 24+, npm, network access and disk space for a separate source build.
+The fork target is the installed fork that owns the supervisor. Direct Bun/dev
+or compiled-binary launches show why channel switching is unavailable; use the
+production Node launcher (including `npm start` or the Windows tray).
+
+Channel switches restart **only the web server**. Keep the separate host daemon
+running; its OMP sessions are not restarted. A web version incompatible with that
+daemon's protocol is refused before selection. OMP runtime updates remain
+independent and available.
 
 ![ompweb — live session demo](docs/demo.gif)
 

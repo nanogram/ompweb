@@ -9,7 +9,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
-> このリポジトリは [nanogram/ompweb](https://github.com/nanogram/ompweb) フォーク、バージョン `0.6.0-nanogram.1` です。上流の npm リリースとは異なり、サイドバー、バージョン表示、既定のアプリ名で識別できます。アプリとデーモンは手動更新のみで、OMP ランタイムの更新は引き続き利用できます。[英語 README のフォーク導入手順](./README.md#quick-start) に従ってソースからビルドしてください。以下に残る上流 npm の例には、このフォークの変更は含まれません。旧 Next.js 版からの初回移行は実行中の作業が完了してから行ってください。再起動で旧版の OMP 子プロセスを維持することはできません。
+> このリポジトリは [nanogram/ompweb](https://github.com/nanogram/ompweb) フォーク、バージョン `0.6.0-n1` です。サイドバー、バージョン表示、既定のアプリ名で識別できます。設定のアプリ更新欄で上流 Main とフォークを選択し、準備後の Web 再起動で切り替えます。上流にも切り戻し用の最小限の選択 UI/API が残ります。デーモンと実行中の OMP は再起動しません。[英語 README の導入・切り替え手順](./README.md) を参照してください。以下の上流 npm の例にはフォークの変更は含まれません。旧 Next.js 版からの初回移行だけは、旧版が所有する OMP の作業完了を待つ必要があります。
 
 コミュニティ：[OMPWEB Discord に参加](https://discord.gg/evqgGzRfM5)
 
