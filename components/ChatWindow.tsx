@@ -1,8 +1,8 @@
 "use client";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
-import { Fragment, memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
-import { ArrowDown, ChevronDown, ChevronUp, Layers, Paperclip, Square } from "lucide-react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { ArrowDown, ChevronDown, ChevronUp, CircleHelp, Layers, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
 import { collectToolResults, isGroupAnchor, planTranscriptRows, transcriptRowIndex, type ActivityPiece, type TranscriptPresentation, type TranscriptRow } from "@/lib/chat-transcript-plan";
@@ -322,6 +322,10 @@ interface CommittedTranscriptProps {
   nearBottom: boolean;
   sentinelRef: React.RefObject<HTMLButtonElement | null>;
   handleLoadMoreClick: () => void;
+  hasOlder: boolean;
+  loadingOlder: boolean;
+  olderHistoryError: boolean;
+  handleLoadOlder: () => void;
 }
 
 /**
@@ -334,6 +338,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
   messages, rows, presentation, expandProcessDetails, revealFolded, selectedMessageIndex, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
   toolCallsDefaultCollapsed, hideToolActivity, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  hasOlder, loadingOlder, olderHistoryError, handleLoadOlder,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
@@ -349,6 +354,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
     const isVisible = msg.role === "user" || msg.role === "assistant";
     const currentRefIdx = visibleRefIndexByMessage.get(idx);
     const keyPrefix = options.keyPrefix ?? "message";
+    const messageKey = entryIds[idx] ?? idx;
     let showTimestamp = false;
     if (msg.role === "assistant") {
       showTimestamp = true;
@@ -372,7 +378,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
     const historyMutationPending = forkingEntryId !== null || editingEntryId !== null;
     const view = (
       <MessageView
-        key={`${keyPrefix}-view-${idx}`}
+        key={`${keyPrefix}-view-${messageKey}`}
         message={msg}
         toolResults={toolResultsMap}
         modelNames={modelNames}
@@ -396,9 +402,9 @@ export const CommittedTranscript = memo(function CommittedTranscript({
         sourceBlockIndices={options.sourceBlockIndices}
       />
     );
-    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return <div key={`${keyPrefix}-${idx}`} data-message-index={idx}>{view}</div>;
+    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx}>{view}</div>;
     return (
-      <div key={`${keyPrefix}-${idx}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
+      <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
         {view}
       </div>
     );
@@ -470,7 +476,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
           sourceBlockIndices: segment.blocks.map((block) => msg.content.indexOf(block)),
         });
         rendered.push(presentation === "focused"
-          ? <AssistantOutputStep key={`output-${userIdx}-${segmentIdx}`} final={row.finalReplyIndex === segment.index && segmentIdx === lastOutput} latest={row.finalReplyIndex === undefined && segmentIdx === lastOutput}>{message}</AssistantOutputStep>
+          ? <AssistantOutputStep key={`output-${entryIds[userIdx] ?? userIdx}-${segmentIdx}`} final={row.finalReplyIndex === segment.index && segmentIdx === lastOutput} latest={row.finalReplyIndex === undefined && segmentIdx === lastOutput}>{message}</AssistantOutputStep>
           : message);
         attached.add(segment.index);
         return;
@@ -482,7 +488,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
       for (const piece of segment.pieces) attached.add(piece.index);
       rendered.push(
         <div
-          key={`activity-${userIdx}-${segmentIdx}`}
+          key={`activity-${entryIds[userIdx] ?? userIdx}-${segmentIdx}`}
           ref={refIdx === undefined ? undefined : (el) => { messageRefs.current[refIdx] = el; }}
         >
           <ProcessDetailsGroup key={`${expandProcessDetails}:${row.finalReplyIndex === undefined ? "activity" : entryIds[row.finalReplyIndex] ?? row.finalReplyIndex}`} messageCount={segment.stepCount} toolCallCount={segment.toolCallCount} defaultExpanded={expandProcessDetails} forceExpanded={revealFolded || segment.pieces.some((piece) => piece.index === selectedMessageIndex)}>
@@ -494,14 +500,18 @@ export const CommittedTranscript = memo(function CommittedTranscript({
   }
   return (
     <>
-      {hasMore && (
+      {(hasMore || hasOlder) && (
         <button
           ref={sentinelRef}
           type="button"
-          onClick={handleLoadMoreClick}
+          data-remote-history={!hasMore || undefined}
+          onClick={hasMore ? handleLoadMoreClick : handleLoadOlder}
+          disabled={!hasMore && loadingOlder}
+          aria-busy={!hasMore && loadingOlder || undefined}
           className="py-3 w-full text-center text-xs text-text-muted hover:text-text transition-colors cursor-pointer"
         >
-          {t("chatWindow.scrollUpToLoad", { count: startIndex })}
+          {hasMore ? t("chatWindow.scrollUpToLoad", { count: startIndex })
+            : t(loadingOlder ? "chatWindow.loadingOlderMessages" : olderHistoryError ? "chatWindow.retryOlderMessages" : "chatWindow.loadOlderMessages")}
         </button>
       )}
       {rendered}
@@ -559,7 +569,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   }, [onAgentEnd]);
 
   const {
-    loading, error, messages, entryIds, showPreCompactionHistory, streamState,
+    loading, error, messages, entryIds, historyWindow, showPreCompactionHistory, streamState,
+    hasOlder, loadingOlder, loadOlder, olderHistoryError, historyCached,
     agentRunning, bashRunning, pendingBash, deferredBash, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit,
     externalRunActive,
     toolPreset,
@@ -599,6 +610,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     if (speech) ttsRef.current.speak(speech.id, speech.text);
   }, [messages, entryIds, streamState, agentRunning]);
   const sessionBusy = agentRunning || bashRunning;
+  // Dialog requests block for an answer; they do not pause native run ownership.
+  const waitingForInput = extensionDialog !== null;
   const modelCapacity = useMemo(() => {
     if (!displayModelValue) return null;
     const model = modelList.find((entry) => entry.provider === displayModelValue.provider && entry.id === displayModelValue.modelId);
@@ -751,10 +764,17 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     presentation,
     running: sessionBusy || externalRunActive || streamState.isStreaming,
   }), [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity, presentation, sessionBusy, externalRunActive, streamState.isStreaming]);
-  const [selectedMessageIndex, setSelectedMessageIndex] = useState<number | null>(null);
-  const [pendingOutlineJump, setPendingOutlineJump] = useState<{ messageIndex: number; smooth: boolean } | null>(null);
+  const upwardIntentRef = useRef(0);
+  const holdNavigationScroll = useCallback(() => {
+    upwardIntentRef.current = 0;
+    holdScrollPosition();
+    setNearBottom(false);
+  }, [holdScrollPosition]);
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
+  const selectedMessageIndex = selectedEntryId === null ? null : entryIds.indexOf(selectedEntryId);
+  const [pendingOutlineJump, setPendingOutlineJump] = useState<{ entryId: string | null; messageIndex: number; smooth: boolean } | null>(null);
   useEffect(() => {
-    setSelectedMessageIndex(null);
+    setSelectedEntryId(null);
     setPendingOutlineJump(null);
   }, [sessionKeyForPaging]);
   const revealMessage = useCallback((messageIndex: number) => {
@@ -766,37 +786,39 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     return false;
   }, [transcriptRows, visibleCount]);
   const ensureOutlineVisible = useCallback((messageIndex: number, smooth = true) => {
-    holdScrollPosition();
-    setNearBottom(false);
-    setSelectedMessageIndex(messageIndex);
+    holdNavigationScroll();
+    setSelectedEntryId(entryIds[messageIndex] ?? null);
     const alreadyVisible = revealMessage(messageIndex);
     // A newly mounted lazy page must jump instantly, as search does, so its
     // sentinel cannot prepend another page mid-animation.
-    setPendingOutlineJump({ messageIndex, smooth: smooth && alreadyVisible });
-  }, [holdScrollPosition, revealMessage]);
+    setPendingOutlineJump({ entryId: entryIds[messageIndex] ?? null, messageIndex, smooth: smooth && alreadyVisible });
+  }, [holdNavigationScroll, revealMessage, entryIds]);
   useEffect(() => {
     if (!pendingOutlineJump || loading || isEmptyNew) return;
     const container = scrollContainerRef.current;
     if (!container) return;
+    const messageIndex = pendingOutlineJump.entryId === null ? pendingOutlineJump.messageIndex : entryIds.indexOf(pendingOutlineJump.entryId);
+    if (messageIndex < 0) { setPendingOutlineJump(null); return; }
     const frame = requestAnimationFrame(() => {
-      const target = container.querySelector<HTMLElement>(`[data-message-index="${pendingOutlineJump.messageIndex}"]`);
+      const target = container.querySelector<HTMLElement>(`[data-message-index="${messageIndex}"]`);
       if (!target) return;
       // Run after lazy-page viewport restoration, never race it.
-      holdScrollPosition();
+      holdNavigationScroll();
       const top = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 16;
       container.scrollTo({ top: Math.max(0, top), behavior: pendingOutlineJump.smooth ? "smooth" : "auto" });
       setPendingOutlineJump(null);
     });
     return () => cancelAnimationFrame(frame);
-  }, [pendingOutlineJump, visibleCount, transcriptRows, loading, isEmptyNew, scrollContainerRef, holdScrollPosition]);
+  }, [pendingOutlineJump, visibleCount, transcriptRows, entryIds, loading, isEmptyNew, scrollContainerRef, holdNavigationScroll]);
   useChatSearchHighlights({
     container: scrollContainerRef,
     query: searchQuery,
     target: searchTarget,
-    ready: !loading && !isEmptyNew,
+    ready: !loading && !isEmptyNew && !historyCached
+      && !(searchTarget && !entryIds.includes(searchTarget.entryId) && (hasOlder || loadingOlder)),
     entryIds,
     revealMessage,
-    holdScrollPosition,
+    holdScrollPosition: holdNavigationScroll,
     onTargetHandled: onSearchTargetHandled,
   });
   // The hosts channel is the source of truth; a frame only speaks before its first snapshot.
@@ -846,6 +868,32 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   // content; "click" (user pressed the banner) reveals the loaded messages at
   // the top of the viewport instead.
   const loadMoreModeRef = useRef<"auto" | "click">("auto");
+  const remoteScrollDistanceRef = useRef<number | null>(null);
+  const handleLoadOlder = useCallback(() => {
+    if (loadingOlder || historyCached) return;
+    upwardIntentRef.current = 0;
+    void loadOlder(() => {
+      const container = scrollContainerRef.current;
+      if (container) remoteScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+      setVisibleCount((count) => count + VISIBLE_PAGE_SIZE);
+      setNearBottom(false);
+    });
+  }, [loadingOlder, historyCached, loadOlder, scrollContainerRef]);
+  useLayoutEffect(() => {
+    if (remoteScrollDistanceRef.current === null) return;
+    const container = scrollContainerRef.current;
+    if (container) container.scrollTop = restoreScrollTop(container.scrollHeight, remoteScrollDistanceRef.current);
+    remoteScrollDistanceRef.current = null;
+  }, [entryIds, visibleCount, scrollContainerRef]);
+  // An explicit sidebar hit may live in an unloaded page. Only that request
+  // walks older pages; ordinary open and scrolling never drain history.
+  useEffect(() => {
+    if (!searchTarget || loading || historyCached || loadingOlder || olderHistoryError
+      || !hasOlder || entryIds.includes(searchTarget.entryId)) return;
+    holdScrollPosition();
+    setNearBottom(false);
+    handleLoadOlder();
+  }, [searchTarget, loading, historyCached, loadingOlder, olderHistoryError, hasOlder, entryIds, holdScrollPosition, handleLoadOlder]);
 
   // IntersectionObserver on the sentinel banner at the top of the message
   // list. When the user scrolls near the top, load the next page of older
@@ -853,7 +901,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   useEffect(() => {
     const sentinel = sentinelRef.current;
     const container = scrollContainerRef.current;
-    if (!sentinel || !container) return;
+    if (!sentinel || !container || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(
       (entries) => {
         // Only auto-load on a genuine upward scroll. On fresh open the
@@ -861,11 +909,14 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         // scrollTop = 0 — auto-loading then races the initial scroll-to-bottom
         // (the capture happens before the scroll, and the restore pins the
         // viewport to the top of the last page until every page is loaded).
-        if (!pendingOutlineJump && entries[0]?.isIntersecting && container.scrollTop > 0) {
-          // Save distance from top before prepending to restore scroll later
-          prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
-          loadMoreModeRef.current = "auto";
-          setVisibleCount((prev) => getNextVisibleCount(prev));
+        if (!pendingOutlineJump && entries[0]?.isIntersecting && Date.now() < upwardIntentRef.current) {
+          upwardIntentRef.current = 0;
+          if (sentinel.dataset.remoteHistory) handleLoadOlder();
+          else {
+            prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+            loadMoreModeRef.current = "auto";
+            setVisibleCount((prev) => getNextVisibleCount(prev));
+          }
         }
       },
       // Expand the root upward so the page loads while the banner is still
@@ -875,7 +926,62 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [visibleCount, messages.length, scrollContainerRef, pendingOutlineJump]);
+  }, [visibleCount, messages.length, hasOlder, loadingOlder, handleLoadOlder, scrollContainerRef, pendingOutlineJump]);
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    let touchY: number | null = null;
+    let lastTop = container.scrollTop;
+    const loadAtTop = () => {
+      if (pendingOutlineJump || Date.now() >= upwardIntentRef.current || container.scrollTop > 400) return;
+      const sentinel = sentinelRef.current;
+      if (!sentinel || sentinel.disabled) return;
+      upwardIntentRef.current = 0;
+      if (sentinel.dataset.remoteHistory) handleLoadOlder();
+      else {
+        prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+        loadMoreModeRef.current = "auto";
+        setVisibleCount((count) => getNextVisibleCount(count));
+      }
+    };
+    const wheel = (event: WheelEvent) => {
+      if (event.deltaY >= 0) return;
+      upwardIntentRef.current = Date.now() + 1000;
+      loadAtTop();
+    };
+    const touchStart = (event: TouchEvent) => { touchY = event.touches[0]?.clientY ?? null; };
+    const touchMove = (event: TouchEvent) => {
+      const next = event.touches[0]?.clientY;
+      if (touchY !== null && next !== undefined && next > touchY) {
+        upwardIntentRef.current = Date.now() + 1000;
+        loadAtTop();
+      }
+      touchY = next ?? null;
+    };
+    const key = (event: KeyboardEvent) => {
+      if (!["ArrowUp", "PageUp", "Home"].includes(event.key)) return;
+      upwardIntentRef.current = Date.now() + 1000;
+      loadAtTop();
+    };
+    const scroll = () => {
+      const movingUp = container.scrollTop < lastTop;
+      lastTop = container.scrollTop;
+      if (movingUp) loadAtTop();
+    };
+    container.addEventListener("wheel", wheel, { passive: true });
+    container.addEventListener("touchstart", touchStart, { passive: true });
+    container.addEventListener("touchmove", touchMove, { passive: true });
+    container.addEventListener("keydown", key);
+    container.addEventListener("scroll", scroll, { passive: true });
+    return () => {
+      container.removeEventListener("wheel", wheel);
+      container.removeEventListener("touchstart", touchStart);
+      container.removeEventListener("touchmove", touchMove);
+      container.removeEventListener("keydown", key);
+      container.removeEventListener("scroll", scroll);
+    };
+  }, [loading, handleLoadOlder, scrollContainerRef, pendingOutlineJump]);
 
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
@@ -1131,6 +1237,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     requestAnimationFrame(() => composerRef.current?.focus());
   }, [composerRef]);
   const composerStatusText = useMemo(() => {
+    if (waitingForInput) return t("chatWindow.waitingForInput");
     if (bashRunning && !pendingBash) {
       return t("chatWindow.runningCommand");
     }
@@ -1149,7 +1256,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       ].filter(Boolean).join(" · ");
     }
     return null;
-  }, [bashRunning, pendingBash, isCompacting, agentRunning, streamState.streamingMessage, pendingToolHeaders.length, agentPhase, activeSubagentCount, currentTodoPhase, t, tn]);
+  }, [waitingForInput, bashRunning, pendingBash, isCompacting, agentRunning, streamState.streamingMessage, pendingToolHeaders.length, agentPhase, activeSubagentCount, currentTodoPhase, t, tn]);
 
   const askOpen = extensionDialog?.method === "ask";
   const hiddenComposerRef = useRef<HTMLDivElement>(null);
@@ -1181,7 +1288,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       onFollowUp={agentRunning ? handleFollowUp : undefined}
       outbox={!isNew}
       isStreaming={sessionBusy}
-      submissionBlocked={editingEntryId !== null}
+      submissionBlocked={historyCached || editingEntryId !== null}
       model={displayModelValue}
       isAutoModelSelection={isAutoModelSelection}
       modelNames={modelNames}
@@ -1239,6 +1346,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
          nothing to collapse. */
       onMinimize={isEmptyNew ? undefined : handleMinimize}
       statusText={hasStatusHostRow ? null : composerStatusText}
+      waitingForInput={waitingForInput}
       onOpenProviders={onOpenProviders}
     />
   );
@@ -1250,7 +1358,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     return <WorkspaceState kind="loading" title={t("chatWindow.loadingSession")} />;
   }
 
-  if (error && heldMessages.length === 0 && !(currentHostStatus && !isLinkUp(currentHostStatus))) {
+  if (error && !historyCached && heldMessages.length === 0 && !(currentHostStatus && !isLinkUp(currentHostStatus))) {
     return (
       <WorkspaceState
         kind="error"
@@ -1371,7 +1479,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             {hostBanner}
             <NoticeShelf notices={notices} onDismiss={dismissNotice} align="right" />
             <SkillDiagnosticsNotice snapshot={skillDiagnostics} onDisable={() => setSkillStartupDiagnostics(false)} />
-            <ComposerPanels todoPhases={[]} subagents={[]} onSelectSubagent={setSelectedSubagent} btw={btwPanel} />
+            <ComposerPanels todoPhases={[]} subagents={[]} onSelectSubagent={setSelectedSubagent} btw={btwPanel} waitingForInput={waitingForInput} />
             {/* ChatInput insets itself by CHAT_COLUMN_PADDING; cancel this column's
                 padding so the composer matches its in-session width. */}
             <div style={{ margin: `0 -${CHAT_COLUMN_PADDING}px` }}>{chatInputElement}</div>
@@ -1420,6 +1528,21 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 </div>
               )}
 
+            {historyCached && (
+              <div role="status" className="mb-2 text-xs text-text-muted">
+                {t("chatWindow.cachedHistoryNotice")}{" "}
+                <button type="button" className="underline" onClick={retrySession}>{t("chatWindow.retry")}</button>
+              </div>
+            )}
+            {historyWindow && (
+              <div role="note" style={{
+                marginBottom: 8, padding: "7px 10px", border: "1px solid var(--border)",
+                borderRadius: "var(--radius-control)", background: "var(--bg-subtle)",
+                color: "var(--text-muted)", fontSize: 12,
+              }}>
+                {t("chatWindow.historyWindowNotice")}
+              </div>
+            )}
             {conversationMeta.hasCompaction && (
               <div
                 style={{
@@ -1429,12 +1552,14 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 }}
               >
                 <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
-                  {showPreCompactionHistory ? t("chatWindow.fullHistoryVisible") : t("chatWindow.compactedHistoryNotice")}
+                  {showPreCompactionHistory
+                    ? t(historyWindow ? "chatWindow.windowHistoryVisible" : "chatWindow.fullHistoryVisible")
+                    : t("chatWindow.compactedHistoryNotice")}
                 </span>
                 <button
                   type="button"
                   onClick={togglePreCompactionHistory}
-                  disabled={editingEntryId !== null}
+                  disabled={historyCached || editingEntryId !== null}
                   style={{
                     flexShrink: 0, padding: "4px 8px", borderRadius: 6, border: "1px solid var(--border)",
                     background: "var(--bg)", color: "var(--text)", cursor: "pointer", fontSize: 12,
@@ -1458,7 +1583,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               sessionBusy={sessionBusy}
               isCompacting={isCompacting}
               externalRunActive={externalRunActive}
-              isNew={isNew}
+              isNew={isNew || historyCached}
               forkingEntryId={forkingEntryId}
               editingEntryId={editingEntryId}
               handleFork={handleFork}
@@ -1475,6 +1600,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               nearBottom={nearBottom}
               sentinelRef={sentinelRef}
               handleLoadMoreClick={handleLoadMoreClick}
+              hasOlder={hasOlder && !historyCached}
+              loadingOlder={loadingOlder}
+              olderHistoryError={olderHistoryError}
+              handleLoadOlder={handleLoadOlder}
             />
             {/* Also while held: a finished reply stays until its saved row
                 replaces it in the same render (useAgentSession-stream). */}
@@ -1577,6 +1706,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
           isStreaming={sessionBusy}
           isCompacting={isCompacting}
           statusText={composerStatusText}
+          waitingForInput={waitingForInput}
           expandRef={minimizedExpandRef}
           onExpand={handleExpand}
           onAbort={handleAbort}
@@ -1639,6 +1769,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               onSelectSubagent={setSelectedSubagent}
               btw={btwPanel}
               liveStatus={composerStatusText}
+              waitingForInput={waitingForInput}
             />
             <ExtensionWidgets widgets={belowEditorWidgets} />
           </div>
@@ -1990,11 +2121,12 @@ function ExtensionCustomPanel({
 }
 
 /** Slim pill bar replacing the full composer when minimized. */
-const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, expandRef, onExpand, onAbort, onAbortCompaction }: {
+const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, waitingForInput = false, expandRef, onExpand, onAbort, onAbortCompaction }: {
   draftKey?: string;
   isStreaming: boolean;
   isCompacting?: boolean;
   statusText?: string | null;
+  waitingForInput?: boolean;
   expandRef?: Ref<HTMLButtonElement>;
   onExpand: () => void;
   onAbort: () => void;
@@ -2048,7 +2180,7 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
               <Paperclip size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
             )}
             {statusText ? (
-              <span style={{
+              <span title={waitingForInput ? statusText : undefined} style={{
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 7,
@@ -2057,8 +2189,12 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
                 fontSize: 13,
                 color: "var(--text-muted)",
               }}>
-                <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {waitingForInput ? (
+                  <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden="true" />
+                ) : (
+                  <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
+                )}
+                <span className={waitingForInput ? "sr-only" : undefined} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {statusText}
                 </span>
               </span>

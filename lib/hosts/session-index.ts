@@ -142,7 +142,7 @@ export function invalidateHostSessionList(hostId: string): void {
 
 /** This machine's session files changed outside any host op (a terminal omp, an import, an archive restore): its daemon and main drop their lists. */
 export function invalidateLocalSessionLists(sessionFile?: string): void {
-  getHost(LOCAL_HOST_ID).invalidateSessionLists(sessionFile);
+  getHost(LOCAL_HOST_ID).invalidateSessionLists(sessionFile, { observedChange: true });
   invalidateHostSessionList(LOCAL_HOST_ID);
 }
 

@@ -157,14 +157,13 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
   async sessionFileExists(path) {
     return existsSync(path);
   },
-  /** Invalidate session-list metadata plus ONLY this session's parse caches
-   * when the file path is known, else fall back to the full invalidation. */
-  invalidateSessionLists(sessionFile) {
+  /** Observations verify retained history; confirmed mutations retire reads. */
+  invalidateSessionLists(sessionFile, options = {}) {
     if (sessionFile) {
       invalidateSessionListMeta();
-      invalidateSessionEntriesCache(sessionFile);
+      invalidateSessionEntriesCache(sessionFile, options);
     } else {
-      invalidateSessionListCache();
+      invalidateSessionListCache(options);
     }
   },
   autoApproveExtension() {

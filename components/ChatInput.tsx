@@ -2,7 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, useMemo, forwardRef, memo, KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, Reply, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
+import { ChevronDown, CircleHelp, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, Reply, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
 import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
 import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActivePlan } from "@/lib/web-mode-state";
@@ -273,6 +273,7 @@ interface Props {
   onMinimize?: () => void;
   /** Active status label attached to the composer's top edge (e.g. "Waiting for model..."). */
   statusText?: string | null;
+  waitingForInput?: boolean;
   /** Open Settings → API Keys & Providers from the model picker footer. */
   onOpenProviders?: () => void;
 }
@@ -395,6 +396,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onAdvisorChange,
   onMinimize,
   statusText,
+  waitingForInput = false,
   onOpenProviders,
 }: Props, ref) {
   const isMobile = useIsMobile();
@@ -2937,6 +2939,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           <div
             role="status"
             aria-live="polite"
+            title={waitingForInput ? statusText : undefined}
             style={{
               border: `1px solid ${bashMode ? "var(--tool-bg)" : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
               borderBottom: "none",
@@ -2950,11 +2953,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               color: "var(--text-muted)",
             }}
           >
-            <span
-              aria-hidden
-              className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent"
-            />
-            <span>{statusText}</span>
+            {waitingForInput ? (
+              <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden="true" />
+            ) : (
+              <span
+                aria-hidden
+                className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent"
+              />
+            )}
+            <span className={waitingForInput ? "sr-only" : undefined}>{statusText}</span>
           </div>
         )}
           <div

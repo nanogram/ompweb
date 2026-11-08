@@ -5,6 +5,7 @@ import React from "react";
 const { cleanup, fireEvent, render } = await import("@testing-library/react/pure.js");
 const { CommittedTranscript } = await import("./ChatWindow.tsx");
 const { collectToolResults, planTranscriptRows, transcriptRowIndex } = await import("../lib/chat-transcript-plan.ts");
+const { translate } = await import("../lib/i18n");
 afterEach(cleanup);
 
 const assistant = (text, extra = {}) => ({ role: "assistant", provider: "p", model: "m", content: [{ type: "text", text }], ...extra });
@@ -24,7 +25,8 @@ function propsFor(messages, options = {}) {
     externalRunActive: false, isNew: true, forkingEntryId: null, editingEntryId: null,
     handleFork() {}, handleEdit: async () => true, modelNames: {}, toolCallsDefaultCollapsed: true,
     hideToolActivity: true, expandThinkingByDefault: false, hideThinkingBlock: false,
-    visibleCount: 40, nearBottom: true, sentinelRef: { current: null }, handleLoadMoreClick() {}, ...options,
+    visibleCount: 40, nearBottom: true, sentinelRef: { current: null }, handleLoadMoreClick() {},
+    hasOlder: false, loadingOlder: false, olderHistoryError: false, handleLoadOlder() {}, ...options,
   };
 }
 
@@ -118,3 +120,45 @@ test("finishing a continued turn closes its new progress history without hiding 
   assert.equal(view.queryByText("The final answer"), null, "the old answer is now expandable progress");
   assert.ok(view.getByText("Updated final answer"));
 });
+
+test("local render pages precede the accessible remote older-history control and retry", () => {
+  const messages = Array.from({ length: 60 }, (_, index) => ({ role: "user", content: `saved prompt ${index}` }));
+  let local = 0;
+  let remote = 0;
+  const props = propsFor(messages, {
+    hasOlder: true,
+    handleLoadMoreClick() { local += 1; },
+    handleLoadOlder() { remote += 1; },
+  });
+  const view = render(React.createElement(CommittedTranscript, props));
+  fireEvent.click(view.getByRole("button", { name: translate("chatWindow.scrollUpToLoad", { count: 20 }) }));
+  assert.equal(local, 1);
+  assert.equal(remote, 0);
+  view.rerender(React.createElement(CommittedTranscript, { ...props, visibleCount: 100 }));
+  fireEvent.click(view.getByRole("button", { name: translate("chatWindow.loadOlderMessages") }));
+  assert.equal(remote, 1);
+  view.rerender(React.createElement(CommittedTranscript, { ...props, visibleCount: 100, loadingOlder: true }));
+  const busy = view.getByRole("button", { name: translate("chatWindow.loadingOlderMessages") });
+  assert.equal(busy.disabled, true);
+  assert.equal(busy.getAttribute("aria-busy"), "true");
+  view.rerender(React.createElement(CommittedTranscript, { ...props, visibleCount: 100, olderHistoryError: true }));
+  fireEvent.click(view.getByRole("button", { name: translate("chatWindow.retryOlderMessages") }));
+  assert.equal(remote, 2);
+  assert.ok(view.getByText("saved prompt 59"), "a failed remote page cannot hide saved text");
+});
+
+
+test("prepending persisted entries preserves the open process details of an existing turn", () => {
+  const messages = completed();
+  const ids = ["prompt", "progress", "answer"];
+  const view = render(React.createElement(CommittedTranscript, propsFor(messages, { entryIds: ids })));
+  fireEvent.click(view.getByRole("button", { name: /Process details/ }));
+  assert.ok(view.getByText("Intermediate needle"));
+  const earlier = [{ role: "user", content: "Earlier prompt" }, assistant("Earlier final", { stopReason: "stop" })];
+  view.rerender(React.createElement(CommittedTranscript, propsFor([...earlier, ...messages], {
+    entryIds: ["earlier-prompt", "earlier-answer", ...ids], visibleCount: 100, nearBottom: false,
+  })));
+  assert.ok(view.getByText("Intermediate needle"));
+  assert.ok(view.getByText("The final answer"));
+});
+

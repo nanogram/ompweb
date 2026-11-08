@@ -44,6 +44,7 @@ import { LOCAL_HOST_ID } from "./hosts/registry";
 import type { OpResult } from "./hosts/session-ops";
 import { hostForSessionId, invalidateHostSessionList, listSessionsAllHosts, sessionSpawnTarget } from "./hosts/session-index";
 import type { SessionLiveSnapshot, SessionLiveToolEvent, SessionStreamCursor } from "./session-sync";
+import type { SessionActivity, SessionActivityStatus } from "./session-activity";
 
 // ============================================================================
 // Types
@@ -106,6 +107,7 @@ const AUTO_TITLE_MAX_ATTEMPTS = 3;
 const RENAME_OUTPUT_RE = /^(Session renamed to |Could not generate a session title|Session name not changed|Rename failed:)/;
 const NON_TERMINAL_CONTINUATION_GRACE_MS = 2_000;
 const AWAITING_AGENT_START_TIMEOUT_MS = 10_000;
+const MAX_RETAINED_SESSION_ACTIVITIES = 1000;
 const RESTARTING_MESSAGE = "This session is restarting — retry in a moment.";
 const BASH_EXCLUDE_MESSAGE =
   "omp cannot run a shell command with its output excluded from the model context (`!!`): the RPC bash command has no exclusion option, so the output would silently enter the context anyway. Run it with a single `!` to share the output with the model, or use a terminal outside omp web.";
@@ -399,6 +401,37 @@ function watchReplacement(wrapper: AgentSessionWrapper, command: Record<string, 
     stop() { stopped = true; clearTimeout(timer); clearTimeout(expansionRetry); detach(); },
   };
 }
+type RunOutcome = { status: "completed" | "error" | "quota" | "interrupted"; detail?: string };
+
+function activityErrorText(value: unknown, depth = 0): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (!value || typeof value !== "object" || depth > 3) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ["errorMessage", "finalError", "error", "message", "detail"]) {
+    const text = activityErrorText(record[key], depth + 1);
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function failedRunOutcome(value: unknown): RunOutcome {
+  const detail = activityErrorText(value) ?? "The agent run failed";
+  const quota = /\b429\b|quota|resource[_ ]exhausted|rate.?limit|usage.?limit|insufficient[_ ]quota|credits? (?:exhausted|depleted)|too many requests|Cloud Code Assist/i.test(detail);
+  return { status: quota ? "quota" : "error", detail };
+}
+
+/** Only final assistant messages describe the model outcome; tools and partial text do not. */
+function assistantRunOutcome(value: unknown): RunOutcome | undefined {
+  if (!isRecord(value) || value.role !== "assistant") return undefined;
+  if (["aborted", "abort", "interrupted", "length"].includes(String(value.stopReason ?? ""))) {
+    return { status: "interrupted", detail: activityErrorText(value.errorMessage) };
+  }
+  if (value.stopReason === "error" || value.errorMessage) return failedRunOutcome(value);
+  if (value.stopReason === "toolUse" || value.stopReason === "tool_use") return undefined;
+  if (value.stopReason === "stop" || hasVisibleAssistantContent(value)) return { status: "completed" };
+  return undefined;
+}
+
 export class AgentSessionWrapper {
   private listeners: EventListener[] = [];
   private pendingUiRequests = new Map<string, UnsequencedAgentEvent>();
@@ -445,6 +478,12 @@ export class AgentSessionWrapper {
   /** Positive evidence for this run, retained after native completion but before disk append. */
   private responseObserved = false;
   private responseRunActive = false;
+  private activity: SessionActivity | undefined;
+  private activityRunActive = false;
+  private assistantOutcome: RunOutcome | undefined;
+  private explicitOutcome: RunOutcome | undefined;
+  private replacingRun = false;
+  private retrying = false;
   private fastModeEnabled = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Lazily-armed deadline for tearing down a session nobody is watching. */
@@ -557,6 +596,7 @@ export class AgentSessionWrapper {
     this.host = host;
     this.launchAdvisor = launchAdvisor;
     this.fellBack = fellBack;
+    if (expectedSessionId) this.activity = getActivityMap().get(expectedSessionId);
   }
 
   get sessionId(): string {
@@ -584,6 +624,51 @@ export class AgentSessionWrapper {
     // closes stdin and OMP records "Request was aborted", even without a Stop.
     return this.isAlive() && (this.promptRunning || this.streaming || this.compacting || this.bashRunning
       || this.pendingUiRequests.size > 0 || this.pendingHostTools.size > 0 || this.pendingHostUris.size > 0);
+  }
+
+  /** Display state only: a question never pauses native execution or changes reaper ownership. */
+  getActivity(): SessionActivity | undefined {
+    this.reconcileActivity();
+    return this.activity ? { ...this.activity } : undefined;
+  }
+
+  private setActivity(status: SessionActivityStatus, detail?: string): void {
+    if (!this._sessionId) return;
+    detail = detail?.slice(0, 500);
+    const hostId = this.host.id === LOCAL_HOST_ID ? undefined : this.host.id;
+    if (this.activity?.id === this._sessionId && this.activity.status === status && this.activity.detail === detail && this.activity.cwd === this.cwd && this.activity.hostId === hostId) return;
+    this.activity = { id: this._sessionId, cwd: this.cwd, ...(hostId ? { hostId } : {}), status, ...(detail ? { detail } : {}), updatedAt: Date.now() };
+    retainSessionActivity(this.activity);
+  }
+
+  private reconcileActivity(): void {
+    const outcome = this.explicitOutcome ?? this.assistantOutcome;
+    if (this.pendingUiRequests.size > 0) {
+      this.setActivity("waiting_input");
+    } else if (outcome && !this.retrying && (outcome.status !== "completed" || (!this.activityRunActive && !this.unsettled))) {
+      this.setActivity(outcome.status, outcome.detail);
+    } else if (this.isRunning() || this.retrying || (outcome?.status === "completed" && this.unsettled)) {
+      this.setActivity("running");
+    } else if (!this.activity || this.activity.status === "running" || this.activity.status === "waiting_input") {
+      // Neither idle state nor an empty terminal frame proves success.
+      this.setActivity("idle");
+    }
+  }
+
+  private beginActivityRun(): void {
+    this.activityRunActive = true;
+    this.assistantOutcome = undefined;
+    this.explicitOutcome = undefined;
+    this.retrying = false;
+    this.setActivity("running");
+  }
+
+  private finishActivityRun(outcome = this.explicitOutcome ?? this.assistantOutcome): void {
+    this.activityRunActive = false;
+    this.explicitOutcome = outcome;
+    this.retrying = false;
+    this.replacingRun = false;
+    this.reconcileActivity();
   }
 
   /** Local history navigation is busy control work, not an interruptible model turn. */
@@ -962,6 +1047,16 @@ export class AgentSessionWrapper {
     // live stream and run state must survive; only the id changes.
     const moved = identityChanged && this.sessionMovePending;
     if (identityChanged && !moved) {
+      if (this.activityRunActive || this.isRunning() || this.unsettled) {
+        const outcome = this.explicitOutcome ?? (this.assistantOutcome?.status !== "completed" ? this.assistantOutcome : undefined);
+        this.unsettled = false;
+        this.finishActivityRun(outcome ?? { status: "interrupted" });
+      }
+      this.activityRunActive = false;
+      this.assistantOutcome = undefined;
+      this.explicitOutcome = undefined;
+      this.replacingRun = false;
+      this.retrying = false;
       this.clearPendingUiRequests();
       this.resetStream();
       this.promptRunning = false;
@@ -975,11 +1070,21 @@ export class AgentSessionWrapper {
     }
     if (queue) this.nativeQueuedMessages = queue;
     this._sessionId = state.sessionId;
+    if (this.activity?.id !== this._sessionId) {
+      const previousActivity = this.activity;
+      this.activity = getActivityMap().get(this._sessionId);
+      if (moved && previousActivity) {
+        getActivityMap().delete(oldId);
+        this.setActivity(previousActivity.status, previousActivity.detail);
+      }
+    }
     this._sessionFile = state.sessionFile ?? "";
     this._sessionName = state.sessionName;
     this.streaming = state.isStreaming;
     this.compacting = state.isCompacting;
     this.fastModeEnabled = state.fastModeEnabled ?? state.fastMode ?? this.fastModeEnabled;
+    if ((state.isStreaming || state.isCompacting) && !this.activityRunActive
+      && (!this.explicitOutcome || (this.explicitOutcome.status === "completed" && !this.unsettled))) this.beginActivityRun();
     // The path cache resolves ids to files on this machine only (file authorization).
     if (this._sessionFile && this.host.id === LOCAL_HOST_ID) cacheSessionPath(this._sessionId, this._sessionFile);
     if (moved) {
@@ -993,6 +1098,7 @@ export class AgentSessionWrapper {
         this.invalidateSessionLists();
       }
     }
+    this.reconcileActivity();
     return queue;
   }
 
@@ -1127,6 +1233,10 @@ export class AgentSessionWrapper {
     // The shared host stopped it on purpose (abandoned, idle, another server's request): not a crash.
     const planned = this.hostOwnedLifecycle ? sourceProc.transport?.stopReason : undefined;
     if (planned) {
+      if (this.activityRunActive || this.isRunning() || this.unsettled) {
+        this.unsettled = false;
+        this.finishActivityRun(this.explicitOutcome ?? { status: "interrupted" });
+      }
       if (this.streaming || this.promptRunning) this.emit({ type: "agent_end", isTerminal: true, messages: [] });
       this.destroy(`host-${planned}`);
       return;
@@ -1141,6 +1251,13 @@ export class AgentSessionWrapper {
     // Recorded before destroy(): its running-change broadcast must carry the
     // record so sidebars that missed the notice below still see the exit.
     if (this._sessionId) getExitedMap().set(this._sessionId, { id: this._sessionId, cwd: this.cwd, ...(this.host.id === LOCAL_HOST_ID ? {} : { hostId: this.host.id }), at: Date.now(), code, signal, detail });
+    // Outcome reconciliation and the synthetic terminal frame below clear these flags.
+    const wasUnsettled = this.streaming || this.promptRunning || this.unsettled;
+    this.explicitOutcome = (this.assistantOutcome?.status !== "completed" ? this.assistantOutcome : undefined)
+      ?? failedRunOutcome(detail || `The omp process exited unexpectedly (${status})`);
+    this.unsettled = false;
+    this.finishActivityRun();
+    this.clearPendingUiRequests();
     this.emit({
       type: "notice",
       level: "error",
@@ -1149,7 +1266,7 @@ export class AgentSessionWrapper {
     // Terminal agent_end so a client mid-stream stops spinning immediately
     // instead of waiting for the reconcile poll.
     if (this.streaming || this.promptRunning) this.emit({ type: "agent_end", isTerminal: true, messages: [] });
-    if (this.streaming || this.promptRunning || this.unsettled) {
+    if (wasUnsettled) {
       this.publishNotifications({ type: "process_exit", detail: detail || status });
     }
     this.destroy();
@@ -1229,6 +1346,8 @@ export class AgentSessionWrapper {
         break;
       }
       case "agent_start":
+        this.replacingRun = false;
+        if (!this.activityRunActive) this.beginActivityRun();
         this.unsettled = true;
         this.promptRunning = true;
         this.streaming = true;
@@ -1253,6 +1372,7 @@ export class AgentSessionWrapper {
         }
         break;
       case "agent_end":
+        if (this.replacingRun) break;
         if (event.isTerminal !== false) {
           // A server dialog belongs to a tool call of this run; nobody can answer it after the run.
           this.dropServerUiRequests();
@@ -1278,6 +1398,7 @@ export class AgentSessionWrapper {
         this.deliveredCallbacks.clear();
         break;
       case "prompt_result":
+        if (this.replacingRun) break;
         // Local-only prompt (builtin/extension slash command) — no agent run.
         this.promptRunning = false;
         this.awaitingAgentStart = false;
@@ -1319,16 +1440,20 @@ export class AgentSessionWrapper {
         // ignored and the UI would stop with no explanation.
         if (event.success === false && event.command === "get_state") return;
         if (event.success === false) {
+          if (this.replacingRun && event.command === "prompt") {
+            this.emit(event);
+            return;
+          }
           const promptFailure =
-            event.command === "prompt" ||
-            (!event.command && (this.promptRunning || this.streaming));
+            event.command === "prompt" || event.command === "abort_and_prompt" ||
+            (!event.command && !event.id && this.activityRunActive && (this.promptRunning || this.streaming));
           const detail = typeof event.error === "string"
             ? event.error
             : typeof event.message === "string"
               ? event.message
               : "RPC command failed";
           if (!promptFailure) {
-            this.emit({ type: "error", error: event.error, message: detail, command: event.command });
+            this.emit({ type: "error", error: event.error, message: detail, command: event.command ?? "unknown" });
             notifyRunningChange();
             return;
           }
@@ -1465,6 +1590,7 @@ export class AgentSessionWrapper {
     this.publishNotifications(event);
     this.emit(event);
     this.trackQueueProgress(event);
+    this.reconcileActivity();
     notifyRunningChange({ refreshSessionList });
   }
 
@@ -1521,6 +1647,7 @@ export class AgentSessionWrapper {
     }
     if (emitCancel) this.emit({ type: "extension_ui_request", id: `cancel:${id}`, method: "cancel", targetId: id });
     serverRequest?.(confirmed);
+    this.reconcileActivity();
     notifyRunningChange();
     return true;
   }
@@ -1606,18 +1733,24 @@ export class AgentSessionWrapper {
   private trackExtensionUiRequest(event: UnsequencedAgentEvent): boolean {
     const method = event.method as string;
     const id = event.id as string;
+    if (method === "custom" && event.closed === true) {
+      this.settlePendingUiRequest(id, false, false);
+      return false;
+    }
     if (method === "cancel") {
       this.settlePendingUiRequest(event.targetId as string, false, false);
       return false;
     }
     // Blocking dialogs stay pending until the client answers (replayed to
     // newly-attached SSE listeners so dialogs survive reconnects).
-    if (BLOCKING_UI_METHODS.has(method)) {
+    if ((BLOCKING_UI_METHODS.has(method) || method === "custom") && id) {
       this.settlePendingUiRequest(id);
-      const timeout = typeof event.timeout === "number" ? event.timeout : undefined;
-      if (timeout && timeout > 0) {
-        event.expiresAt = Date.now() + timeout;
-        const timer = setTimeout(() => this.settlePendingUiRequest(id), timeout);
+      const timeout = typeof event.timeout === "number" && event.timeout > 0 ? event.timeout : undefined;
+      const expiresAt = typeof event.expiresAt === "number" ? event.expiresAt : timeout ? Date.now() + timeout : undefined;
+      if (expiresAt !== undefined) {
+        event.expiresAt = expiresAt;
+        if (expiresAt <= Date.now()) return false;
+        const timer = setTimeout(() => this.settlePendingUiRequest(id), expiresAt - Date.now());
         timer.unref?.();
         this.uiExpiryTimers.set(id, timer);
       }
@@ -1773,28 +1906,59 @@ export class AgentSessionWrapper {
     // Strip it before caching tool snapshots as well as before wire emission.
     delete event.web;
     switch (event.type) {
+      case "session_settled":
+        this.unsettled = false;
+        this.clearPendingUiRequests();
+        this.reconcileActivity();
+        break;
       case "agent_start":
         this.responseObserved = false;
         this.responseRunActive = true;
         this.clearLiveSnapshots();
         break;
       case "agent_end":
-        if (event.isTerminal === false) break;
+        if (event.isTerminal === false || this.replacingRun) break;
+        if (Array.isArray(event.messages)) {
+          for (let i = event.messages.length - 1; i >= 0; i -= 1) {
+            const message = event.messages[i];
+            if (!isRecord(message) || message.role !== "assistant") continue;
+            const outcome = assistantRunOutcome(message);
+            // A terminal history snapshot must not erase a failure just observed on the wire.
+            if (!this.assistantOutcome || this.assistantOutcome.status === "completed" || (outcome && outcome.status !== "completed")) this.assistantOutcome = outcome;
+            break;
+          }
+        }
+        if (event.error || event.errorMessage) this.explicitOutcome = failedRunOutcome(event);
         this.responseRunActive = false;
         this.streaming = false;
         this.promptRunning = false;
         this.compacting = false;
         this.clearLiveSnapshots();
         this.resumeDeltaUpdates();
+        this.finishActivityRun();
         break;
       case "prompt_error":
       case "prompt_result":
+        if (this.replacingRun) break;
+        if (event.type === "prompt_error" || event.status === "error" || event.success === false) {
+          this.explicitOutcome = failedRunOutcome(event);
+        } else if (event.status === "aborted" || event.status === "interrupted") {
+          this.explicitOutcome = { status: "interrupted", detail: activityErrorText(event.error) };
+        } else if (event.agentInvoked === false || event.status === "completed") {
+          // Native prompt results are terminal evidence, but may leave background work running.
+          if (!this.explicitOutcome || this.explicitOutcome.status === "completed") this.explicitOutcome = { status: "completed" };
+        }
+        if (event.sessionSettled === true) {
+          this.unsettled = false;
+          this.clearPendingUiRequests();
+        }
         this.responseRunActive = false;
         this.streaming = false;
         this.compacting = false;
         this.promptRunning = false;
         this.clearLiveSnapshots();
         this.resumeDeltaUpdates();
+        this.finishActivityRun();
         break;
       case "message_start":
       case "message_update": {
@@ -1815,6 +1979,11 @@ export class AgentSessionWrapper {
           if (this.hostOwnedLifecycle || event.type === "message_start" || isDeltaUpdate(event)) this.openMessages.set(messageId, message);
           else this.openMessages.delete(messageId);
         }
+        if (this.activityRunActive && !this.replacingRun && message?.role === "assistant") {
+          if (event.type === "message_start") this.assistantOutcome = undefined;
+          const outcome = assistantRunOutcome(message);
+          if (outcome && outcome.status !== "completed") this.assistantOutcome = outcome;
+        }
         if (message && message.role !== "user") {
           this.streamingMessage = message;
           this.streamingMessageId = messageId;
@@ -1824,6 +1993,9 @@ export class AgentSessionWrapper {
       }
       case "message_end": {
         const message = event.message as Partial<AgentMessage> | undefined;
+        if (this.activityRunActive && !this.replacingRun && message?.role === "assistant") {
+          this.assistantOutcome = assistantRunOutcome(message);
+        }
         if (this.responseRunActive && hasVisibleAssistantContent(message)) this.responseObserved = true;
         if (typeof event.messageId === "string") this.openMessages.delete(event.messageId);
         if (message?.role && message.role === this.streamingMessage?.role) {
@@ -1834,6 +2006,33 @@ export class AgentSessionWrapper {
         if (message?.role === "assistant") this.resumeDeltaUpdates();
         break;
       }
+      case "auto_retry_start":
+        if (this.activityRunActive) {
+          this.retrying = true;
+          this.assistantOutcome = activityErrorText(event) ? failedRunOutcome(event) : this.explicitOutcome ?? this.assistantOutcome;
+          if (this.explicitOutcome?.status !== "interrupted") this.explicitOutcome = undefined;
+        }
+        break;
+      case "auto_retry_end":
+        this.retrying = false;
+        if (this.activityRunActive && event.success === false) {
+          this.explicitOutcome = activityErrorText(event)
+            ? failedRunOutcome(event)
+            : (this.assistantOutcome?.status !== "completed" ? this.assistantOutcome : undefined) ?? failedRunOutcome(event);
+        } else if (this.activityRunActive && event.success === true) {
+          if (this.assistantOutcome?.status !== "completed") this.assistantOutcome = undefined;
+          if (this.explicitOutcome?.status !== "interrupted") this.explicitOutcome = undefined;
+        }
+        break;
+      case "error":
+      case "agent_error":
+      case "turn_error":
+      case "model_error":
+        if ((this.activityRunActive || this.unsettled) && (!event.command || event.command === "prompt" || event.command === "abort_and_prompt")) this.explicitOutcome = failedRunOutcome(event);
+        break;
+      case "notice":
+        if ((this.activityRunActive || this.unsettled) && event.level === "error") this.explicitOutcome = failedRunOutcome(event);
+        break;
       case "tool_execution_start":
       case "tool_execution_update":
         if (typeof event.toolCallId !== "string") break;
@@ -1887,8 +2086,8 @@ export class AgentSessionWrapper {
    * session_info_update, …) so a busy session does not flush every other
    * open session's parsed-entry cache. List metadata (sidebar order/counts)
    * still always refreshes. */
-  private invalidateSessionLists(): void {
-    this.host.invalidateSessionLists(this._sessionFile || undefined);
+  private invalidateSessionLists(observedChange = true): void {
+    this.host.invalidateSessionLists(this._sessionFile || undefined, { observedChange });
     invalidateHostSessionList(this.host.id);
   }
 
@@ -2210,6 +2409,7 @@ export class AgentSessionWrapper {
       this.promptDispatchPendingCount > 0 ||
       this.historyEditInFlight ||
       (this.awaitingAgentStart && !awaitingExpired) ||
+      this.retrying ||
       this.mcpListWaiter !== null ||
       this.pendingUiRequests.size > 0 ||
       this.pendingHostTools.size > 0 ||
@@ -2224,12 +2424,13 @@ export class AgentSessionWrapper {
       this.promptRunning = false;
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
+      this.activityRunActive = false;
+      this.responseRunActive = false;
       this.clearLiveSnapshots();
     }
 
-    if (wasRunning && !this.isRunning()) {
-      notifyRunningChange();
-    }
+    this.reconcileActivity();
+    if (wasRunning !== this.isRunning() || this.activity) notifyRunningChange();
     const skillDiagnostics = parseSkillDiagnosticsSnapshot(state.skillDiagnostics);
     const goal = state.goal === undefined ? undefined : state.goal === null ? null : readGoalModeState(state.goal) ?? undefined;
     return {
@@ -2240,6 +2441,7 @@ export class AgentSessionWrapper {
       isPromptRunning: this.promptRunning,
       isBashRunning: this.bashRunning,
       responseObserved: this.responseObserved,
+      activity: this.getActivity(),
       isCompacting: state.isCompacting,
       autoCompactionEnabled: state.autoCompactionEnabled,
       autoRetryEnabled: state.autoRetryEnabled,
@@ -2379,7 +2581,7 @@ export class AgentSessionWrapper {
       this.awaitingAgentStartDeadline = 0;
       this.continuationGraceUntil = 0;
       // Invalidate the confirmed edited conversation, not its preserved source.
-      this.invalidateSessionLists();
+      this.invalidateSessionLists(false);
       this.emit({ type: "session_history_changed", leafId: result.leafId });
       notifyRunningChange({ refreshSessionList: true });
       return result;
@@ -2433,6 +2635,10 @@ export class AgentSessionWrapper {
     } catch (error) {
       this.restarting = false;
       throw error;
+    }
+    if (this.activityRunActive || this.isRunning() || this.unsettled) {
+      this.unsettled = false;
+      this.finishActivityRun(this.explicitOutcome ?? { status: "interrupted" });
     }
     this.resetStream();
     this.streaming = false;
@@ -2712,6 +2918,7 @@ export class AgentSessionWrapper {
         if (this.bashRunning && !this.streaming) return await this.queueWhileShellRunning(command);
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
         if (!streamingBehavior) {
+          this.beginActivityRun();
           this.responseObserved = false;
           this.responseRunActive = false;
           if (!this.isRunning()) this.clearLiveSnapshots();
@@ -2748,11 +2955,15 @@ export class AgentSessionWrapper {
           }
           if (ack?.agentInvoked === false) return ack;
         } catch (error) {
-          this.promptRunning = false;
-          this.awaitingAgentStart = false;
-          this.awaitingAgentStartDeadline = 0;
-          this.streaming = false;
-          this.clearLiveSnapshots();
+          if (!streamingBehavior) {
+            this.promptRunning = false;
+            this.awaitingAgentStart = false;
+            this.awaitingAgentStartDeadline = 0;
+            this.streaming = false;
+            this.clearLiveSnapshots();
+            this.unsettled = false;
+            this.finishActivityRun(failedRunOutcome(error));
+          }
           notifyRunningChange();
           if (error instanceof RpcCommandTimeoutError) {
             if (this.linkLostDuring(error)) throw this.hostOfflineError("unknown");
@@ -2806,6 +3017,9 @@ export class AgentSessionWrapper {
         const queueBoundary = this.queueProgress.boundary();
         const result = await this.withFinalRunningNotification(async () => {
           const response: unknown = await this.proc.sendCommand({ type });
+          this.unsettled = false;
+          this.finishActivityRun({ status: "interrupted" });
+          this.clearPendingUiRequests();
           // If the prompt was aborted before the agent loop started, no
           // agent_end will arrive to clear the flag; the streaming flag still
           // tracks a live turn that ends with its own agent_end.
@@ -2914,6 +3128,8 @@ export class AgentSessionWrapper {
       case "compact": {
         try {
           return await this.withFinalRunningNotification(async () => {
+            const standalone = !this.activityRunActive && !this.unsettled;
+            if (standalone) this.beginActivityRun();
             this.compacting = true;
             this.streamSequence += 1;
             notifyRunningChange();
@@ -2923,7 +3139,11 @@ export class AgentSessionWrapper {
                 ...(command.customInstructions ? { customInstructions: command.customInstructions } : {}),
               });
               patchEstimatedTokensAfter(result);
+              if (standalone) this.finishActivityRun({ status: "completed" });
               return result;
+            } catch (error) {
+              if (standalone) this.finishActivityRun(failedRunOutcome(error));
+              throw error;
             } finally {
               this.compacting = false;
               this.streamSequence += 1;
@@ -2937,7 +3157,12 @@ export class AgentSessionWrapper {
       case "abort_compaction":
         // No dedicated RPC command; a plain abort cancels the in-flight turn
         // including compaction work.
-        await this.withFinalRunningNotification(() => this.proc.sendCommand({ type: "abort" }));
+        await this.withFinalRunningNotification(async () => {
+          await this.proc.sendCommand({ type: "abort" });
+          this.unsettled = false;
+          this.finishActivityRun({ status: "interrupted" });
+          this.clearPendingUiRequests();
+        });
         return null;
 
       case "set_session_name": {
@@ -2992,6 +3217,8 @@ export class AgentSessionWrapper {
         if (this.bashRunning) {
           throw new Error("A shell command is already running");
         }
+        const standalone = !this.activityRunActive && !this.unsettled;
+        if (standalone) this.beginActivityRun();
         this.bashRunning = true;
         notifyRunningChange();
         try {
@@ -3001,7 +3228,18 @@ export class AgentSessionWrapper {
           // applied before this await resumes.
           let deferred = this.streaming;
           const result = await this.proc.sendCommand<BashResultInfo>({ type: "bash", command: command.command as string }, undefined, () => { deferred = this.streaming; });
+          if (standalone && !this.unsettled) {
+            const outcome: RunOutcome | undefined = result.cancelled || result.timedOut
+              ? { status: "interrupted" }
+              : result.exitCode !== undefined && result.exitCode !== 0
+                ? failedRunOutcome(`Shell command exited with code ${result.exitCode}`)
+                : undefined;
+            this.finishActivityRun(outcome);
+          }
           return { ...result, deferred };
+        } catch (error) {
+          if (standalone && !this.unsettled) this.finishActivityRun(failedRunOutcome(error));
+          throw error;
         } finally {
           this.bashRunning = false;
           this.invalidateSessionLists();
@@ -3093,15 +3331,32 @@ export class AgentSessionWrapper {
       default: {
         if (PASSTHROUGH_COMMANDS.has(type)) {
           if (type === "abort_and_prompt") {
+            this.replacingRun = this.isRunning() || this.unsettled;
+            this.beginActivityRun();
             this.responseObserved = false;
             this.responseRunActive = false;
             this.streamSequence += 1;
           }
-          const result: unknown = await this.sendNativeMessageCommand(
-            command as { type: string },
-            type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : undefined,
-            command,
-          );
+          let result: unknown;
+          try {
+            result = await this.sendNativeMessageCommand(
+              command as { type: string },
+              type === "predict_word" ? PREDICT_WORD_TIMEOUT_MS : undefined,
+              command,
+            );
+          } catch (error) {
+            if (type === "abort_and_prompt") {
+              this.replacingRun = false;
+              this.unsettled = false;
+              this.finishActivityRun(failedRunOutcome(error));
+            }
+            throw error;
+          }
+          if (type === "abort_retry" || (type === "abort_bash" && !this.streaming && !this.promptRunning && !this.unsettled)) {
+            this.unsettled = false;
+            this.finishActivityRun({ status: "interrupted" });
+            notifyRunningChange();
+          }
           if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
         }
@@ -3144,6 +3399,11 @@ export class AgentSessionWrapper {
     if (this.destroyPromise) return untilHostDown(this.host, this.destroyPromise);
     if (!this._alive) return;
     console.info("[omp-web] session-dispose", JSON.stringify({ sessionId: this._sessionId, reason, running: this.isRunning(), pendingDialogs: this.pendingUiRequests.size, at: new Date().toISOString(), caller: new Error().stack?.split("\n").slice(2, 5).map((line) => line.trim()) }));
+    if (this.activityRunActive || this.isRunning() || this.unsettled) {
+      const outcome = this.explicitOutcome ?? (this.assistantOutcome?.status !== "completed" ? this.assistantOutcome : undefined);
+      this.unsettled = false;
+      this.finishActivityRun(outcome ?? { status: "interrupted" });
+    }
     this._alive = false;
     this.reportInterest();
     this.deliveredCallbacks.clear();
@@ -3218,6 +3478,7 @@ export interface RunningSessionUpdate {
   ids: string[];
   runningSessions: RunningRpcSession[];
   exitedSessions: ExitedRpcSession[];
+  sessionActivities: SessionActivity[];
   refreshSessionList: boolean;
 }
 
@@ -3228,6 +3489,7 @@ declare global {
   var __ompRunningListeners: Set<(update: RunningSessionUpdate) => void> | undefined;
   var __ompHostToolListeners: Set<(call: CrossSessionHostToolEvent) => void> | undefined;
   var __ompExitedSessions: Map<string, ExitedRpcSession> | undefined;
+  var __ompSessionActivities: Map<string, SessionActivity> | undefined;
   var __ompFrameTaps: Set<(wrapper: AgentSessionWrapper, event: AgentEvent) => void> | undefined;
   var __ompSessionMoveListeners: Set<(from: string, to: string) => void> | undefined;
   var __ompNativeWrites: WeakSet<object> | undefined;
@@ -3258,6 +3520,34 @@ export function getExitedRpcSession(sessionId: string): ExitedRpcSession | undef
 /** Clear the visible crash state once a replacement child is ready. */
 export function clearExitedRpcSession(sessionId: string): boolean {
   const cleared = getExitedMap().delete(sessionId);
+  if (cleared) notifyRunningChange();
+  return cleared;
+}
+
+function getActivityMap(): Map<string, SessionActivity> {
+  return (globalThis.__ompSessionActivities ??= new Map());
+}
+
+function retainSessionActivity(activity: SessionActivity): void {
+  const activities = getActivityMap();
+  activities.delete(activity.id);
+  activities.set(activity.id, activity);
+  while (activities.size > MAX_RETAINED_SESSION_ACTIVITIES) activities.delete(activities.keys().next().value!);
+}
+
+/** Latest live evidence, including bounded terminal records retained after a child exits. */
+export function getSessionActivities(): SessionActivity[] {
+  const live = new Map<string, SessionActivity>();
+  for (const session of new Set(getRegistry().values())) {
+    const activity = session.getActivity?.();
+    if (activity) live.set(activity.id, activity);
+  }
+  return [...getActivityMap().values()].filter((activity) => !live.has(activity.id)).map((activity) => ({ ...activity })).concat([...live.values()]);
+}
+
+/** Deleted/archived sessions must not reappear as retained sidebar activity. */
+export function clearRpcSessionActivity(sessionId: string): boolean {
+  const cleared = getActivityMap().delete(sessionId);
   if (cleared) notifyRunningChange();
   return cleared;
 }
@@ -3385,7 +3675,7 @@ export function subscribeHostToolCalls(listener: (call: CrossSessionHostToolEven
 }
 
 // Starts at the empty state so an idle server never broadcasts "nothing changed".
-let lastRunningSnapshot = "[[],[]]";
+let lastRunningSnapshot = "[[],[],[]]";
 
 /**
  * Recompute the running-session-id set and, when it changes, broadcast it.
@@ -3395,13 +3685,14 @@ let lastRunningSnapshot = "[[],[]]";
 export function notifyRunningChange({ refreshSessionList = false }: { refreshSessionList?: boolean } = {}): void {
   const runningSessions = getRunningRpcSessions();
   const exitedSessions = getExitedRpcSessions();
+  const sessionActivities = getSessionActivities();
   const ids = runningSessions.map((s) => s.id);
   const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
-  const snapshot = JSON.stringify([runningSessions.slice().sort(byId), exitedSessions.slice().sort(byId)]);
+  const snapshot = JSON.stringify([runningSessions.slice().sort(byId), exitedSessions.slice().sort(byId), sessionActivities.slice().sort(byId)]);
   if (snapshot === lastRunningSnapshot && !refreshSessionList) return;
   lastRunningSnapshot = snapshot;
   syncInterruptibleSessions();
-  const update: RunningSessionUpdate = { ids, runningSessions, exitedSessions, refreshSessionList };
+  const update: RunningSessionUpdate = { ids, runningSessions, exitedSessions, sessionActivities, refreshSessionList };
   for (const listener of getRunningListeners()) {
     try { listener(update); } catch { /* ignore listener errors */ }
   }

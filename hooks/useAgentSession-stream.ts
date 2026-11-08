@@ -8,6 +8,7 @@ import type {
   ExtensionStatusItem,
   ExtensionUiRequest,
   ExtensionWidgetItem,
+  SessionContext,
   SessionTreeNode,
 } from "@/lib/types";
 import type { EventStream } from "@/lib/event-stream";
@@ -20,20 +21,18 @@ import type {
 } from "@/lib/subagent-types";
 import { translate } from "@/lib/i18n";
 import { isLocalUri } from "@/lib/local-uri";
-import type { SessionStreamCursor } from "@/lib/session-sync";
+import type { SessionHistoryCursor, SessionStreamCursor } from "@/lib/session-sync";
 
 export interface SessionData {
   sessionId: string;
   filePath: string;
   tree: SessionTreeNode[];
   leafId: string | null;
-  context: {
-    messages: AgentMessage[];
-    entryIds: string[];
-    thinkingLevel: string;
-    model: { provider: string; modelId: string } | null;
-    todoPhases: TodoPhase[];
-  };
+  context: SessionContext;
+  cursor?: SessionHistoryCursor;
+  hasMore?: boolean;
+  hasOlder?: boolean;
+  agent?: { running: boolean; state?: AgentStateResponse };
 }
 
 export interface StreamingState {

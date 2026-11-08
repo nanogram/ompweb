@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity, Bot, Check, ChevronDown, Copy,
-  CircleDollarSign, Clock3, Cpu, Gauge, GitBranch, Network, RefreshCw,
+  CircleDollarSign, CircleHelp, Clock3, Cpu, Gauge, GitBranch, Network, RefreshCw,
   UserRound, Wrench, type LucideIcon,
 } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
@@ -147,7 +147,7 @@ function SubagentActivityLine({ subagent }: { subagent: SubagentInfo }) {
   );
 }
 
-function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, liveStatus = null }: {
+function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, liveStatus = null, waitingForInput = false }: {
   subagents: SubagentInfo[];
   onSelectSubagent: (subagent: SubagentInfo) => void;
   /** Initial expansion (default: collapsed — the header still shows the live summary). */
@@ -155,6 +155,7 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
   /** Transient live-agent status merged into this header row when no todo
    * row exists to host it (#245). See TodoList's liveStatus. */
   liveStatus?: string | null;
+  waitingForInput?: boolean;
 }) {
   const { t } = useI18n();
   const [collapsed, setCollapsed] = useState(() => loadCollapsed(SUBAGENTS_COLLAPSED_STORAGE_KEY, defaultExpanded));
@@ -246,8 +247,12 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
             title={liveStatus}
             style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6, color: "var(--text-muted)" }}
           >
-            <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{liveStatus}</span>
+            {waitingForInput ? (
+              <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden />
+            ) : (
+              <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
+            )}
+            <span className={waitingForInput ? "sr-only" : undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{liveStatus}</span>
           </span>
         ) : null}
         <span
@@ -313,7 +318,7 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
  * via its header row (`chevron`); todo/subagents start collapsed (headers
  * always show live progress / running-summary), a new side question starts
  * expanded. Rendered pinned above the chat input. */
-export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = null, defaultExpanded = false, liveStatus = null }: {
+export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = null, defaultExpanded = false, liveStatus = null, waitingForInput = false }: {
   todoPhases: TodoPhase[];
   subagents: SubagentInfo[];
   onSelectSubagent: (subagent: SubagentInfo) => void;
@@ -326,6 +331,7 @@ export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = 
    * row; when neither exists the caller keeps the standalone bar so the
    * status is never hidden. */
   liveStatus?: string | null;
+  waitingForInput?: boolean;
 }) {
   const [todoCollapsed, setTodoCollapsed] = useState(() => loadCollapsed(TODO_COLLAPSED_STORAGE_KEY, defaultExpanded));
   if (todoPhases.length === 0 && subagents.length === 0 && !btw) return null;
@@ -336,12 +342,13 @@ export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = 
       <TodoList
         phases={todoPhases}
         liveStatus={todoHostsLiveStatus ? liveStatus : null}
+        waitingForInput={waitingForInput}
         collapsible
         defaultExpanded={defaultExpanded}
         collapsed={todoCollapsed}
         onCollapsedChange={(collapsed) => { saveCollapsed(TODO_COLLAPSED_STORAGE_KEY, collapsed); setTodoCollapsed(collapsed); }}
       />
-      <SubagentsPanel subagents={subagents} onSelectSubagent={onSelectSubagent} defaultExpanded={defaultExpanded} liveStatus={todoHostsLiveStatus ? null : liveStatus} />
+      <SubagentsPanel subagents={subagents} onSelectSubagent={onSelectSubagent} defaultExpanded={defaultExpanded} liveStatus={todoHostsLiveStatus ? null : liveStatus} waitingForInput={waitingForInput} />
     </div>
   );
 }

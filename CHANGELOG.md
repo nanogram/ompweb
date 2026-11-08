@@ -8,6 +8,9 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Added
 
+- **Outcome-aware session status.** Errors and exhausted usage show red, pending questions show a static amber question mark, and green marks only successful completions not yet viewed. Folder status follows descendant error → question → unread completion priority without an idle/running status decoration.
+- **Optional last-chat startup.** Reopen this browser's last-viewed chat in new tabs or on reload, preserving its host. Explicit chat/workspace links win, and temporary offline failures do not erase the saved destination.
+- **Progressive large-session history.** Initial chat loads use the newest 50 messages and a soft 256 KiB page budget, with older-page prepend and deferred thinking/media. Normal display reads retain the latest 128 MiB without deleting canonical history or shrinking OMP's model context. A bounded display-only IndexedDB cache paints recent messages while authoritative HTTP revalidates.
 - **Native goals and queue progress.** `/goal` and runtime-owned slash commands use OMP's command catalog instead of browser-only goal state. The composer shows per-item pending, active and finished queue progress; only finished display records are trimmed, never OMP's actual queue.
 - **Configurable conversation outline and transcript.** Settings → Interface & Behavior offers a desktop rail, floating outline button or no outline, an optional mobile outline button, Classic or Focused transcript presentation, and default Process details expansion. Classic remains the default; live, incomplete and failed output remains visible, and search can reveal folded content.
 - **Traditional Chinese.** Added `zh-TW`, including automatic selection for Traditional Chinese browser regions/scripts and a translated README.
@@ -40,6 +43,10 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Fixes & Improvements
 
+- **Fresh sends no longer depend on the viewer staying active.** The server owns the first prompt alongside startup, coalesces matching creation keys and attaches uploads through the owning host. Pre-created sessions hand off before observation/model/history waits; captured run boundaries use the shared HTTP/WebSocket response.
+- **History remains responsive and safe across changes.** Metadata-first cooperative indexing reuses verified append prefixes, bounds retained caches and negotiates history gzip asynchronously. Owning-host list refreshes no longer cancel otherwise valid history reads with HTTP 500; explicit edit/delete invalidation stays strict.
+- **Mobile loading and storage recovery.** Failed initial lists show an actionable error even with the sidebar closed, and foreground/online retries recover. Blocked browser storage cannot crash sound preference initialization; cached transcripts never authorize sends before revalidation.
+- **Preserve native delivery and editing invariants.** Command preparation retains outbox correlation, crash notifications sample active state before cleanup, and history hydration keeps StrictMode observer ownership, Edit drafts and persisted model/thinking metadata.
 - **Safer runtime startup and dialog settlement.** Startup protocol negotiation remains bounded without swallowing later command failures. Dialog answers keep pending state until their transport write succeeds and use the same settlement path from chat and notifications.
 - **Responsive usage reports.** Usage scans run in a coalescing worker, custom time windows are validated, and compiled releases include the worker's parser/YAML dependencies and licenses.
 - **Workspace and settings correctness.** Re-adding a project preserves its metadata, sanitized worktree-name collisions remain distinct, cwd-less chats stay browsable, XDG session roots are watched, and OMP profiles are validated before spawning. MCP editors discard stale workspace state; server-backed switches serialize saves, restore confirmed values on failure and remain usable afterward. Notification/toast controls support keyboard interaction.

@@ -1,5 +1,6 @@
 import type { SkillDiagnosticsSnapshot } from "./skill-diagnostics";
 import type { QueueProgressSnapshot } from "./queue-progress";
+import type { SessionActivity } from "./session-activity";
 
 // Local mirrors of the omp shapes used by omp-web. omp's SDK packages are
 // Bun-only, so these types are hand-maintained against
@@ -146,6 +147,7 @@ export interface WebSessionState {
   isCompacting: boolean;
   /** Web-observed current-run response; not a persisted-history cursor. */
   responseObserved?: boolean;
+  activity?: SessionActivity;
   autoCompactionEnabled: boolean;
   interruptMode: "immediate" | "wait";
   steeringMode: "all" | "one-at-a-time";

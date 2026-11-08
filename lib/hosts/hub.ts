@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { readBodyWithinLimit } from "../bounded-form-data";
 import type { RpcTransport } from "../omp/rpc-transport";
 import type { ProjectRegistryEntry } from "../project-registry";
+import { MAX_SYNC_MESSAGES, RECENT_SYNC_MESSAGES, parseHistoryCursor } from "../session-sync";
 import { isValidSessionId } from "../session-file-references-core";
 import { appendTransportSamples, transportMetricsPath } from "../transport-metrics";
 import { isRecord } from "../type-guards";
@@ -982,14 +983,22 @@ function validResult(op: keyof SessionOps, result: unknown, args: unknown[]): bo
       return isRecord(value) && typeof value.cwd === "string" && typeof value.projectRoot === "string" && (value.projectKey === undefined || typeof value.projectKey === "string");
     case "exportSession":
       return isRecord(value) && typeof value.html === "string" && typeof value.fileName === "string";
-    case "readSession":
-      return isRecord(value) && isRecord(value.info) && isRecord(value.context);
+    case "readSession": {
+      if (!isRecord(value) || !isRecord(value.info) || !isRecord(value.context)) return false;
+      const options = isRecord(args[1]) ? args[1] : {};
+      return !options.recent || (validHistoryContext(value.context) && validHistoryCursor(value.cursor)
+        && typeof value.hasMore === "boolean" && typeof value.hasOlder === "boolean"
+        && Array.isArray(value.tree) && nullableString(value.leafId) && typeof value.filePath === "string");
+    }
     case "readContext": {
       // The context route reads a different shape per mode.
       const options = isRecord(args[2]) ? args[2] : {};
       if (!isRecord(value)) return false;
       if (options.boundary) return Array.isArray(value.entryIds);
-      if (options.sync) return isRecord(value.history) && nullableString(value.leafId) && nullableString(value.tipId);
+      if (options.sync) {
+        if (!isRecord(value.history) || !nullableString(value.leafId) || !nullableString(value.tipId)) return false;
+        return !isRecord(options.sync) || !options.sync.recent || validRecentHistoryPage(value.history);
+      }
       return isRecord(value.context);
     }
     case "archiveSession":
@@ -1010,14 +1019,15 @@ const nullableString = (value: unknown) => value === null || typeof value === "s
 /** A daemon's session-list entry reduced to SessionInfo's fields; null when one has the wrong type. */
 function sessionEntry(value: unknown): SessionInfo | null {
   if (!isRecord(value)) return null;
-  const { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch } = value;
+  const { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch, activityStatus } = value;
   if (
     typeof path !== "string" || typeof id !== "string" || !isValidSessionId(id) || typeof cwd !== "string"
     || typeof created !== "string" || typeof modified !== "string" || typeof firstMessage !== "string"
     || typeof messageCount !== "number" || !Number.isFinite(messageCount)
     || ![name, lastMessageAt, parentSessionId, projectRoot, projectKey, worktreeBranch].every(optionalString)
+    || (activityStatus !== undefined && !["idle", "running", "waiting_input", "completed", "error", "quota", "interrupted"].includes(activityStatus as string))
   ) return null;
-  return { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch } as SessionInfo;
+  return { path, id, cwd, name, created, modified, lastMessageAt, messageCount, firstMessage, parentSessionId, projectRoot, projectKey, worktreeBranch, ...(activityStatus === undefined ? {} : { activityStatus }) } as SessionInfo;
 }
 
 /** A daemon's project-registry entry reduced to its known fields; null when one has the wrong type. */
@@ -1035,6 +1045,37 @@ function projectEntry(value: unknown): ProjectRegistryEntry | null {
   return { path, addedAt, hidden, alias, sortOrder, pinOrder, launchConfig } as ProjectRegistryEntry;
 }
 
+/** Recent-history cursors are positions, never file paths or authorization. */
+function validHistoryCursor(value: unknown): boolean {
+  try { return isRecord(value) && parseHistoryCursor(JSON.stringify(value)) !== null; } catch { return false; }
+}
+
+function validHistoryContext(value: unknown): boolean {
+  return isRecord(value) && Array.isArray(value.messages) && Array.isArray(value.entryIds)
+    && value.messages.length === value.entryIds.length && value.messages.length <= RECENT_SYNC_MESSAGES
+    && value.entryIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= 256);
+}
+
+function validRecentHistoryPage(value: Record<string, unknown>): boolean {
+  return ["append", "prepend", "replace"].includes(value.mode as string)
+    && nullableString(value.baseEntryId) && validHistoryContext(value.context)
+    && validHistoryCursor(value.cursor) && typeof value.hasMore === "boolean" && typeof value.hasOlder === "boolean";
+}
+
+function validHistoryReadOptions(op: keyof SessionOps, args: unknown[]): boolean {
+  if (op !== "readSession" && op !== "readContext") return true;
+  const options = args[op === "readSession" ? 1 : 2];
+  if (!isRecord(options)) return false;
+  if (["deferThinking", "deferMedia", "recent", "paged", "boundary", "includePreCompaction"].some((key) => options[key] !== undefined && typeof options[key] !== "boolean")) return false;
+  if (op !== "readContext" || options.sync == null) return true;
+  const sync = options.sync;
+  if (!isRecord(sync) || (sync.cursor !== null && !validHistoryCursor(sync.cursor))
+    || !Number.isInteger(sync.limit) || (sync.limit as number) < 1
+    || (sync.limit as number) > (sync.recent ? RECENT_SYNC_MESSAGES : MAX_SYNC_MESSAGES)
+    || ["recent", "older"].some((key) => sync[key] !== undefined && typeof sync[key] !== "boolean")) return false;
+  return !options.boundary && (!sync.older || (sync.recent === true && sync.cursor !== null && sync.cursor !== undefined));
+}
+
 const MEDIA_HASH_RE = /^[0-9a-f]{64}$/;
 
 /** Ops that rewrite or move a session's file: an exiting orphan of that session may still flush it. */
@@ -1044,6 +1085,9 @@ function remoteSessionOps(hostId: string): SessionOps {
   const ops: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
   for (const [op, params] of Object.entries(SESSION_OP_PARAMS) as [keyof SessionOps, readonly string[]][]) {
     ops[op] = async (...args) => {
+      if (!validHistoryReadOptions(op, args)) {
+        return { ok: false, status: 400, code: "invalid_history_options", error: "Invalid history read options" };
+      }
       if (op === "readMedia" && !MEDIA_HASH_RE.test(String(args[0]))) {
         return { ok: false, status: 400, code: "invalid_hash", error: "Invalid media hash" };
       }
@@ -1423,9 +1467,9 @@ export class RemoteHost implements Host {
     return exists;
   }
 
-  invalidateSessionLists(sessionFile?: string): void {
+  invalidateSessionLists(sessionFile?: string, options: { observedChange?: boolean } = {}): void {
     // Best effort, like the local cache drop.
-    request(this.id, "invalidateSessionLists", { path: sessionFile }).catch(() => {});
+    request(this.id, "invalidateSessionLists", { path: sessionFile, ...options }).catch(() => {});
   }
 
   autoApproveExtension(): boolean {

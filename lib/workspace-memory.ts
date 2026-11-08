@@ -1,6 +1,13 @@
 import type { SessionInfo } from "./types";
 
-const STORAGE_KEY = "omp-web:last-open-by-project";
+const LAST_VIEWED_SESSION_KEY = "omp-web:last-viewed-session";
+const RESTORE_LAST_CHAT_KEY = "omp-web:restore-last-chat";
+
+export interface RememberedSession {
+  sessionId: string;
+  hostId?: string;
+  workspace?: string;
+}
 
 interface StorageLike {
   getItem(key: string): string | null;
@@ -17,47 +24,49 @@ function browserStorage(): StorageLike | null {
   }
 }
 
-function readEntries(storage: StorageLike): Record<string, string> {
-  try {
-    const raw = storage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    const value: unknown = JSON.parse(raw);
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    return Object.fromEntries(Object.entries(value).filter(([, id]) => typeof id === "string" && id.length > 0)) as Record<string, string>;
-  } catch {
-    return {};
-  }
-}
 
 export function workspaceKeyOf(session: Pick<SessionInfo, "cwd" | "projectRoot" | "projectKey">): string {
   return session.projectKey || session.projectRoot || session.cwd || "";
 }
 
-export function getLastOpenSession(workspace: string, storage: StorageLike | null = browserStorage()): string | null {
-  if (!storage) return null;
-  return readEntries(storage)[workspace] ?? null;
+
+export function getRestoreLastChat(storage: StorageLike | null = browserStorage()): boolean {
+  try { return storage?.getItem(RESTORE_LAST_CHAT_KEY) === "true"; } catch { return false; }
 }
 
-export function setLastOpenSession(workspace: string, sessionId: string, storage: StorageLike | null = browserStorage()): void {
-  if (!storage) return;
-  try {
-    const entries = readEntries(storage);
-    entries[workspace] = sessionId;
-    storage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  } catch {
-    // Workspace restoration is a best-effort convenience.
-  }
+export function setRestoreLastChat(enabled: boolean, storage: StorageLike | null = browserStorage()): void {
+  try { storage?.setItem(RESTORE_LAST_CHAT_KEY, String(enabled)); } catch { /* Browser-local convenience. */ }
 }
 
-export function clearLastOpenSession(workspace: string, storage: StorageLike | null = browserStorage()): void {
-  if (!storage) return;
+export function getLastViewedSession(storage: StorageLike | null = browserStorage()): RememberedSession | null {
   try {
-    const entries = readEntries(storage);
-    if (!(workspace in entries)) return;
-    delete entries[workspace];
-    if (Object.keys(entries).length === 0) storage.removeItem(STORAGE_KEY);
-    else storage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  } catch {
-    // Workspace restoration is a best-effort convenience.
-  }
+    const raw = storage?.getItem(LAST_VIEWED_SESSION_KEY);
+    if (!raw) return null;
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      // The deployed browser remembered a raw id before hosts existed.
+      // Upgrade once; the authoritative session lookup will fill its workspace.
+      const sessionId = raw.trim();
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(sessionId)) return null;
+      const migrated: RememberedSession = { sessionId, hostId: "local" };
+      setLastViewedSession(migrated, storage);
+      return migrated;
+    }
+    if (!value || typeof value !== "object") return null;
+    const item = value as Partial<RememberedSession>;
+    if (typeof item.sessionId !== "string" || !item.sessionId || (item.workspace !== undefined && typeof item.workspace !== "string")) return null;
+    if (item.hostId !== undefined && typeof item.hostId !== "string") return null;
+    return { sessionId: item.sessionId, ...(item.workspace !== undefined ? { workspace: item.workspace } : {}), ...(item.hostId ? { hostId: item.hostId } : {}) };
+  } catch { return null; }
+}
+
+export function setLastViewedSession(session: RememberedSession, storage: StorageLike | null = browserStorage()): void {
+  try { storage?.setItem(LAST_VIEWED_SESSION_KEY, JSON.stringify(session)); } catch { /* Browser-local convenience. */ }
+}
+
+export function clearLastViewedSession(sessionId: string, storage: StorageLike | null = browserStorage()): void {
+  if (getLastViewedSession(storage)?.sessionId !== sessionId) return;
+  try { storage?.removeItem(LAST_VIEWED_SESSION_KEY); } catch { /* A stale tab must not erase a newer pointer. */ }
 }

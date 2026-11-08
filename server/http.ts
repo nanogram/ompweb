@@ -36,8 +36,8 @@ function acceptsGzip(header: string | null): boolean {
 }
 
 /**
- * Security headers (overwriting the handler's), the index cache policy and gzip, on a fresh Response. API answers are
- * never gzipped, as under Next: compressing a 40 MB session read cost ~1 s per request; a reverse proxy can do it.
+ * Security headers, index cache policy and automatic gzip for non-API responses.
+ * History routes negotiate their own asynchronous gzip; encoded responses pass through unchanged.
  */
 export function finalizeResponse(request: Request, response: Response): Response {
   const { pathname } = new URL(request.url);

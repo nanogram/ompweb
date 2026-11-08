@@ -3,7 +3,9 @@ import { HostOpError } from "@/lib/hosts/link-protocol";
 import { invalidateHostSessionList } from "@/lib/hosts/session-index";
 import { invalidateSessionCaches } from "@/lib/session-reader";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
-import { clearExitedRpcSession, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
+import { clearExitedRpcSession, clearRpcSessionActivity, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
+
+import { historyJsonResponse } from "@/lib/history-response";
 
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
@@ -29,14 +31,26 @@ export async function GET(
 ) {
   const { id } = await params;
   try {
+    const searchParams = new URL(req.url).searchParams;
+    const sync = searchParams.get("sync");
+    const recent = searchParams.get("recent");
+    if (sync !== null && (sync !== "1" || searchParams.getAll("sync").length !== 1)) {
+      return Response.json({ error: "Invalid sync mode", code: "invalid_sync" }, { status: 400 });
+    }
+    if (recent !== null && (recent !== "1" || sync !== "1" || searchParams.getAll("recent").length !== 1)) {
+      return Response.json({ error: "Invalid recent mode", code: "invalid_recent" }, { status: 400 });
+    }
+    if (["cursor", "limit", "direction", "boundary"].some((key) => searchParams.has(key))) {
+      return Response.json({ error: "Initial history does not accept paging options", code: "invalid_sync_options" }, { status: 400 });
+    }
     const resolved = await resolveSessionHostOr404(id);
     if ("response" in resolved) return resolved.response;
-
-    const searchParams = new URL(req.url).searchParams;
     const includeState = searchParams.has("includeState");
     const read = await resolved.host.sessionOps.readSession(id, {
       deferThinking: searchParams.has("deferThinking"),
       deferMedia: searchParams.has("deferMedia"),
+      recent: recent === "1",
+      paged: sync === "1",
     });
     if (!read.ok) return opErrorResponse(read);
 
@@ -58,7 +72,7 @@ export async function GET(
       }
     }
 
-    return Response.json({
+    return await historyJsonResponse(req, {
       sessionId: id,
       ...read.value,
       ...(agent ? { agent } : {}),
@@ -136,6 +150,7 @@ export async function DELETE(
     if (!result.ok) return opErrorResponse(result);
     invalidateHostSessionList(resolved.host.id);
     clearExitedRpcSession(id);
+    clearRpcSessionActivity(id);
     return Response.json({ ok: true, ...result.value });
   } catch (error) {
     return sessionsErrorResponse(error);

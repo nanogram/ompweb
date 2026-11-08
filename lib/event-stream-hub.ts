@@ -8,7 +8,7 @@ import type { WorkspaceFileEvent } from "./workspace-types";
 import { attachNotificationClient } from "./notification-hub";
 import { getDevice } from "./notification-store";
 import { isValidNotificationId } from "./notification-events";
-import { getExitedRpcSessions, getRpcSession, getRunningRpcSessions, subscribeHostToolCalls, subscribeRunningSessions, type AgentSessionWrapper } from "./rpc-manager";
+import { getExitedRpcSessions, getRpcSession, getRunningRpcSessions, getSessionActivities, subscribeHostToolCalls, subscribeRunningSessions, type AgentSessionWrapper } from "./rpc-manager";
 import { onOutboxChange, outboxEntries, outboxSettledIds } from "./message-outbox";
 import { subscribeSessionFileChanges } from "./session-watcher";
 import {
@@ -384,12 +384,13 @@ function openRunningChannel(handle: SubscriptionHandle): SubscribeResult {
   handle.open();
   // Subscribe BEFORE taking the initial snapshot so no state change can slip
   // through the gap between snapshot and subscription.
-  const unsubscribeRunning = subscribeRunningSessions(({ ids, runningSessions, exitedSessions, refreshSessionList }) => {
+  const unsubscribeRunning = subscribeRunningSessions(({ ids, runningSessions, exitedSessions, refreshSessionList, sessionActivities }) => {
     handle.send({
       type: "running",
       runningSessionIds: ids,
       runningSessions,
       exitedSessions,
+      sessionActivities,
       ...(refreshSessionList ? { refreshSessionList: true } : {}),
     });
   });
@@ -406,6 +407,7 @@ function openRunningChannel(handle: SubscriptionHandle): SubscribeResult {
     runningSessionIds: initialRunning.map((session) => session.id),
     runningSessions: initialRunning,
     exitedSessions: getExitedRpcSessions(),
+    sessionActivities: getSessionActivities(),
   });
   return SUBSCRIBED;
 }

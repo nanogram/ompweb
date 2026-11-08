@@ -87,6 +87,7 @@ export interface RpcProcessOptions {
 }
 
 const STDERR_TAIL_LIMIT = 8 * 1024;
+const RECENT_COMMAND_LIMIT = 1024;
 
 /** A stdout line as JSON; undefined when blank or not JSON (omp guards stdout in RPC mode, but never let a stray line kill the reader). */
 function parseLine(line: string): unknown {
@@ -125,6 +126,8 @@ export class RpcProcess {
   readonly transport: RpcTransport;
   private readonly exitedPromise: Promise<void>;
   private readonly pending = new Map<string, PendingCommand>();
+  /** Native async failures reuse command ids after their acknowledgement or timeout. */
+  private readonly recentCommandTypes = new Map<string, string>();
   private readonly pendingFrameWrites = new Set<(error: Error) => void>();
   private readonly frameListeners = new Set<(frame: RpcFrame) => void>();
   private readyPromise: Promise<RpcFrame>;
@@ -346,6 +349,18 @@ export class RpcProcess {
     if (this.heldOverflow) return Promise.reject(this.heldOverflow);
     const dispatchedAt = Date.now();
     const id = `${this.idPrefix}${this.nextId++}`;
+    this.recentCommandTypes.set(id, command.type);
+    if (this.recentCommandTypes.size > RECENT_COMMAND_LIMIT) {
+      let oldestQueryId: string | undefined;
+      // Frequent get_state polls must not evict the identity of a still-running prompt.
+      for (const [recentId, type] of this.recentCommandTypes) {
+        if (type !== "prompt" && type !== "abort_and_prompt") {
+          oldestQueryId = recentId;
+          break;
+        }
+      }
+      this.recentCommandTypes.delete(oldestQueryId ?? this.recentCommandTypes.keys().next().value!);
+    }
     return new Promise<T>((resolve, reject) => {
       const entry: PendingCommand = {
         command: command.type,
@@ -438,7 +453,8 @@ export class RpcProcess {
     if (!entry || !id || (response.command && response.command !== entry.command)) {
       // Unsolicited response (or a command we already timed out) — surface to
       // frame listeners so nothing is silently dropped.
-      this.dispatch(response as unknown as RpcFrame);
+      const command = id ? this.recentCommandTypes.get(id) : undefined;
+      this.dispatch((!response.command && command ? { ...response, command } : response) as unknown as RpcFrame);
       return;
     }
     this.pending.delete(id);

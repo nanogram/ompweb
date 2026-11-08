@@ -1,4 +1,5 @@
 import { apiErrorResponse, opErrorResponse, resolveSessionHostOr404 } from "@/lib/api-utils";
+import { historyJsonResponse } from "@/lib/history-response";
 
 export async function GET(
   req: Request,
@@ -15,7 +16,7 @@ export async function GET(
     const resolved = await resolveSessionHostOr404(id);
     if ("response" in resolved) return resolved.response;
     const result = await resolved.host.sessionOps.readThinking(id, entryId, blockIndex);
-    return result.ok ? Response.json(result.value) : opErrorResponse(result);
+    return result.ok ? await historyJsonResponse(req, result.value) : opErrorResponse(result);
   } catch (error) {
     return apiErrorResponse(error);
   }

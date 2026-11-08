@@ -1,5 +1,5 @@
-import { randomUUID } from "crypto";
-import type { Dirent } from "fs";
+import { createHash, randomUUID, type Hash } from "crypto";
+import type { Dirent, Stats } from "fs";
 import {
   closeSync,
   existsSync,
@@ -19,8 +19,10 @@ import {
   writeSync,
 } from "fs";
 import * as fsRuntime from "fs";
+import { open, stat, type FileHandle } from "fs/promises";
 import * as path from "path";
 import { StringDecoder } from "string_decoder";
+import { setImmediate as yieldToEventLoop } from "timers/promises";
 import { gunzipSync, gzipSync } from "zlib";
 import { isRecord } from "../type-guards";
 
@@ -31,6 +33,7 @@ import type {
   CompactionEntry,
   SessionEntry,
   SessionHeader,
+  SessionHistoryWindow,
   SessionTitleSource,
   SessionTreeNode,
 } from "../types";
@@ -202,11 +205,12 @@ function generateEntryId(taken: Set<string>): string {
 }
 
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
-function migrateV1ToV2(header: SessionHeader, entries: MutableEntry[]): void {
+function* migrateV1ToV2(header: SessionHeader, entries: MutableEntry[]): Generator<void> {
   header.version = 2;
   const ids = new Set<string>();
   let prevId: string | null = null;
-  for (const entry of entries) {
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
     entry.id = generateEntryId(ids);
     ids.add(entry.id);
     entry.parentId = prevId;
@@ -218,27 +222,30 @@ function migrateV1ToV2(header: SessionHeader, entries: MutableEntry[]): void {
       if (target) (entry as CompactionEntry).firstKeptEntryId = target.id;
       delete entry.firstKeptEntryIndex;
     }
+    if ((index + 1) % SESSION_FINALIZE_BATCH_ENTRIES === 0) yield;
   }
 }
 
 /** Migrate v2 → v3: rename hookMessage role to custom. Mutates in place. */
-function migrateV2ToV3(header: SessionHeader, entries: MutableEntry[]): void {
+function* migrateV2ToV3(header: SessionHeader, entries: MutableEntry[]): Generator<void> {
   header.version = 3;
-  for (const entry of entries) {
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
     if (entry.type === "message") {
       // Imports and hand-edits can produce message entries whose message
       // object is missing — entryToUiMessage tolerates that, so must we.
       const message = entry.message as { role?: string } | null | undefined;
       if (message?.role === "hookMessage") message.role = "custom";
     }
+    if ((index + 1) % SESSION_FINALIZE_BATCH_ENTRIES === 0) yield;
   }
 }
 
-function migrateToCurrentVersion(header: SessionHeader, entries: MutableEntry[]): void {
+function* migrateToCurrentVersion(header: SessionHeader, entries: MutableEntry[], windowedV1 = false): Generator<void> {
   const version = header.version ?? 1;
   if (version >= CURRENT_SESSION_VERSION) return;
-  if (version < 2) migrateV1ToV2(header, entries);
-  if (version < 3) migrateV2ToV3(header, entries);
+  if (version < 2 && !windowedV1) yield* migrateV1ToV2(header, entries);
+  if (version < 3) yield* migrateV2ToV3(header, entries);
 }
 
 // ============================================================================
@@ -352,16 +359,19 @@ export interface ResolveBlobOptions {
 /** Resolve blob references in loaded entries back to inline base64. Mutates in place. */
 export function resolveBlobRefsInEntries(entries: SessionEntry[], options: ResolveBlobOptions = {}): void {
   for (const entry of entries) {
-    if (
-      options.skipToolResultImages &&
-      entry.type === "message" &&
-      ((entry.message as { role?: string } | null | undefined)?.role === "toolResult")
-    ) {
-      continue;
-    }
-    if (!containsBlobRef(entry)) continue;
-    resolveBlobsInValue(entry, undefined);
+    resolveBlobRefsInEntry(entry, options);
   }
+}
+
+function resolveBlobRefsInEntry(entry: SessionEntry, options: ResolveBlobOptions): void {
+  if (
+    options.skipToolResultImages &&
+    entry.type === "message" &&
+    ((entry.message as { role?: string } | null | undefined)?.role === "toolResult")
+  ) {
+    return;
+  }
+  if (containsBlobRef(entry)) resolveBlobsInValue(entry, undefined);
 }
 
 // ============================================================================
@@ -376,17 +386,78 @@ export interface LoadedSession {
   titleSlot: SessionTitleSlot | undefined;
   /** Set when the file exists but could not be materialized (see loadSessionFile). */
   error?: SessionLoadError;
+  /** The retained raw history interval, present only when older bytes were omitted. */
+  historyWindow?: SessionHistoryWindow;
 }
 
 export interface LoadSessionOptions extends ResolveBlobOptions {
   /** Resolve blob:sha256 image references to inline base64 for display. */
   resolveBlobs?: boolean;
-  /** Retain only an entry's indexing metadata while scanning. Runs before
-   * legacy migration; byte ranges exclude LF but include any CR. */
-  projectEntry?: (entry: SessionEntry, offset: number, length: number) => SessionEntry;
+  /** Retain only bounded indexing metadata while scanning. Projected reads
+   * bypass the full-file ceiling; the caller must bound retained metadata.
+   * Runs before legacy migration; ranges exclude LF but include any CR.
+   * A thrown RangeError becomes error:"too_large"; other callback errors propagate. */
+  projectEntry?: (entry: SessionEntry, offset: number, length: number, recordSha256?: string) => SessionEntry;
+}
+
+/** Initial file identity/version and the exact physical range consumed by a scan. */
+export interface SessionFileSnapshot extends Pick<Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs"> {
+  byteLength: number;
+  sha256: string;
+  /** Defaults to zero; tail snapshots also cover their one-byte framing lookbehind. */
+  byteOffset?: number;
+  /** Finite selected end, defaulting to the initial actual file size. */
+  windowEnd?: number;
+  /** Separately captured bounded title-slot/header prefix for tail snapshots. */
+  headerByteLength?: number;
+  headerSha256?: string;
+}
+
+/** Body-free projection from a verified physical record. Reuse is deliberately
+ * limited to current-format files: legacy migrations may assign new IDs. */
+export interface ProjectedSessionRecord {
+  entry: SessionEntry;
+  offset: number;
+  length: number;
+  sha256: string;
+}
+
+export interface SessionFileProjectionState {
+  sourceVersion: number;
+  /** Byte after the last LF, so an unterminated final record is read again. */
+  resumeOffset: number;
+}
+
+export interface SessionFileProjectionReuse extends SessionFileProjectionState {
+  snapshot: SessionFileSnapshot;
+  records: readonly ProjectedSessionRecord[];
+}
+
+export interface AsyncLoadSessionOptions extends LoadSessionOptions {
+  /** Limit UI history to the latest raw bytes before the selected end. The
+   * canonical file is untouched; its bounded header is loaded separately. */
+  historyWindowBytes?: number;
+  /** Pin a finite history end across appends; cannot exceed the initial size. */
+  historyWindowEnd?: number;
+  /** Capture the physical range and each projected record (no LF, including
+   * CR). Tail snapshots also capture the bounded header and framing byte.
+   * Missing, malformed and failed scans do not call this. */
+  onSnapshot?: (snapshot: SessionFileSnapshot) => void;
+  /** Previously projected metadata, never raw records or message bodies. Old
+   * covered bytes are still SHA256-verified during the new scan. */
+  reuseProjection?: SessionFileProjectionReuse;
+  onProjectionState?: (state: SessionFileProjectionState) => void;
+  /** Discard projection accounting before a rejected reuse attempt is rebuilt. */
+  onProjectionReset?: () => void;
 }
 
 const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
+const SESSION_FINALIZE_BATCH_ENTRIES = 1024;
+const MAX_SESSION_HEADER_BYTES = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
+/** A projected scan may cross the full-file ceiling, but cannot allocate an
+ * unbounded JSON record (including a corrupt unterminated line). */
+const MAX_PROJECTED_RECORD_BYTES = 32 * 1024 * 1024;
+const STALE_SESSION_PROJECTION = Symbol("stale session projection");
 
 /**
  * Ceiling on the on-disk size omp-web will materialize into memory. omp streams
@@ -406,41 +477,82 @@ export const MAX_SESSION_LOAD_BYTES = 1024 * 1024 * 1024;
 export function forEachFileLineSync(
   filePath: string,
   onLine: (line: string, offset: number, length: number) => boolean | void,
+  maxLineBytes = MAX_SESSION_LOAD_BYTES,
 ): void {
   const fd = openSync(filePath, "r");
   try {
     const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
-    const decoder = new StringDecoder("utf8");
-    // Join a long line only once; offsets count physical bytes, not UTF-16.
-    const fragments: string[] = [];
-    let offset = 0;
-    let length = 0;
+    const lines = createFileLineDecoder(onLine, maxLineBytes);
     for (;;) {
       const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead === 0) break;
+      if (!lines.write(buffer, bytesRead)) return;
+    }
+    lines.finish();
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Shared byte-to-line state for synchronous and cooperative asynchronous reads. */
+function createFileLineDecoder(
+  onLine: (line: string, offset: number, length: number, recordSha256?: string) => boolean | void,
+  maxLineBytes: number,
+  captureHashes = false,
+  initialOffset = 0,
+  skipLeadingFragment = false,
+) {
+  const decoder = new StringDecoder("utf8");
+  // Join a long line only once; offsets count physical bytes, not UTF-16.
+  const fragments: string[] = [];
+  let offset = initialOffset;
+  let length = 0;
+  let recordHash: Hash | undefined;
+  let resumeOffset = initialOffset;
+  return {
+    write(buffer: Buffer, bytesRead: number): boolean {
       let start = 0;
+      if (skipLeadingFragment) {
+        const newline = buffer.indexOf(10);
+        if (newline < 0 || newline >= bytesRead) {
+          offset += bytesRead;
+          return true;
+        }
+        offset += newline + 1;
+        start = newline + 1;
+        skipLeadingFragment = false;
+        resumeOffset = offset;
+      }
       while (start < bytesRead) {
         const newline = buffer.indexOf(10, start);
         const end = newline >= 0 && newline < bytesRead ? newline : bytesRead;
-        fragments.push(decoder.write(buffer.subarray(start, end)));
+        const bytes = buffer.subarray(start, end);
+        fragments.push(decoder.write(bytes));
         length += end - start;
+        if (length > maxLineBytes) throw new RangeError("Session record exceeds the read budget");
+        if (captureHashes) (recordHash ??= createHash("sha256")).update(bytes);
         if (end < bytesRead) {
           fragments.push(decoder.end());
-          if (onLine(fragments.join(""), offset, length) === false) return;
+          const digest = captureHashes ? (recordHash ?? createHash("sha256")).digest("hex") : undefined;
+          recordHash = undefined;
+          if (onLine(fragments.join(""), offset, length, digest) === false) return false;
           fragments.length = 0;
           offset += length + 1;
+          resumeOffset = offset;
           length = 0;
         }
         start = end + 1;
       }
-    }
-    if (length > 0) {
-      fragments.push(decoder.end());
-      onLine(fragments.join(""), offset, length);
-    }
-  } finally {
-    closeSync(fd);
-  }
+      return true;
+    },
+    finish(): void {
+      if (length > 0) {
+        fragments.push(decoder.end());
+        onLine(fragments.join(""), offset, length, recordHash?.digest("hex"));
+      }
+    },
+    get resumeOffset() { return resumeOffset; },
+  };
 }
 
 /**
@@ -458,15 +570,235 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
   } catch {
     return { header: null, entries: [], titleSlot: undefined };
   }
-  if (size > MAX_SESSION_LOAD_BYTES) {
+  if (!options.projectEntry && size > MAX_SESSION_LOAD_BYTES) {
     return { header: null, entries: [], titleSlot: undefined, error: "too_large" };
   }
 
+  const parser = createSessionFileParser(options);
+  try {
+    forEachFileLineSync(filePath, parser.onLine, options.projectEntry ? MAX_PROJECTED_RECORD_BYTES : MAX_SESSION_LOAD_BYTES);
+  } catch (error) {
+    return parser.failure(error);
+  }
+  const finalizer = parser.finalize();
+  let result = finalizer.next();
+  while (!result.done) result = finalizer.next();
+  return result.value;
+}
+
+/** Read a bounded head probe, returning only the physical title/header lines. */
+async function readSessionHeaderBytes(handle: FileHandle, end: number): Promise<Buffer | null> {
+  const buffer = Buffer.allocUnsafe(Math.min(MAX_SESSION_HEADER_BYTES, end));
+  let position = 0;
+  let headerStart: number | undefined;
+  while (position < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, position, Math.min(SESSION_TITLE_SLOT_BYTES, buffer.length - position), position);
+    if (bytesRead === 0) break;
+    position += bytesRead;
+    const firstEnd = buffer.subarray(0, position).indexOf(10);
+    if (firstEnd < 0) continue;
+    headerStart ??= parseTitleSlotLine(buffer.subarray(0, firstEnd).toString("utf8")) ? firstEnd + 1 : 0;
+    const headerEnd = buffer.subarray(0, position).indexOf(10, headerStart);
+    if (headerEnd >= 0) return buffer.subarray(0, headerEnd + 1);
+  }
+  // A valid header may be the last record without LF, but not a capped fragment.
+  return position === end ? buffer.subarray(0, position) : null;
+}
+
+/**
+ * Cooperative counterpart of loadSessionFile. Reads at most the size observed
+ * by fstat on the opened handle: appends after that snapshot belong to the next
+ * load. This is a byte bound, not an atomic snapshot of concurrent rewrites.
+ * UTF-8/JSON parsing yields after each 1 MiB read; a single record (up to the
+ * projected 32 MiB ceiling) remains indivisible. Finalization also yields in
+ * bounded entry batches, including legacy migrations and optional blob walks.
+ */
+export async function loadSessionFileAsync(filePath: string, options: AsyncLoadSessionOptions = {}): Promise<LoadedSession> {
+  let handle: FileHandle;
+  try {
+    handle = await open(filePath, "r");
+  } catch {
+    return { header: null, entries: [], titleSlot: undefined };
+  }
+  let parser = createSessionFileParser(options);
+  let snapshot: SessionFileSnapshot | undefined;
+  let projectionState: SessionFileProjectionState | undefined;
+  try {
+    try {
+      const initialStat = await handle.stat();
+      const size = initialStat.size;
+      const end = Math.min(size, options.historyWindowEnd ?? size);
+      const start = options.historyWindowBytes === undefined ? 0 : Math.max(0, end - options.historyWindowBytes);
+      if (!options.projectEntry && end - start > MAX_SESSION_LOAD_BYTES) {
+        return { header: null, entries: [], titleSlot: undefined, error: "too_large" };
+      }
+      const historyWindow = start > 0 ? { maxBytes: options.historyWindowBytes!, startOffset: start, endOffset: end } : undefined;
+      const byteOffset = historyWindow ? start - 1 : 0;
+      const prior = options.reuseProjection;
+      const priorEnd = prior && (prior.snapshot.windowEnd ?? prior.snapshot.size);
+      const priorOffset = prior?.snapshot.byteOffset ?? 0;
+      // Stat identity is only eligibility, never append proof. Hash the entire
+      // old interval below, including rolled-out bytes and framing lookbehind.
+      const reuse = prior && options.projectEntry && options.onSnapshot && prior.sourceVersion >= CURRENT_SESSION_VERSION
+        && initialStat.dev === prior.snapshot.dev && initialStat.ino === prior.snapshot.ino
+        && size >= prior.snapshot.size && end >= priorEnd! && byteOffset >= priorOffset
+        && priorOffset + prior.snapshot.byteLength === priorEnd
+        && Number.isSafeInteger(prior.resumeOffset) && prior.resumeOffset >= start
+        && prior.resumeOffset <= priorEnd! ? prior : undefined;
+      let headerBytes: Buffer | null = null;
+      if (historyWindow || reuse) {
+        parser = createSessionFileParser(options, historyWindow);
+        headerBytes = await readSessionHeaderBytes(handle, end);
+        if (!headerBytes) return { header: null, entries: [], titleSlot: undefined };
+        const headerLines = createFileLineDecoder(parser.onLine, MAX_SESSION_HEADER_BYTES);
+        headerLines.write(headerBytes, headerBytes.length);
+        headerLines.finish();
+        if (reuse?.snapshot.headerByteLength !== undefined &&
+          (reuse.snapshot.headerByteLength !== headerBytes.length ||
+            reuse.snapshot.headerSha256 !== createHash("sha256").update(headerBytes).digest("hex"))) {
+          throw STALE_SESSION_PROJECTION;
+        }
+      }
+      if (reuse) {
+        for (let i = 0; i < reuse.records.length; i++) {
+          const record = reuse.records[i];
+          if (record.offset >= start && record.offset < reuse.resumeOffset) parser.seed(record.entry);
+          if ((i + 1) % SESSION_FINALIZE_BATCH_ENTRIES === 0) await yieldToEventLoop();
+        }
+      }
+      const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
+      const rangeHash = options.onSnapshot ? createHash("sha256") : undefined;
+      const priorHash = reuse ? createHash("sha256") : undefined;
+      const scanStart = reuse ? priorOffset : byteOffset;
+      const parseStart = reuse ? reuse.resumeOffset : start;
+      let position = scanStart;
+      let skipLeadingFragment = false;
+      if (!reuse && historyWindow) {
+        const { bytesRead } = await handle.read(buffer, 0, 1, position);
+        rangeHash?.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+        skipLeadingFragment = bytesRead === 1 && buffer[0] !== 10;
+      }
+      const lines = createFileLineDecoder(parser.onLine, options.projectEntry ? MAX_PROJECTED_RECORD_BYTES : MAX_SESSION_LOAD_BYTES,
+        !!options.onSnapshot, parseStart, skipLeadingFragment);
+      while (position < end) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, end - position), position);
+        if (bytesRead === 0) break;
+        const next = position + bytesRead;
+        if (next > byteOffset) rangeHash?.update(buffer.subarray(Math.max(0, byteOffset - position), bytesRead));
+        if (priorHash && position < priorEnd!) priorHash.update(buffer.subarray(0, Math.min(bytesRead, priorEnd! - position)));
+        if (next > parseStart) {
+          const parseOffset = Math.max(0, parseStart - position);
+          if (!lines.write(buffer.subarray(parseOffset, bytesRead), bytesRead - parseOffset)) break;
+        }
+        position = next;
+        await yieldToEventLoop();
+      }
+      lines.finish();
+      if (reuse && (position < priorEnd! || priorHash!.digest("hex") !== reuse.snapshot.sha256)) {
+        throw STALE_SESSION_PROJECTION;
+      }
+      projectionState = { sourceVersion: parser.sourceVersion, resumeOffset: lines.resumeOffset };
+      if (rangeHash) {
+        snapshot = {
+          dev: initialStat.dev, ino: initialStat.ino, size,
+          mtimeMs: initialStat.mtimeMs, ctimeMs: initialStat.ctimeMs,
+          byteLength: position - byteOffset, sha256: rangeHash.digest("hex"),
+          ...(historyWindow ? { byteOffset } : {}),
+          ...(historyWindow || end !== size ? { windowEnd: end } : {}),
+          ...(historyWindow && headerBytes ? {
+            headerByteLength: headerBytes.length,
+            headerSha256: createHash("sha256").update(headerBytes).digest("hex"),
+          } : {}),
+        };
+      }
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (error === STALE_SESSION_PROJECTION) {
+      options.onProjectionReset?.();
+      return loadSessionFileAsync(filePath, { ...options, reuseProjection: undefined });
+    }
+    return parser.failure(error);
+  }
+  const finalizer = parser.finalize();
+  let result = finalizer.next();
+  while (!result.done) {
+    await yieldToEventLoop();
+    result = finalizer.next();
+  }
+  if (result.value.header && snapshot) options.onSnapshot?.(snapshot);
+  if (result.value.header && projectionState) options.onProjectionState?.(projectionState);
+  return result.value;
+}
+
+/**
+ * Validate the original bytes, not merely a growing file's stat version.
+ * Reads exactly the covered range and separate bounded header with cooperative
+ * yields. An early EOF remains loadable for legacy callers, but cannot certify
+ * a complete selected snapshot (including synthetic oversized stats).
+ * A same-size version change is not an append, even if its bytes were restored.
+ */
+export async function matchesSessionFileSnapshot(filePath: string, snapshot: SessionFileSnapshot): Promise<boolean> {
+  const byteOffset = snapshot.byteOffset ?? 0;
+  const windowEnd = snapshot.windowEnd ?? snapshot.size;
+  if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || !Number.isSafeInteger(windowEnd) || windowEnd < byteOffset ||
+    windowEnd > snapshot.size || !Number.isSafeInteger(snapshot.byteLength) || snapshot.byteLength < 0 ||
+    byteOffset + snapshot.byteLength !== windowEnd) return false;
+  if ((snapshot.headerByteLength === undefined) !== (snapshot.headerSha256 === undefined) ||
+    (byteOffset > 0 && snapshot.headerByteLength === undefined)) return false;
+  if (snapshot.headerByteLength !== undefined && (!Number.isSafeInteger(snapshot.headerByteLength) ||
+    snapshot.headerByteLength <= 0 || snapshot.headerByteLength > Math.min(MAX_SESSION_HEADER_BYTES, windowEnd))) return false;
+  let handle: FileHandle;
+  try {
+    handle = await open(filePath, "r");
+  } catch {
+    return false;
+  }
+  const compatibleVersion = (value: Stats) => value.dev === snapshot.dev && value.ino === snapshot.ino && value.size >= snapshot.size &&
+    (value.size > snapshot.size || (value.mtimeMs === snapshot.mtimeMs && value.ctimeMs === snapshot.ctimeMs));
+  try {
+    const before = await handle.stat();
+    if (!compatibleVersion(before)) return false;
+    const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
+    const matchesRange = async (start: number, end: number, expectedHash: string): Promise<boolean> => {
+      const hash = createHash("sha256");
+      let position = start;
+      while (position < end) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, end - position), position);
+        if (bytesRead === 0) return false;
+        hash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+        await yieldToEventLoop();
+      }
+      return hash.digest("hex") === expectedHash;
+    };
+    if (!await matchesRange(byteOffset, windowEnd, snapshot.sha256)) return false;
+    if (snapshot.headerByteLength !== undefined &&
+      !await matchesRange(0, snapshot.headerByteLength, snapshot.headerSha256!)) return false;
+    const after = await handle.stat();
+    if (!compatibleVersion(after) || after.size < before.size) return false;
+    // fstat alone could validate the old inode after the path was replaced.
+    const current = await stat(filePath);
+    return compatibleVersion(current) && current.size >= after.size &&
+      (current.size > after.size || (current.mtimeMs === after.mtimeMs && current.ctimeMs === after.ctimeMs));
+  } catch {
+    return false;
+  } finally {
+    await handle.close();
+  }
+}
+
+
+function createSessionFileParser(options: LoadSessionOptions, historyWindow?: SessionHistoryWindow) {
   let titleSlot: SessionTitleSlot | undefined;
   const records: Record<string, unknown>[] = [];
   let isFirstLine = true;
-  try {
-    forEachFileLineSync(filePath, (rawLine, offset, length) => {
+  let projectionFailed = false;
+  let previousWindowedV1Id: string | null = null;
+  return {
+    onLine(rawLine: string, offset: number, length: number, recordSha256?: string): void {
       if (isFirstLine) {
         isFirstLine = false;
         titleSlot = parseTitleSlotLine(rawLine);
@@ -480,24 +812,58 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
       } catch {
         return; // Skip malformed line (torn write).
       }
-      records.push(records.length > 0 && record && record.type !== "session" && options.projectEntry
-        ? options.projectEntry(record as unknown as SessionEntry, offset, length) as unknown as Record<string, unknown>
-        : record);
-    });
-  } catch (error) {
-    // A single line past the string cap, or an allocation failure part-way in.
-    const tooLarge = error instanceof RangeError;
-    return { header: null, entries: [], titleSlot, ...(tooLarge ? { error: "too_large" as const } : {}) };
-  }
+      if (historyWindow && records.length > 0 && record && record.type !== "session" &&
+        ((records[0].version as number | undefined) ?? 1) < 2) {
+        // Absolute v1 entry indices cannot be resolved without the omitted
+        // prefix. Link only observed rows and give them stable physical IDs.
+        record.id = `v1-${offset.toString(36)}`;
+        record.parentId = previousWindowedV1Id;
+        previousWindowedV1Id = record.id as string;
+        if (record.type === "compaction") {
+          delete record.firstKeptEntryIndex;
+          delete record.firstKeptEntryId;
+        }
+      }
+      if (records.length > 0 && record && record.type !== "session" && options.projectEntry) {
+        try {
+          record = options.projectEntry(record as unknown as SessionEntry, offset, length, recordSha256) as unknown as Record<string, unknown>;
+        } catch (error) {
+          projectionFailed = true;
+          throw error;
+        }
+      }
+      records.push(record);
+    },
+    failure(error: unknown): LoadedSession {
+      // Budget failures must not masquerade as empty/malformed transcripts.
+      const tooLarge = error instanceof RangeError;
+      if (projectionFailed && !tooLarge) throw error;
+      return { header: null, entries: [], titleSlot, ...(tooLarge ? { error: "too_large" as const } : {}) };
+    },
+    seed(entry: SessionEntry): void { records.push(entry as unknown as Record<string, unknown>); },
+    get sourceVersion() { return typeof records[0]?.version === "number" ? records[0].version : 1; },
+    finalize: () => finalizeLoadedSession(records, titleSlot, options, historyWindow),
+  };
+}
 
+function* finalizeLoadedSession(
+  records: Record<string, unknown>[],
+  titleSlot: SessionTitleSlot | undefined,
+  options: LoadSessionOptions,
+  historyWindow?: SessionHistoryWindow,
+): Generator<void, LoadedSession> {
   const headerRecord = records[0];
   if (!headerRecord || headerRecord.type !== "session" || typeof headerRecord.id !== "string") {
     return { header: null, entries: [], titleSlot };
   }
   const header = headerRecord as unknown as SessionHeader;
-  const entries = records.slice(1).filter((record) => record.type !== "session") as unknown as MutableEntry[];
+  const entries: MutableEntry[] = [];
+  for (let index = 1; index < records.length; index++) {
+    if (records[index].type !== "session") entries.push(records[index] as unknown as MutableEntry);
+    if (index % SESSION_FINALIZE_BATCH_ENTRIES === 0) yield;
+  }
 
-  migrateToCurrentVersion(header, entries);
+  yield* migrateToCurrentVersion(header, entries, !!historyWindow);
 
   if (titleSlot) {
     if (titleSlot.title) {
@@ -511,10 +877,13 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
   }
 
   if (options.resolveBlobs) {
-    resolveBlobRefsInEntries(entries, { skipToolResultImages: options.skipToolResultImages });
+    for (let index = 0; index < entries.length; index++) {
+      resolveBlobRefsInEntry(entries[index], options);
+      if ((index + 1) % SESSION_FINALIZE_BATCH_ENTRIES === 0) yield;
+    }
   }
 
-  return { header, entries, titleSlot };
+  return { header, entries, titleSlot, ...(historyWindow ? { historyWindow } : {}) };
 }
 
 /**
@@ -523,7 +892,7 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
  * folded into the returned header.
  */
 export function readSessionHeaderSync(filePath: string): SessionHeader | null {
-  const maxHeaderBytes = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
+  const maxHeaderBytes = MAX_SESSION_HEADER_BYTES;
   let fd: number;
   try {
     fd = openSync(filePath, "r");

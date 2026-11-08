@@ -55,6 +55,18 @@ export function loadRightPanelWidth(): number | null {
   }
 }
 
+/** Outside the mobile drawer so a failed startup remains actionable. */
+export function SessionListLoadError({ visible, error, onRetry }: { visible: boolean; error: string | null; onRetry: () => void }) {
+  const { t } = useI18n();
+  if (!visible || !error) return null;
+  return (
+    <div role="alert" style={{ padding: "10px 14px", color: "var(--status-error)", display: "flex", alignItems: "center", gap: 10 }}>
+      <span style={{ flex: 1 }}>{error}</span>
+      <button type="button" className="load-retry-button" onClick={onRetry}>{t("sessionSidebar.refresh")}</button>
+    </div>
+  );
+}
+
 type WorkspaceStateKind = "loading" | "error" | "empty";
 
 export function WorkspaceState({

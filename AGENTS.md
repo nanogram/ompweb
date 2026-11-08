@@ -49,6 +49,35 @@ does not substitute its own files for an unavailable host.
 its host transport. The host owns one native process per active conversation;
 browser navigation does not own or cancel that process or its accepted sends.
 
+**Fresh-session handoff**: a message-bearing `POST /api/agent/new` owns startup
+and the first prompt before its response reaches the browser. A scoped
+`creationKey` joins an in-flight ensure request without a second spawn or prompt.
+Known pre-created IDs dispatch immediately through the shared agent-command
+path; model/thinking selection and optional `captureRunBoundary` are web
+envelope fields, stripped before native RPC. Captured entry IDs return as
+`runBoundary` in the command result for both HTTP and WebSocket callers.
+
+**Bounded display history**: the owning host retains metadata/offsets, not full
+bodies, for the latest 128 MiB window. Recent pages contain at most 50 messages
+and a soft 256 KiB raw-record budget; older pages prepend. Cooperative scans,
+per-record hashes and snapshot identity fence append/rewrite races. External
+host/watcher refreshes mark indexes for verification; explicit edits/deletes
+retire their reads. Never apply the display limit to canonical writes, exports
+or native model context.
+
+**Provisional browser history**: IndexedDB keeps display-only recent context,
+at most 50 rows / 256 KiB per view, 24 entries / 4 MiB overall, with a 24-hour TTL
+and 1.5-second storage deadline. HTTP is authoritative. Cached history cannot
+enable sending or restore cursors/models/live state; authorization failure,
+confirmed deletion, history edits and installation-scope changes invalidate it.
+
+**Activity and startup navigation**: successful native settlement is distinct
+from a question, quota failure, interruption or background work. Only unread
+success gets a green mark; viewing clears it. Folder status priority is
+error/quota, input, unread completion. Last-chat startup restoration is opt-in
+and browser-local, preserves host identity and yields to explicit deep links.
+Initial list failures must remain visible with the mobile sidebar closed.
+
 Shared foundations in `lib/omp/`:
 
 - `paths.ts` — Node port of omp's directory resolution (`~/.omp/agent`,
@@ -73,7 +102,7 @@ server/
   dev.ts              dev entry (`bun --hot`): serves the HTML import with HMR; re-runs itself once with OMP_WEB_PUBLIC_* set so `bunfig.toml` can inline them
   app.ts              `startServer`: `Bun.serve` + route table + gate + SPA fallback; `startProduction` (listen, `register()`, Ready line); `parseListenArgs`
   routes.ts           the API route table (see "Adding an API route"); `routePattern`, `dispatch`
-  http.ts             `finalizeResponse` (security headers, gzip for pages and static files, never `/api/`), `serveFile` (dist/, public/, KaTeX), `renderIndex`
+  http.ts             `finalizeResponse` (security headers, automatic gzip for pages/assets; history routes negotiate their own), `serveFile` (dist/, public/, KaTeX), `renderIndex`
   client-env.ts       build-time constants for the browser bundle (app version, event-stream worker hash)
 app/
   index.html          the SPA shell, the bundler entry; #root holds static copies of RouteLoadingFallback and (swapped in on /login by an inline script) LoginForm's first render, painted before the bundle runs
@@ -133,7 +162,7 @@ lib/
   omp/                 shared omp foundations (paths, CLI probe, RpcProcess)
   hosts/               hosts and the local daemon (see "Remote hosts"); none of the daemon-loaded files may import `@/` (the daemon runs on Node through `jiti`)
     host.ts            `Host` interface, `HostStatus`, `isLinkUp`
-    local-host.ts      `localHost`, the daemon's side: spawn + file checks on the daemon's machine; `resolveSpawnCwdResult`; `SESSION_EDIT_EXTENSION_PATH` (from the module's own location: the daemon runs in HOME). Never imported by main, nor is `daemon.ts` (`no-direct-local.test.mjs`)
+    local-host.ts      daemon-side spawn and file checks; `resolveSpawnCwdResult`; `SESSION_EDIT_EXTENSION_PATH` resolves from the module's location. Never imported by main, nor is `daemon.ts`.
     local-bootstrap.ts web server side of the local link: `localLinkUrl`, `ensureLocalHostLink` (the `local` record + `host.json`)
     host-login.ts      `host.json` (`loginHost`, `readHostLogin`) and `isLoopbackHost`, shared by the daemon and local-bootstrap
     session-ops.ts     file-reading half of the session/project routes, run on the owning host's daemon (this machine's too)

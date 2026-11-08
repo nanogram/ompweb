@@ -10,6 +10,7 @@
 
 import { recordTransportSample, sendSessionCommand, type CommandReply } from "@/lib/event-stream";
 import { formatApiError } from "@/lib/i18n/api-error";
+import { clearRecentHistoryCache } from "@/lib/recent-history-cache";
 
 // Sessions whose per-chat advisor toggle is on: their lazily spawned omp
 // process must start with --advisor. Keyed by session id because the spawn
@@ -19,10 +20,17 @@ const advisorSpawnSessions = new Set<string>();
 const OUTBOX_SCOPE_KEY = "omp-web:outbox-scope";
 let outboxScope: string | null = null;
 
-/** Nonsecret installation/auth fingerprint, not a cookie: reuse it offline, but never rebind a stored entry. */
-export function rememberOutboxScope(scope: string): void {
+/** Nonsecret installation/auth fingerprint. Returns true when replacing a known scope. */
+export function rememberOutboxScope(scope: string): boolean {
+  let previous = outboxScope;
+  if (!previous) {
+    try { previous = localStorage.getItem(OUTBOX_SCOPE_KEY); } catch { /* This page can still learn the scope. */ }
+  }
+  const changed = Boolean(previous && previous !== scope);
+  if (changed) void clearRecentHistoryCache();
   outboxScope = scope;
   try { localStorage.setItem(OUTBOX_SCOPE_KEY, scope); } catch { /* Storage blocked: this page still knows it. */ }
+  return changed;
 }
 
 export async function getOutboxScope(sessionId: string): Promise<string> {
@@ -76,11 +84,12 @@ export function setSessionAdvisorSpawn(sessionId: string, enabled: boolean) {
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
+  options?: { onRunBoundary: (entryIds: string[]) => void },
 ): Promise<T> {
   const advisor = advisorSpawnSessions.has(sessionId);
   // The link's dedupe key; no crypto.randomUUID (insecure LAN origins lack it).
   const req = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
-  const json = JSON.stringify(command);
+  const json = JSON.stringify(options ? { ...command, captureRunBoundary: true } : command);
   // Every command's `action` sample (spec D6); the worker adds the tags and its clock.
   const type = typeof command.type === "string" ? command.type : "";
   const sample = { metric: "action", req, type, session: sessionId, bytes: json.length, sentAt: Date.now() };
@@ -99,6 +108,7 @@ export async function sendAgentCommand<T = unknown>(
     code?: string;
     hostOffline?: boolean;
     delivery?: string;
+    runBoundary?: unknown;
   };
   const failed = reply.status < 200 || reply.status >= 300 || Boolean(body.error);
   let outcome = failed ? "error" : "ok";
@@ -127,6 +137,12 @@ export async function sendAgentCommand<T = unknown>(
     if (reply.status === 503 && body.hostOffline) throw new HostOfflineError(message, body.delivery === "unknown");
     if (reply.status === 503 && body.code === "transport_lost") throw new TransportLostError(message);
     throw new Error(message);
+  }
+  if (options) {
+    if (!Array.isArray(body.runBoundary) || body.runBoundary.some((id) => typeof id !== "string")) {
+      throw new TransportLostError(formatApiError({ code: "prompt_boundary_unavailable" }));
+    }
+    options.onRunBoundary(body.runBoundary);
   }
   return body.data as T;
 }

@@ -19,11 +19,13 @@ import {
   deleteSessionFileWithArtifacts,
   getLeafEntryId,
   loadSessionFile,
+  loadSessionFileAsync,
   MAX_SESSION_LOAD_BYTES,
   parseTitleSlotLine,
   readSessionHeaderSync,
   setSessionTitle,
   writeSessionFileAtomicSync,
+  type LoadedSession,
 } from "../omp/session-files";
 import { projectIdentityKey, sessionPathKey } from "../paths";
 import {
@@ -42,6 +44,7 @@ import {
   getSessionEntries,
   getSessionEntriesForDisplayAsync,
   getSessionHistoryPage,
+  MAX_CHAT_HISTORY_BYTES,
   invalidateSessionCaches,
   invalidateSessionListCache,
   invalidateSessionPathCache,
@@ -52,7 +55,8 @@ import {
   resolveSessionPath,
   SessionFileTooLargeError,
 } from "../session-reader";
-import type { SessionHistoryCursor } from "../session-sync";
+import { MAX_SYNC_MESSAGES, RECENT_SYNC_MESSAGES, type SessionHistoryCursor } from "../session-sync";
+import { projectTreeForResponse } from "../session-tree";
 import { extractSubagentHistory, readCompletionArtifact, readSubagentTranscriptPage, resolveSubagentArtifact, subagentTranscriptPath } from "../subagent-history";
 import { SUBAGENT_ID_RE } from "../subagent-types";
 import { isRecord } from "../type-guards";
@@ -62,17 +66,21 @@ import { resolveProject } from "../worktree";
 export type OpResult<T> = { ok: true; value: T } | { ok: false; status: number; code: string; error: string };
 
 export interface SessionReadOptions {
-  deferThinking: boolean;
-  deferMedia: boolean;
+  deferThinking?: boolean;
+  deferMedia?: boolean;
+  /** Initial indexed page, including legacy forward paging. */
+  paged?: boolean;
+  /** Initial newest-first display page, without materializing full history. */
+  recent?: boolean;
 }
 
 export interface ContextReadOptions extends SessionReadOptions {
   /** Read-only transcript mode: include entries omitted from the active agent context. */
-  includePreCompaction: boolean;
+  includePreCompaction?: boolean;
   /** Return only the active context's entry ids. */
-  boundary: boolean;
+  boundary?: boolean;
   /** Paged history read (`?sync=1`). */
-  sync: { cursor: SessionHistoryCursor | null; limit: number } | null;
+  sync?: { cursor: SessionHistoryCursor | null; limit: number; recent?: boolean; older?: boolean } | null;
 }
 
 /** `GET /api/sessions/[id]` minus the route's `sessionId` and live `agent`. */
@@ -82,6 +90,9 @@ export interface SessionReadValue {
   leafId: string | null;
   tree: unknown[];
   context: SessionContext;
+  cursor?: SessionHistoryCursor;
+  hasMore?: boolean;
+  hasOlder?: boolean;
 }
 
 export interface ProjectUpdate {
@@ -139,126 +150,6 @@ function unreadableSession(filePath: string): OpResult<never> {
   return fail(404, "session_file_malformed", "Session file is missing or malformed");
 }
 
-// BranchNavigator still traverses recursively, so keep the response tree shallow.
-const MAX_PROJECTED_TREE_DEPTH = 200;
-const MAX_BRANCH_PREVIEW_LENGTH = 40;
-
-function branchPreviewForEntry(entry: { id?: string; type?: string; message?: unknown }): { role?: "user" | "assistant"; text: string } | undefined {
-  if (entry.type !== "message" || !entry.message || typeof entry.message !== "object" || Array.isArray(entry.message)) return undefined;
-  const message = entry.message as { role?: unknown; content?: unknown };
-  let text = typeof message.content === "string"
-    ? message.content
-    : Array.isArray(message.content)
-      ? message.content.filter((block): block is { type?: unknown; text?: unknown } => typeof block === "object" && block !== null).filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text as string).join(" ")
-      : "";
-  text = text.replace(/\s+/g, " " ).trim();
-  if (text.length > MAX_BRANCH_PREVIEW_LENGTH) text = `${text.slice(0, MAX_BRANCH_PREVIEW_LENGTH)}…`;
-  if (!text) text = message.role === "assistant" ? "[assistant]" : "message";
-  const role = message.role === "user" || message.role === "assistant" ? message.role : undefined;
-  return { ...(role ? { role } : {}), text };
-}
-
-/**
- * Project the session tree into the shallow navigation tree sent to the client.
- * Keeps roots, branch points, and leaves while contracting single-child chains
- * without recursive traversal. Contracted entry IDs are attached to the next
- * visible node so the UI can still recognize an active leaf inside the chain.
- */
-function projectTreeForResponse<T extends { entry: { id: string }; children: T[]; compressedEntryIds?: string[] }>(
-  nodes: T[]
-): T[] {
-  const keep = new Set<T>();
-  const roots = new Set(nodes);
-  const seen = new Set<T>();
-  const stack = [...nodes];
-
-  while (stack.length > 0) {
-    const node = stack.pop()!;
-    if (seen.has(node)) continue;
-    seen.add(node);
-
-    if (
-      roots.has(node) ||
-      node.children.length !== 1
-    ) {
-      keep.add(node);
-    }
-
-    for (const child of node.children) {
-      stack.push(child);
-    }
-  }
-
-  const cloneNode = (node: T, compressedEntryIds?: string[], branchPreview?: { role?: "user" | "assistant"; text: string }): T => ({
-    ...node,
-    children: [],
-    ...(compressedEntryIds?.length ? { compressedEntryIds } : {}),
-    ...(branchPreview ? { branchPreview } : {}),
-  });
-  const projectedRoots = nodes.map((node) => cloneNode(node, undefined, branchPreviewForEntry(node.entry)));
-  const tasks = nodes.map((source, index) => ({
-    source,
-    projected: projectedRoots[index],
-    depth: 1,
-  }));
-
-  const appendFlattenedKeptDescendants = (source: T, projectedParent: T) => {
-    const pending = [{ node: source, compressedEntryIds: [] as string[], branchPreview: undefined as { role?: "user" | "assistant"; text: string } | undefined }];
-    const flattenedSeen = new Set<T>();
-
-    while (pending.length > 0) {
-      const { node, compressedEntryIds, branchPreview } = pending.pop()!;
-      if (flattenedSeen.has(node)) continue;
-      flattenedSeen.add(node);
-
-      if (keep.has(node)) {
-        projectedParent.children.push(cloneNode(node, compressedEntryIds, branchPreview ?? branchPreviewForEntry(node.entry)));
-      }
-
-      for (let i = node.children.length - 1; i >= 0; i--) {
-        pending.push({
-          node: node.children[i],
-          compressedEntryIds: keep.has(node)
-            ? []
-            : [...compressedEntryIds, node.entry.id],
-          branchPreview: keep.has(node) ? undefined : (branchPreview ?? branchPreviewForEntry(node.entry)),
-        });
-      }
-    }
-  };
-
-  while (tasks.length > 0) {
-    const { source, projected, depth } = tasks.pop()!;
-
-    for (const sourceChild of source.children) {
-      let child = sourceChild;
-
-      if (depth >= MAX_PROJECTED_TREE_DEPTH) {
-        appendFlattenedKeptDescendants(child, projected);
-        continue;
-      }
-
-      const compressedEntryIds: string[] = [];
-      let branchPreview = branchPreviewForEntry(child.entry);
-      while (!keep.has(child) && child.children.length === 1) {
-        compressedEntryIds.push(child.entry.id);
-        child = child.children[0];
-        branchPreview ??= branchPreviewForEntry(child.entry);
-      }
-
-      if (!keep.has(child)) {
-        continue;
-      }
-
-      const projectedChild = cloneNode(child, compressedEntryIds, branchPreview);
-      projected.children.push(projectedChild);
-      tasks.push({ source: child, projected: projectedChild, depth: depth + 1 });
-    }
-  }
-
-  return projectedRoots;
-}
-
 /** Normalize a user-typed workspace path: ~ expands, relative resolves against the process cwd. */
 function normalizeCwd(cwd: string): string {
   if (cwd === "~") return homedir();
@@ -284,11 +175,25 @@ async function runOmpExport(filePath: string, outputPath: string): Promise<void>
   });
 }
 
+/** Legacy full-display APIs retain their shape, but never read older display bodies. */
+async function readDisplaySession(filePath: string, deferToolResultImages?: boolean): Promise<Pick<LoadedSession, "entries" | "historyWindow">> {
+  if (statSync(filePath).size <= MAX_CHAT_HISTORY_BYTES) {
+    return { entries: await getSessionEntriesForDisplayAsync(filePath, { skipToolResultImages: deferToolResultImages }) };
+  }
+  const loaded = await loadSessionFileAsync(filePath, {
+    historyWindowBytes: MAX_CHAT_HISTORY_BYTES,
+    resolveBlobs: true,
+    skipToolResultImages: deferToolResultImages,
+  });
+  if (loaded.error === "too_large") throw new SessionFileTooLargeError(filePath);
+  return loaded;
+}
+
 /** This machine's session and project files. */
 export const sessionOps: SessionOps = {
   listSessions: () => listAllSessions(),
 
-  async readSession(id, { deferThinking, deferMedia: deferToolResultImages }) {
+  async readSession(id, { deferThinking, deferMedia: deferToolResultImages, recent, paged }) {
     const filePath = await resolveSessionPath(id);
     if (!filePath) return sessionNotFound();
     try {
@@ -297,10 +202,17 @@ export const sessionOps: SessionOps = {
       // deep copy so shared cached objects are never mutated.
       const header = readSessionHeader(filePath);
       if (header === null) return unreadableSession(filePath);
-      const displayEntries = await getSessionEntriesForDisplayAsync(filePath, { skipToolResultImages: deferToolResultImages });
-      const leafId = getLeafEntryId(displayEntries);
-      const tree = projectTreeForResponse(buildSessionTree(displayEntries));
-      const context = buildSessionContext(displayEntries, leafId, { deferThinking, deferToolResultImages });
+      const page = paged || recent ? await getSessionHistoryPage(filePath, null, recent ? RECENT_SYNC_MESSAGES : MAX_SYNC_MESSAGES, undefined, {
+        deferThinking, deferToolResultImages, recent, includeTree: true,
+      }) : null;
+      const display = page ? null : await readDisplaySession(filePath, deferToolResultImages);
+      const displayEntries = display?.entries;
+      const leafId = page ? page.leafId : getLeafEntryId(displayEntries!);
+      const tree = page ? page.tree! : projectTreeForResponse(buildSessionTree(displayEntries!));
+      const context = page ? page.history.context : buildSessionContext(displayEntries!, leafId, {
+        deferThinking, deferToolResultImages, prefixOmitted: !!(display && "historyWindow" in display && display.historyWindow),
+      });
+      if (display && "historyWindow" in display && display.historyWindow) context.historyWindow = display.historyWindow;
 
       let modified = header.timestamp ?? new Date().toISOString();
       try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
@@ -315,7 +227,7 @@ export const sessionOps: SessionOps = {
         name: header.title,
         created: header.timestamp,
         modified,
-        messageCount: context.messages.length,
+        messageCount: page ? page.entryCount : context.messages.length,
         firstMessage: firstUser
           ? (() => {
               const c = (firstUser as { content: unknown }).content;
@@ -324,7 +236,9 @@ export const sessionOps: SessionOps = {
           : "(no messages)",
         parentSessionId,
       };
-      return ok({ filePath, info, leafId, tree, context });
+      return ok({ filePath, info, leafId, tree, context, ...(page ? {
+        cursor: page.history.cursor, hasMore: page.history.hasMore, hasOlder: page.history.hasOlder,
+      } : {}) });
     } catch (error) {
       if (error instanceof SessionFileTooLargeError) return sessionTooLarge();
       throw error;
@@ -337,21 +251,26 @@ export const sessionOps: SessionOps = {
     try {
       const header = readSessionHeader(filePath);
       if (header === null) return unreadableSession(filePath);
-      if (boundary) return ok(getSessionContextBoundary(filePath));
+      if (boundary) return ok(await getSessionContextBoundary(filePath));
       if (sync) {
-        return ok(getSessionHistoryPage(filePath, sync.cursor, sync.limit, leafId, {
+        return ok(await getSessionHistoryPage(filePath, sync.cursor, sync.limit, leafId, {
           deferThinking,
           deferToolResultImages,
           includePreCompaction,
+          recent: sync.recent,
+          older: sync.older,
         }));
       }
       // Deduplicated cached read; blob resolution on per-entry deep copies.
-      const entries = await getSessionEntriesForDisplayAsync(filePath, { skipToolResultImages: deferToolResultImages });
+      const display = await readDisplaySession(filePath, deferToolResultImages);
+      const entries = display.entries;
       const context = buildSessionContext(entries, leafId, {
         deferThinking,
         deferToolResultImages,
         includePreCompaction,
+        prefixOmitted: !!("historyWindow" in display && display.historyWindow),
       });
+      if ("historyWindow" in display && display.historyWindow) context.historyWindow = display.historyWindow;
       return ok({ context });
     } catch (error) {
       // Past the load ceiling: the same 413 as the null-header path, not a

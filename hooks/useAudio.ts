@@ -45,8 +45,12 @@ function getSharedCtx(): AudioContext | null {
 export function useAudio() {
   const [enabled, setEnabled] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
-    const stored = localStorage.getItem("omp-sound-enabled");
-    return stored === null ? true : stored === "true";
+    try {
+      const stored = localStorage.getItem("omp-sound-enabled");
+      return stored === null ? true : stored === "true";
+    } catch {
+      return true;
+    }
   });
 
   const enabledRef = useRef(enabled);

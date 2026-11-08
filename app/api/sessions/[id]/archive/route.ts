@@ -2,7 +2,7 @@ import { apiErrorResponse, hostOfflineResponse, opErrorResponse, resolveSessionH
 import { HostOpError } from "@/lib/hosts/link-protocol";
 import { invalidateHostSessionList } from "@/lib/hosts/session-index";
 import { LOCAL_HOST_ID } from "@/lib/hosts/registry";
-import { clearExitedRpcSession, getRpcSession } from "@/lib/rpc-manager";
+import { clearExitedRpcSession, clearRpcSessionActivity, getRpcSession } from "@/lib/rpc-manager";
 
 /** POST /api/sessions/[id]/archive — stop the live child, then archive the
  * native OMP JSONL and its sibling artifacts using OMP's gc layout. */
@@ -42,6 +42,7 @@ export async function POST(
     if (!result.ok) return opErrorResponse(result);
     invalidateHostSessionList(resolved.host.id);
     clearExitedRpcSession(id);
+    clearRpcSessionActivity(id);
     return Response.json({ ok: true, archived: true, archivedPath: result.value.archivedPath });
   } catch (error) {
     if (error instanceof HostOpError) return apiErrorResponse(error);

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Ban, CheckCircle2, ChevronDown, Circle, CircleAlert, CircleDotDashed, ListChecks } from "lucide-react";
+import { Ban, CheckCircle2, ChevronDown, Circle, CircleAlert, CircleDotDashed, CircleHelp, ListChecks } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import type { TodoItem, TodoPhase } from "@/lib/pi-types";
 
@@ -21,6 +21,7 @@ interface TodoListProps {
    * composer (#245). The row already exists whenever phases exist, so the
    * status text changes in place rather than popping a line in and out. */
   liveStatus?: string | null;
+  waitingForInput?: boolean;
   /** Render as a composer-attached panel: the header row becomes a
    * collapse/expand toggle and the section margin is dropped. */
   collapsible?: boolean;
@@ -40,7 +41,7 @@ function previewTaskOrder(status: TodoItem["status"]): number {
   return 2;
 }
 
-export function TodoList({ phases = [], liveStatus = null, collapsible = false, defaultExpanded = false, collapsed: collapsedProp, onCollapsedChange }: TodoListProps) {
+export function TodoList({ phases = [], liveStatus = null, waitingForInput = false, collapsible = false, defaultExpanded = false, collapsed: collapsedProp, onCollapsedChange }: TodoListProps) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [collapsedState, setCollapsedState] = useState(collapsible ? !defaultExpanded : false);
@@ -80,8 +81,12 @@ export function TodoList({ phases = [], liveStatus = null, collapsible = false, 
       title={liveStatus}
       style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 6, color: "var(--text-muted)" }}
     >
-      <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
-      <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{liveStatus}</span>
+      {waitingForInput ? (
+        <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden />
+      ) : (
+        <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
+      )}
+      <span className={waitingForInput ? "sr-only" : undefined} style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{liveStatus}</span>
     </span>
   ) : null;
 

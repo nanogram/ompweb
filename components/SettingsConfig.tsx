@@ -4,6 +4,7 @@ import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { getSubmitDuringRunBehavior, getWordCompletionMode, setSubmitDuringRunBehavior, setWordCompletionMode, type SubmitDuringRunBehavior, type WordCompletionMode } from "@/lib/composer-prefs";
+import { getRestoreLastChat, setRestoreLastChat } from "@/lib/workspace-memory";
 import dynamic from "@/lib/dynamic";
 import { ArrowDown, ArrowLeft, ArrowUp, Copy, Download, RefreshCw, RotateCcw, Search, Monitor, Play, Square, Trash2, X } from "lucide-react";
 import { COMPACTION_METHODS, DEFAULT_COMPACTION_METHOD_ORDER, type CompactionMethod } from "@/lib/compaction-methods";
@@ -172,6 +173,7 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   { id: "transcript-presentation", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.transcriptPresentation", descKey: "settingsConfig.transcriptPresentationDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Transcript presentation", fallbackDesc: "Focused mode folds completed progress before the final reply. Live, incomplete and failed output stays visible; search reveals folded content.", scope: "UI" },
   { id: "expand-process-details", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.expandProcessDetailsByDefault", descKey: "settingsConfig.expandProcessDetailsByDefaultDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Expand Process details by default", fallbackDesc: "Open transcript process details automatically in either presentation", scope: "UI" },
   { id: "open-url-automatically", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.openUrlAutomatically", descKey: "settingsConfig.openUrlAutomaticallyDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Open agent links without asking", fallbackDesc: "Links the agent opens from the session you are viewing open in a new tab right away. Links from other sessions always ask first. Your browser may still block pop-ups.", scope: "UI" },
+  { id: "restore-last-chat", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.restoreLastChat", descKey: "settingsConfig.restoreLastChatDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Reopen last chat on startup", fallbackDesc: "Return to the last viewed chat in this browser unless a session or workspace link was opened.", scope: "UI" },
   { id: "scope-native-select-all", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.scopeNativeSelectAll", descKey: "settingsConfig.scopeNativeSelectAllDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Scope native Select All (experimental)", fallbackDesc: "Limit whole-page selections from browser or touch menus to the active message, chat, or file. May also narrow deliberate whole-page selections. Turn off if selection handles or menus misbehave. Keyboard shortcuts are unaffected.", scope: "UI" },
   { id: "tts-autoplay", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.ttsAutoplay", descKey: "settingsConfig.ttsAutoplayDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Auto-read assistant responses", fallbackDesc: "Automatically read aloud new assistant replies when completed.", scope: "UI" },
   { id: "tts-voice", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.ttsVoice", descKey: "settingsConfig.ttsVoiceDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Speech Voice", fallbackDesc: "Select the browser voice for text-to-speech reading.", scope: "UI" },
@@ -429,6 +431,16 @@ function UploadRetentionSetting() {
           </option>
         ))}
       </select>
+    </NativeSetting>
+  );
+}
+
+export function RestoreLastChatSetting() {
+  const { t } = useI18n();
+  const [enabled, setEnabled] = useState(getRestoreLastChat);
+  return (
+    <NativeSetting searchId="restore-last-chat" label={t("settingsConfig.restoreLastChat")} description={t("settingsConfig.restoreLastChatDesc")} scope="UI">
+      <ToggleSwitch checked={enabled} onChange={(next) => { setEnabled(next); setRestoreLastChat(next); }} />
     </NativeSetting>
   );
 }
@@ -1340,6 +1352,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                   <NativeSetting searchId="open-url-automatically" label={t("settingsConfig.openUrlAutomatically")} description={t("settingsConfig.openUrlAutomaticallyDesc")} scope="UI">
                     <ToggleSwitch checked={openUrlAutomatically} onChange={onOpenUrlAutomaticallyChange} />
                   </NativeSetting>
+                  <RestoreLastChatSetting />
                   <NativeSetting searchId="completion-sound" label={t("settingsConfig.completionSound")} description={t("settingsConfig.completionSoundDesc")} scope="UI">
                     <ToggleSwitch
                       checked={soundEnabled}

@@ -5,7 +5,8 @@ import { createPortal } from "react-dom";
 import { Popover } from "@base-ui/react/popover";
 import { useI18n } from "@/lib/i18n";
 import { usePrefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
-import { AlertTriangle, Check } from "lucide-react";
+import { AlertCircle, AlertTriangle, Check, CircleHelp } from "lucide-react";
+import type { SessionActivityStatus } from "@/lib/session-activity";
 import OmpWebLogo from "./OmpWebLogo";
 /**
  * Path label that ellipsizes on the LEFT, keeping the (most relevant) trailing
@@ -435,66 +436,26 @@ function ExitedSessionIndicator({ title, size = 14 }: { title: string; size?: nu
     </span>
   );
 }
-function RecentlyCompletedIndicator({ size = 12 }: { size?: number }) {
+function SessionActivityIndicator({ status, detail, size = 14 }: { status: SessionActivityStatus; detail?: string; size?: number }) {
   const { t } = useI18n();
+  if (status === "running") return <RunningSessionIndicator size={size} />;
+  const label = t(`sessionSidebar.activity.${status}`);
+  const title = detail ? `${label}: ${detail}` : label;
+  const Icon = status === "completed" ? Check : status === "waiting_input" ? CircleHelp : AlertCircle;
   return (
-    <span
-      title={t("sessionSidebar.recentlyCompleted")}
-      aria-label={t("sessionSidebar.recentlyCompleted")}
-      style={{
-        width: size,
-        height: size,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        color: "var(--status-success)",
-      }}
-    >
-      <Check size={size} strokeWidth={2.4} aria-hidden="true" />
+    <span role="img" title={title} aria-label={title} style={{ width: size, height: size, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: status === "completed" ? "var(--status-success)" : status === "waiting_input" ? "var(--status-warning)" : "var(--status-error)" }}>
+      <Icon size={size} strokeWidth={2.2} aria-hidden="true" />
     </span>
   );
 }
 
-
-function UnreadSessionIndicator({ size = 14 }: { size?: number }) {
-  const { t } = useI18n();
-  const reducedMotion = usePrefersReducedMotion();
-  return (
-    <span
-      title={t("sessionSidebar.newActivity")}
-      aria-label={t("sessionSidebar.newSessionActivity")}
-      style={{
-        width: size,
-        height: size,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        color: "var(--accent)",
-      }}
-    >
-      <svg width={size} height={size} viewBox="0 0 14 14" fill="none" aria-hidden="true" style={{ display: "block" }}>
-        <circle cx="7" cy="7" r="2.5" fill="currentColor" />
-        {!reducedMotion && (
-          <circle cx="7" cy="7" r="3" stroke="currentColor" strokeWidth="1.4" opacity="0.32">
-            <animate attributeName="r" values="3;6;3" dur="1.6s" repeatCount="indefinite" />
-            <animate attributeName="opacity" values="0.32;0;0.32" dur="1.6s" repeatCount="indefinite" />
-          </circle>
-        )}
-      </svg>
-    </span>
-  );
-}
 export {
   OmpWebTitle,
   PathLabel,
   ExitedSessionIndicator,
-  RunningSessionIndicator,
-  RecentlyCompletedIndicator,
+  SessionActivityIndicator,
   SIDEBAR_BUTTON_TRANSITION,
   SidebarIconButton,
   SidebarPortalMenu,
-  UnreadSessionIndicator,
   useScramble,
 };

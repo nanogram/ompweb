@@ -40,7 +40,7 @@ function flush(): void {
   if (hadUnknown) {
     // filename was null — fs.watch coalesced the event or overflowed. We
     // don't know which file changed, so fall back to the full invalidation.
-    invalidateSessionListCache();
+    invalidateSessionListCache({ observedChange: true });
     invalidateLocalSessionLists();
     void rescanAndNotify();
     return;
@@ -52,7 +52,7 @@ function flush(): void {
   invalidateSessionListMeta();
   // The sidebar lists this machine's sessions through its daemon: its caches go stale the same way.
   for (const path of paths) {
-    invalidateSessionEntriesCache(path);
+    invalidateSessionEntriesCache(path, { observedChange: true });
     invalidateLocalSessionLists(path);
   }
 
