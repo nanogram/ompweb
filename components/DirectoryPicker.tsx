@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { isValidOmpProfile } from "@/lib/omp-profile";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { appendProgress, cloneDirectoryName } from "@/lib/git-clone";
@@ -134,11 +135,12 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host 
   const hasUncommittedPath = pathInput.trim() !== currentPath;
   const cloneName = cloneUrl.trim() ? cloneDirectoryName(cloneUrl) : null;
   const cloneTarget = cloneName && currentPath ? `${currentPath.replace(/[\\/]+$/, "")}${currentPath.includes("\\") ? "\\" : "/"}${cloneName}` : null;
-  const canSelect = Boolean(currentPath) && !loading && !hasUncommittedPath && !locked && (!cloneUrl.trim() || cloneName !== null);
+  const profileInvalid = !isValidOmpProfile(profile.trim());
+  const canSelect = Boolean(currentPath) && !loading && !hasUncommittedPath && !locked && (!cloneUrl.trim() || cloneName !== null) && !profileInvalid;
   const goDisabled = loading || locked || !pathInput.trim();
   const canNavigateUp = !locked && (Boolean(parentDirectory) || isWindowsDriveRoot(currentPath));
   const submitSelection = async () => {
-    if (locked || cloneAbortRef.current) return;
+    if (!canSelect || cloneAbortRef.current) return;
     const args = extraArgs.split("\n").map((arg) => arg.trim()).filter(Boolean);
     const launchConfig = { profile: profile.trim() || undefined, advisor: advisor || undefined, extraArgs: args.length ? args : undefined };
     if (!cloneUrl.trim()) {
@@ -359,7 +361,8 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, host 
               {cloneLog.replace(/\r/g, "")}
             </pre>
           )}
-          <input className="directory-picker-profile" value={profile} onChange={(event) => setProfile(event.target.value)} placeholder={t("directoryPicker.profilePlaceholder")} aria-label={t("directoryPicker.profileLabel")} style={{ width: "100%", height: 30, boxSizing: "border-box", marginBottom: 7, padding: "0 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
+          <input className="directory-picker-profile" value={profile} disabled={locked} onChange={(event) => setProfile(event.target.value)} placeholder={t("directoryPicker.profilePlaceholder")} aria-label={t("directoryPicker.profileLabel")} aria-invalid={profileInvalid || undefined} style={{ width: "100%", height: 30, boxSizing: "border-box", marginBottom: 3, padding: "0 8px", background: "var(--bg-panel)", border: `1px solid ${profileInvalid ? "var(--status-error)" : "var(--border)"}`, borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
+          <div role={profileInvalid ? "alert" : undefined} style={{ marginBottom: 7, color: profileInvalid ? "var(--status-error)" : "var(--text-dim)", fontSize: 11, lineHeight: 1.4 }}>{t(profileInvalid ? "projectLaunchConfig.profileInvalid" : "projectLaunchConfig.profileRule")}</div>
           <label className="directory-picker-launch" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7, color: "var(--text-muted)", fontSize: 11 }}><input type="checkbox" checked={advisor} onChange={(event) => setAdvisor(event.target.checked)} />{t("projectLaunchConfig.advisorLabel")}</label>
           <textarea className="directory-picker-extra-args" value={extraArgs} onChange={(event) => setExtraArgs(event.target.value)} placeholder={t("directoryPicker.extraArgsPlaceholder")} aria-label={t("directoryPicker.extraArgsLabel")} rows={2} style={{ width: "100%", boxSizing: "border-box", resize: "vertical", padding: "6px 8px", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }} />
         </div>

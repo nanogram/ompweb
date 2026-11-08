@@ -4,6 +4,10 @@ import type { AgentMessage, SessionContext } from "./types";
 export interface SessionHistoryCursor {
   firstEntryId: string | null;
   lastEntryId: string | null;
+  /** First row of the full selected path, independent of the loaded subset. */
+  contextFirstEntryId?: string | null;
+  /** Pins a bounded read only until its final page has been delivered. */
+  windowEndOffset?: number;
 }
 
 /** Ordering within one web-owned RPC process; resets when that process changes. */
@@ -32,11 +36,13 @@ export interface SessionLiveSnapshot {
 }
 
 export interface SessionHistoryPage {
-  mode: "append" | "replace";
+  mode: "append" | "prepend" | "replace";
   baseEntryId: string | null;
   context: SessionContext;
   cursor: SessionHistoryCursor;
   hasMore: boolean;
+  /** Earlier retained rows, distinct from pending forward catch-up. */
+  hasOlder?: boolean;
 }
 
 export interface SessionHistoryRange extends Omit<SessionHistoryPage, "context"> {
@@ -52,6 +58,9 @@ export interface SessionSyncResponse extends SessionHistoryPage {
 }
 
 export const MAX_SYNC_MESSAGES = 200;
+export const RECENT_SYNC_MESSAGES = 50;
+/** Soft raw JSONL body-byte budget; one complete oversized row may progress. */
+export const MAX_SYNC_PAGE_BYTES = 256 * 1024;
 
 export function historyCursor(context: Pick<SessionContext, "entryIds">): SessionHistoryCursor {
   return {
@@ -69,10 +78,20 @@ export function parseHistoryCursor(raw: string | null): SessionHistoryCursor | n
   const cursor = value as Record<string, unknown>;
   const validId = (id: unknown): id is string | null => id === null || (typeof id === "string" && id.length > 0 && id.length <= 256);
   if (!validId(cursor.firstEntryId) || !validId(cursor.lastEntryId)
-    || (cursor.firstEntryId === null) !== (cursor.lastEntryId === null)) {
+    || (cursor.firstEntryId === null) !== (cursor.lastEntryId === null)
+    || (cursor.contextFirstEntryId !== undefined
+      && (!validId(cursor.contextFirstEntryId)
+        || (cursor.contextFirstEntryId === null) !== (cursor.firstEntryId === null)))
+    || (cursor.windowEndOffset !== undefined
+      && (typeof cursor.windowEndOffset !== "number" || !Number.isSafeInteger(cursor.windowEndOffset) || cursor.windowEndOffset < 0))) {
     throw new Error("Invalid history cursor");
   }
-  return { firstEntryId: cursor.firstEntryId, lastEntryId: cursor.lastEntryId };
+  return {
+    firstEntryId: cursor.firstEntryId,
+    lastEntryId: cursor.lastEntryId,
+    ...(cursor.contextFirstEntryId === undefined ? {} : { contextFirstEntryId: cursor.contextFirstEntryId as string | null }),
+    ...(cursor.windowEndOffset === undefined ? {} : { windowEndOffset: cursor.windowEndOffset as number }),
+  };
 }
 
 /** Page the selected display path; an invalidated branch/compaction cursor resets it. */
@@ -82,6 +101,7 @@ export function selectSessionHistory(
   limit = MAX_SYNC_MESSAGES,
 ): SessionHistoryPage {
   const { start, end, ...page } = selectHistoryRange(context.entryIds, cursor, limit);
+  if (page.hasMore && context.historyWindow) page.cursor.windowEndOffset = context.historyWindow.endOffset;
   return {
     ...page,
     context: { ...context, messages: context.messages.slice(start, end), entryIds: context.entryIds.slice(start, end) },
@@ -111,5 +131,76 @@ export function selectHistoryRange(
     end,
     cursor: { firstEntryId, lastEntryId: entryIds[end - 1] ?? null },
     hasMore: end < entryIds.length,
+  };
+}
+
+/** Select a bounded newest page, an older prepend, or forward catch-up. */
+export function selectRecentHistoryRange(
+  entryIds: readonly string[],
+  cursor: SessionHistoryCursor | null,
+  limit = RECENT_SYNC_MESSAGES,
+  positions?: ReadonlyMap<string, number>,
+  options: { older?: boolean; rowBytes?: readonly number[]; maxBytes?: number } = {},
+): SessionHistoryRange {
+  if (!Number.isInteger(limit) || limit < 1 || limit > RECENT_SYNC_MESSAGES) throw new RangeError("Invalid history page limit");
+  const maxBytes = options.maxBytes ?? MAX_SYNC_PAGE_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new RangeError("Invalid history page byte limit");
+  const contextFirstEntryId = entryIds[0] ?? null;
+  const locate = (id: string | null | undefined) => {
+    if (id == null) return -1;
+    const index = positions ? positions.get(id) ?? -1 : entryIds.indexOf(id);
+    return entryIds[index] === id ? index : -1;
+  };
+  const firstIndex = locate(cursor?.firstEntryId);
+  const lastIndex = locate(cursor?.lastEntryId);
+  const valid = cursor !== null && cursor.contextFirstEntryId === contextFirstEntryId
+    && ((firstIndex >= 0 && lastIndex >= firstIndex)
+      || (entryIds.length === 0 && cursor.firstEntryId === null && cursor.lastEntryId === null));
+  const mode = valid ? options.older ? "prepend" : "append" : "replace";
+  const bytesAt = (index: number) => {
+    const bytes = options.rowBytes === undefined ? 0 : options.rowBytes[index];
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("Invalid history row byte length");
+    return bytes;
+  };
+  let start: number;
+  let end: number;
+  let bytes = 0;
+  if (mode === "append") {
+    start = lastIndex + 1;
+    end = start;
+    while (end < entryIds.length && end - start < limit) {
+      const nextBytes = bytesAt(end);
+      if (end > start && bytes + nextBytes > maxBytes) break;
+      bytes += nextBytes;
+      end++;
+      if (bytes >= maxBytes) break;
+    }
+  } else {
+    end = mode === "prepend" ? Math.max(0, firstIndex) : entryIds.length;
+    start = end;
+    while (start > 0 && end - start < limit) {
+      const nextBytes = bytesAt(start - 1);
+      if (start < end && bytes + nextBytes > maxBytes) break;
+      bytes += nextBytes;
+      start--;
+      if (bytes >= maxBytes) break;
+    }
+  }
+  const loadedFirst = mode === "append" ? cursor!.firstEntryId
+    : entryIds[start] ?? cursor?.firstEntryId ?? null;
+  const loadedLast = mode === "prepend" ? cursor!.lastEntryId
+    : entryIds[end - 1] ?? null;
+  return {
+    mode,
+    baseEntryId: mode === "append" ? cursor!.lastEntryId : mode === "prepend" ? cursor!.firstEntryId : null,
+    start,
+    end,
+    cursor: {
+      firstEntryId: mode === "replace" ? entryIds[start] ?? null : loadedFirst,
+      lastEntryId: loadedLast,
+      contextFirstEntryId,
+    },
+    hasMore: mode === "append" && end < entryIds.length,
+    hasOlder: mode === "append" ? firstIndex > 0 : start > 0,
   };
 }

@@ -441,7 +441,8 @@ export class ChannelTable {
       }
       return;
     }
-    if (channel.editor !== undefined && channel.editor !== link.id && HISTORY_MUTATING_COMMANDS.has(frame.type)) {
+    if (channel.editor !== undefined && channel.editor !== link.id
+      && (HISTORY_MUTATING_COMMANDS.has(frame.type) || (frame.type === "goal" && frame.op !== "get"))) {
       if (typeof frame.id === "string") {
         this.deliver(channel, channel.members.get(link.id)!, { type: "stdout", ch, line: JSON.stringify({ type: "response", id: frame.id, command: frame.type,
           success: false, code: "session_busy", error: "Another web app is editing this session's history; retry once it finishes" }) }, true);

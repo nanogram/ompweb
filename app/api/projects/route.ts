@@ -1,4 +1,5 @@
 import { apiErrorResponse, opErrorResponse, resolveHostOrError } from "@/lib/api-utils";
+import { isValidOmpProfile } from "@/lib/omp-profile";
 import { allowFileRoot } from "@/lib/file-access";
 import { LOCAL_HOST_ID } from "@/lib/hosts/registry";
 import { listProjectsAllHosts } from "@/lib/hosts/session-index";
@@ -15,12 +16,12 @@ function parseLaunchConfig(value: unknown): ProjectLaunchConfig | undefined {
   const raw = value as Record<string, unknown>;
   const profile = raw.profile === undefined ? undefined : typeof raw.profile === "string" && raw.profile.trim() ? raw.profile.trim() : undefined;
   if (raw.profile !== undefined && !profile) throw new ProjectPathError("invalid_profile", "Profile must be a non-empty string");
-  if (profile?.startsWith("-")) throw new ProjectPathError("invalid_profile", "Profile must not start with '-'");
+  if (profile !== undefined && !isValidOmpProfile(profile)) throw new ProjectPathError("invalid_profile", "Invalid OMP profile name");
   const advisor = raw.advisor === undefined ? undefined : raw.advisor;
   if (advisor !== undefined && typeof advisor !== "boolean") throw new ProjectPathError("invalid_advisor", "Advisor must be a boolean");
   if (raw.extraArgs !== undefined && (!Array.isArray(raw.extraArgs) || raw.extraArgs.length > MAX_EXTRA_ARGS)) throw new ProjectPathError("invalid_extra_args", "Extra args must contain at most 32 arguments");
   const extraArgs = raw.extraArgs === undefined ? undefined : (raw.extraArgs as unknown[]).map((arg) => {
-    if (typeof arg !== "string" || !arg || arg.length > MAX_EXTRA_ARG_LENGTH || isReservedLaunchArg(arg)) throw new ProjectPathError("invalid_extra_args", "Extra args contain an invalid or reserved argument");
+    if (typeof arg !== "string" || !arg || arg.length > MAX_EXTRA_ARG_LENGTH || arg.includes("\0") || isReservedLaunchArg(arg)) throw new ProjectPathError("invalid_extra_args", "Extra args contain an invalid or reserved argument");
     return arg;
   });
   if (!profile && advisor === undefined && (!extraArgs || extraArgs.length === 0)) return undefined;

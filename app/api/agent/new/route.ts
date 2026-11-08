@@ -1,8 +1,11 @@
-import { apiErrorResponse, opErrorResponse, resolveHostOrError } from "@/lib/api-utils";
-import { WebRpcError, startNewRpcSession } from "@/lib/rpc-manager";
+import { apiErrorResponse, resolveHostOrError } from "@/lib/api-utils";
+import { WebRpcError } from "@/lib/rpc-manager";
 import { RpcCommandError } from "@/lib/omp/rpc-process";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "@/lib/image-attachments";
+import { readAgentSelection } from "@/lib/agent-command";
+import { runFreshSessionCommand } from "@/lib/fresh-session-handoff";
+import { requestOwner } from "@/lib/web-auth";
 
 function newSessionErrorResponse(error: unknown) {
   if (error instanceof RequestBodyTooLargeError) {
@@ -25,17 +28,12 @@ function newSessionErrorResponse(error: unknown) {
 // calls immediately send the first command;
 // type:"ensure_session" only creates the runtime so clients can query commands.
 // Returns { sessionId, data } where sessionId is omp's real session id.
-// Model/thinking presets are applied post-ready via RPC set_model /
-// set_thinking_level (not CLI flags) so failures surface as command errors and
-// the live model catalog (incl. background discovery) is consulted.
+// A creationKey joins precreation and the first prompt server-side; neither a
+// renderer continuation nor the order of the two HTTP responses owns delivery.
 export async function POST(req: Request) {
   try {
     const body = await parseJsonWithinLimit<{ cwd?: string; hostId?: unknown; [key: string]: unknown }>(req, MAX_AGENT_COMMAND_REQUEST_BYTES);
-    const { cwd: requestedCwd, hostId, ...command } = body;
-    // New-chat uploads have no session file to attach into; never forward bearer authority to native RPC.
-    if (Object.hasOwn(command, "uploadProofs") || Object.hasOwn(command, "uploads")) {
-      return Response.json({ error: "Files attach only to an existing session", code: "invalid_uploads" }, { status: 400 });
-    }
+    const { cwd: requestedCwd, hostId, creationKey, ...command } = body;
     const target = resolveHostOrError(hostId);
     if ("response" in target) return target.response;
     const { host } = target;
@@ -52,36 +50,16 @@ export async function POST(req: Request) {
       return Response.json({ error: "command type is required", code: "command_type_required" }, { status: 400 });
     }
 
-    // The cwd is checked on its host; the host answers with the path it will use.
-    const preparing = promptCommand.type !== "ensure_session" || !!(provider && modelId) || !!thinkingLevel;
-    const started = await startNewRpcSession(host, requestedCwd, toolNames, advisor === true, preparing);
-    if (!started.ok) return opErrorResponse(started);
-    const { session, realSessionId } = started.value;
-
-    try {
-      const run = async () => {
-        if (provider && modelId) await session.send({ type: "set_model", provider, modelId });
-        if (thinkingLevel) await session.send({ type: "set_thinking_level", level: thinkingLevel });
-        if (promptCommand.type === "ensure_session") {
-          return Response.json({ success: true, sessionId: realSessionId, data: null });
-        }
-        const result = await session.send(promptCommand);
-        return Response.json({ success: true, sessionId: realSessionId, data: result });
-      };
-      return await (preparing ? session.withPendingCommand(run, true) : run());
-    } catch (error) {
-      // The child was spawned but the prompt never ran: without this cleanup a
-      // failed set_model/set_thinking_level/prompt leaves an orphaned omp
-      // process and a registry entry nobody will ever use.
-      // The link dropped: the first command may be running there, so the
-      // wrapper stays for the reconnect (and disposing it would wait for the link).
-      // Its id lets the client open it instead of starting a second session.
-      if (error instanceof WebRpcError && error.code === "host_offline") {
-        return Response.json({ error: error.message, code: error.code, hostOffline: true, delivery: error.delivery, sessionId: realSessionId }, { status: 503 });
-      }
-      await session.destroyAndWait();
-      throw error;
-    }
+    return await runFreshSessionCommand({
+      host,
+      cwd: requestedCwd,
+      toolNames,
+      advisor: advisor === true,
+      selection: readAgentSelection({ provider, modelId, thinkingLevel }),
+      owner: requestOwner(req),
+      creationKey,
+      command: promptCommand,
+    });
   } catch (error) {
     return newSessionErrorResponse(error);
   }

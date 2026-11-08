@@ -1,18 +1,25 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync, type Stats } from "fs";
+import { createHash } from "crypto";
 import { normalize as normalizePath } from "path";
 import { getAgentDir } from "./omp/paths";
 import {
+  buildSessionTree,
   containsBlobRef,
   invalidateAllSessionScanCaches,
   invalidateSessionFileListCache,
   invalidateSessionScanCache,
   listAllSessionInfos,
   loadSessionFile,
+  loadSessionFileAsync,
+  matchesSessionFileSnapshot,
   MAX_SESSION_LOAD_BYTES,
   readSessionHeaderSync,
   resolveBlobRefsInEntries,
   type OmpSessionInfo,
   type ResolveBlobOptions,
+  type SessionFileSnapshot,
+  type ProjectedSessionRecord,
+  type SessionFileProjectionState,
 } from "./omp/session-files";
 import type {
   AgentMessage,
@@ -22,6 +29,7 @@ import type {
   SessionEntry,
   SessionHeader,
   SessionInfo,
+  SessionTreeNode,
 } from "./types";
 import { normalizeToolCalls } from "./normalize";
 import { isRecord } from "./type-guards";
@@ -30,8 +38,9 @@ import { taskResultRetryFailure, taskResultStructuredOutput, taskResultUsageCost
 import type { TodoPhase } from "./pi-types";
 import { projectIdentityKey, sessionPathKey } from "./paths";
 import { resolveProject, type ProjectInfo } from "./worktree";
-import { selectHistoryRange, type SessionHistoryCursor, type SessionHistoryPage } from "./session-sync";
+import { selectHistoryRange, selectRecentHistoryRange, type SessionHistoryCursor, type SessionHistoryPage } from "./session-sync";
 import { PASSIVE_TOOL_CONTEXT } from "./chat-transcript-plan";
+import { branchPreviewForEntry, projectTreeForResponse } from "./session-tree";
 
 export { getAgentDir };
 
@@ -74,7 +83,7 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
     }));
   }
 
-  return ompSessions.map((s) => {
+  return ompSessions.map((s): SessionInfo => {
     cacheSessionPath(s.id, s.path);
     const project = s.cwd ? projectByCwd.get(s.cwd) : undefined;
     return {
@@ -90,6 +99,11 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
       ...(s.lastMessageAt ? { lastMessageAt: s.lastMessageAt.toISOString() } : {}),
       messageCount: s.messageCount,
       firstMessage: s.firstMessage || "(no messages)",
+      activityStatus: s.status === undefined ? undefined
+        : s.status === "complete" ? "completed"
+          : s.status === "error" ? "error"
+            : s.status === "aborted" || s.status === "interrupted" ? "interrupted"
+              : "idle",
       parentSessionId: s.parentSessionPath
         ? matchParentSessionId(s.parentSessionPath, pathToId, knownIds)
         : undefined,
@@ -185,13 +199,25 @@ export function invalidateSessionListMeta(): void {
   invalidateSessionFileListCache();
 }
 
-export function invalidateSessionListCache(): void {
+export function invalidateSessionListCache(options: { observedChange?: boolean } = {}): void {
   invalidateSessionListMeta();
   // Drop cached entry parses so a mutation preserving size+mtime (rare) can
   // never serve stale entries; the (size, mtimeMs) key already invalidates
   // the common case, this closes the remaining window.
   globalThis.__ompSessionEntriesCache?.clear();
-  globalThis.__ompSessionHistoryIndexes?.clear();
+  for (const index of globalThis.__ompSessionHistoryIndexes?.values() ?? []) index.observedChange = true;
+  if (!options.observedChange) globalThis.__ompSessionHistoryIndexes?.clear();
+  if (options.observedChange) {
+    for (const flight of globalThis.__ompSessionHistoryInFlight?.values() ?? []) { flight.observedChange = true; flight.revision++; }
+  } else {
+    globalThis.__ompSessionHistoryInFlight?.clear();
+  }
+  for (const reads of globalThis.__ompSessionHistoryReads?.values() ?? []) {
+    for (const read of reads) {
+      if (options.observedChange) read.observedChange = true;
+      else read.invalidated = true;
+    }
+  }
   // Unknown-source changes (full-flush fallback) have no known path to target
   // with invalidateSessionEntriesCache: clear every per-file SCAN memo too, or
   // an unknown same-size + same-mtime rewrite would keep serving the OLD list
@@ -220,11 +246,26 @@ export function invalidateSessionCaches(filePath?: string): void {
  * unrelated sessions keep their parsed-entry cache — a single busy session no
  * longer forces every other open session to re-parse multi-MB transcripts.
  * The key is normalized with sessionPathKey so Windows case/spacing variants
- * still hit the same entry. */
-export function invalidateSessionEntriesCache(filePath: string): void {
-  globalThis.__ompSessionEntriesCache?.delete(sessionPathKey(filePath));
+ * still hit the same entry. Observed notifications keep only untrusted history
+ * metadata for hash-verified reuse; explicit mutations retire it and pending reads. */
+export function invalidateSessionEntriesCache(filePath: string, options: { observedChange?: boolean } = {}): void {
+  const pathKey = sessionPathKey(filePath);
+  for (const read of globalThis.__ompSessionHistoryReads?.get(pathKey) ?? []) {
+    if (options.observedChange) read.observedChange = true;
+    else read.invalidated = true;
+  }
+  globalThis.__ompSessionEntriesCache?.delete(pathKey);
   for (const [key, index] of globalThis.__ompSessionHistoryIndexes ?? []) {
-    if (index.pathKey === sessionPathKey(filePath)) globalThis.__ompSessionHistoryIndexes?.delete(key);
+    if (index.pathKey === pathKey) {
+      index.observedChange = true;
+      if (!options.observedChange) globalThis.__ompSessionHistoryIndexes?.delete(key);
+    }
+  }
+  for (const [key, flight] of globalThis.__ompSessionHistoryInFlight ?? []) {
+    if (flight.pathKey === pathKey) {
+      if (options.observedChange) { flight.observedChange = true; flight.revision++; }
+      else globalThis.__ompSessionHistoryInFlight?.delete(key);
+    }
   }
   invalidateSessionScanCache(filePath);
 }
@@ -560,40 +601,66 @@ interface HistoryEntryRange {
   id: string;
   offset: number;
   length: number;
+  sha256: string;
   firstKeptEntryId?: string;
   legacyCustom?: boolean;
+}
+
+interface HistoryMetadataRecord extends ProjectedSessionRecord {
+  bytes: number;
 }
 
 interface SessionHistoryIndex {
   pathKey: string;
   version: string;
+  snapshot: SessionFileSnapshot | null;
+  observedChange: boolean;
   bytes: number;
   rows: HistoryEntryRange[];
+  rowBytes: number[];
   entryIds: string[];
   positions: Map<string, number>;
   compactionId: string | null;
   metadata: Omit<SessionContext, "messages" | "entryIds">;
   leafId: string | null;
   tipId: string | null;
+  tree: SessionTreeNode[] | null;
+  /** Complete retained topology, not only the currently selected branch. */
+  records: HistoryMetadataRecord[];
+  projectionState: SessionFileProjectionState | null;
+  includesTree: boolean;
+}
+
+interface SessionHistoryFlight {
+  pathKey: string;
+  observedChange: boolean;
+  revision: number;
+  promise: Promise<SessionHistoryIndex>;
 }
 
 declare global {
   var __ompSessionHistoryIndexes: Map<string, SessionHistoryIndex> | undefined;
+  var __ompSessionHistoryInFlight: Map<string, SessionHistoryFlight> | undefined;
+  var __ompSessionHistoryReads: Map<string, Set<{ invalidated: boolean; observedChange: boolean }>> | undefined;
 }
 
 // Independent of the 256 MiB RAW parse cache: only offsets, IDs and selected
 // branch metadata live here, never transcript bodies or compaction summaries.
 // Charge UTF-16 strings plus per-row/map overhead; both LRU bounds apply.
 const MAX_HISTORY_INDEX_BYTES = 32 * 1024 * 1024;
+/** Raw transcript bytes retained for normal chat/history views; never a deletion limit. */
+export const MAX_CHAT_HISTORY_BYTES = 128 * 1024 * 1024;
 const MAX_HISTORY_INDEXES = 32;
+/** Bound the temporary graph too, before compaction/tree projection shrinks it. */
+const MAX_HISTORY_BUILD_BYTES = 256 * 1024 * 1024;
 
-function historyFileVersion(stat: Stats): string {
+function historyFileVersion(stat: Pick<Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs">): string {
   return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
 /** The shared loader still owns title slots, lenient parsing and migrations.
  * Discard bodies before retaining each entry; keep only selection inputs. */
-function historyEntryMetadata(entry: SessionEntry): SessionEntry {
+function historyEntryMetadata(entry: SessionEntry, includeTree: boolean): SessionEntry {
   const compact: Record<string, unknown> = {
     type: entry.type, id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp,
   };
@@ -601,6 +668,7 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
     const message = entry.message;
     compact.message = {
       role: message.role, provider: message.provider, model: message.model,
+      ...(includeTree ? { content: branchPreviewForEntry(entry)?.text } : {}),
       ...(message.role === "toolResult" && message.toolName === "todo" ? {
         toolName: message.toolName, isError: message.isError,
         details: isRecord(message.details) ? { phases: message.details.phases } : undefined,
@@ -618,72 +686,176 @@ function historyEntryMetadata(entry: SessionEntry): SessionEntry {
   } else if (entry.type === "custom" && entry.customType === "user_todo_edit") {
     compact.customType = entry.customType;
     compact.data = isRecord(entry.data) ? { phases: entry.data.phases } : undefined;
+  } else if (entry.type === "label") {
+    Object.assign(compact, { targetId: entry.targetId, label: entry.label });
   }
   return compact as unknown as SessionEntry;
 }
 
-function buildHistoryIndex(
-  filePath: string, version: string, leafId?: string, includePreCompaction?: boolean,
-): SessionHistoryIndex {
-  const ranges = new WeakMap<SessionEntry, { offset: number; length: number }>();
-  const loaded = loadSessionFile(filePath, {
-    projectEntry(entry, offset, length) {
-      const compact = historyEntryMetadata(entry);
-      ranges.set(compact, { offset, length });
+async function buildHistoryIndex(
+  filePath: string, version: string, leafId?: string, includePreCompaction?: boolean, includeTree = false, windowEnd?: number,
+  previous?: SessionHistoryIndex,
+): Promise<SessionHistoryIndex> {
+  // Keep a reusable graph rich enough for future overview/navigation requests
+  // when an ordinary append sync follows an already indexed tree.
+  const projectTree = includeTree || previous?.includesTree === true;
+  let ranges = new WeakMap<SessionEntry, HistoryMetadataRecord>();
+  let snapshot: SessionFileSnapshot | null = null;
+  let projectionState: SessionFileProjectionState | null = null;
+  let metadataBytes = 0;
+  const reuse = previous?.snapshot && previous.projectionState && (!includeTree || previous.includesTree)
+    ? { snapshot: previous.snapshot, ...previous.projectionState, records: previous.records } : undefined;
+  for (const record of reuse?.records ?? []) {
+    ranges.set(record.entry, record);
+    metadataBytes += record.bytes;
+  }
+  const loaded = await loadSessionFileAsync(filePath, {
+    historyWindowBytes: MAX_CHAT_HISTORY_BYTES,
+    ...(windowEnd !== undefined ? { historyWindowEnd: windowEnd } : {}),
+    reuseProjection: reuse,
+    onSnapshot(captured) { snapshot = captured; },
+    onProjectionState(captured) { projectionState = captured; },
+    onProjectionReset() {
+      ranges = new WeakMap();
+      metadataBytes = 0;
+    },
+    projectEntry(entry, offset, length, recordSha256) {
+      // Detach each newly parsed projection once. Reusing this compact object
+      // cannot pin a sliced JSON source string or rebuild old body metadata.
+      const serialized = JSON.stringify(historyEntryMetadata(entry, projectTree));
+      const bytes = serialized.length * 2 + 256 + (recordSha256?.length ?? 0) * 2;
+      metadataBytes += bytes;
+      if (metadataBytes > MAX_HISTORY_BUILD_BYTES) throw new RangeError("Session history metadata exceeds the scan budget");
+      const compact = JSON.parse(serialized) as SessionEntry;
+      ranges.set(compact, { entry: compact, offset, length, sha256: recordSha256!, bytes });
       return compact;
     },
   });
   if (loaded.error === "too_large") throw new SessionFileTooLargeError(filePath);
-  const { selected, compactionId, ...metadata } = selectSessionContext(loaded.entries, leafId, { includePreCompaction });
-  const rows = selected.map((entry): HistoryEntryRange => ({
-    id: entry.id,
-    ...ranges.get(entry)!,
-    ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
-    ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
-  }));
-  const tipId = loaded.entries.at(-1)?.id ?? null;
-  // Detach metadata strings from the parser's JSON source: an ID represented
-  // by a sliced V8 string must not pin a multi-megabyte message body.
-  const serialized = JSON.stringify({
-    rows, compactionId, metadata, tipId,
-    leafId: leafId && loaded.entries.some((entry) => entry.id === leafId) ? leafId : tipId,
+  const captured = snapshot as SessionFileSnapshot | null;
+  if (windowEnd !== undefined && captured && (captured.windowEnd ?? captured.size) !== windowEnd) {
+    throw new Error("Session changed before reading the history window");
+  }
+  const { selected, compactionId, ...contextMetadata } = selectSessionContext(loaded.entries, leafId, {
+    includePreCompaction, prefixOmitted: !!loaded.historyWindow,
   });
-  const detached = JSON.parse(serialized) as Pick<SessionHistoryIndex, "rows" | "compactionId" | "metadata" | "tipId" | "leafId">;
-  const entryIds = detached.rows.map((row) => row.id);
+  const metadata = {
+    ...contextMetadata,
+    ...(loaded.historyWindow ? { historyWindow: loaded.historyWindow } : {}),
+  };
+  const rows = selected.map((entry): HistoryEntryRange => {
+    const record = ranges.get(entry)!;
+    return {
+      id: entry.id, offset: record.offset, length: record.length, sha256: record.sha256,
+      ...(entry.type === "compaction" ? { firstKeptEntryId: entry.firstKeptEntryId } : {}),
+      ...(entry.type === "message" && entry.message.role === "custom" ? { legacyCustom: true } : {}),
+    };
+  });
+  const tipId = loaded.entries.at(-1)?.id ?? null;
+  const tree = projectTree ? projectTreeForResponse(buildSessionTree(loaded.entries)) : null;
+  const records = loaded.entries.map((entry) => ranges.get(entry)!);
+  const entryIds = rows.map((row) => row.id);
+  const rowBytes = rows.map((row) => row.length);
   const positions = new Map(entryIds.map((id, position) => [id, position]));
-  const bytes = 256 + serialized.length * 2 + rows.length * 192;
-  return { ...detached, pathKey: sessionPathKey(filePath), version, bytes, entryIds, positions };
+  // Charge both the reusable graph and view-specific rows/maps/response
+  // metadata. Window roll-out drops every old graph reference here.
+  const bytes = 256 + records.reduce((sum, record) => sum + record.bytes, 0)
+    + JSON.stringify({ rows, metadata, tree }).length * 2 + rows.length * 192;
+  return {
+    rows, rowBytes, compactionId, metadata, tipId, tree, records, projectionState, includesTree: projectTree,
+    leafId: leafId && loaded.entries.some((entry) => entry.id === leafId) ? leafId : tipId,
+    pathKey: sessionPathKey(filePath), version: captured ? historyFileVersion(captured) : version,
+    snapshot: captured, observedChange: false, bytes, entryIds, positions,
+  };
 }
 
-/** Rebuild on any file-version change: growth alone cannot prove that old
- * offsets survived a prefix rewrite. Both readers share the same bounded LRU. */
-function getSessionHistoryIndex(filePath: string, leafId?: string, includePreCompaction = false) {
+/** Cache one bounded display window per view/version; pagination can pin its
+ * finite end while ordinary subsequent sync discovers the latest tail. */
+async function getSessionHistoryIndex(filePath: string, leafId?: string, includePreCompaction = false, includeTree = false, windowEnd?: number) {
   const cache = globalThis.__ompSessionHistoryIndexes ??= new Map();
   const pathKey = sessionPathKey(filePath);
-  const key = JSON.stringify([pathKey, leafId ?? null, includePreCompaction]);
   let stat: Stats | undefined;
   try { stat = statSync(filePath); } catch { /* Missing/unreadable: retain the lenient empty result. */ }
-  if (stat && stat.size > MAX_SESSION_LOAD_BYTES) {
-    invalidateSessionEntriesCache(filePath);
-    throw new SessionFileTooLargeError(filePath);
-  }
   const version = stat ? historyFileVersion(stat) : "";
-  for (const [cachedKey, cached] of cache) {
-    if (cached.pathKey === pathKey && cached.version !== version) cache.delete(cachedKey);
+  if (windowEnd !== undefined && (!Number.isSafeInteger(windowEnd) || windowEnd < 0 || !stat || windowEnd > stat.size)) {
+    throw new Error("Session changed before reading the history window");
   }
-  let index = cache.get(key);
-  if (!index) {
-    index = buildHistoryIndex(filePath, version, leafId, includePreCompaction);
-    if (stat && historyFileVersion(statSync(filePath)) !== version) throw new Error("Session changed while indexing history");
-    // An unusually metadata-heavy file still opens, but cannot evict every
-    // peer or retain more than the entire index budget by itself.
-    if (stat && index.bytes <= MAX_HISTORY_INDEX_BYTES) cache.set(key, index);
-  } else {
+  const effectiveEnd = windowEnd ?? (stat && stat.size > MAX_CHAT_HISTORY_BYTES ? stat.size : undefined);
+  const key = JSON.stringify([pathKey, leafId ?? null, includePreCompaction, effectiveEnd ?? null]);
+  const cached = cache.get(key);
+  // Preserve cheap polling: an unchanged, unobserved version remains a stat
+  // hit. Growth and external notifications must prove the retained bytes.
+  if (cached && cached.version === version && !cached.observedChange && (!includeTree || cached.includesTree)) {
     cache.delete(key);
-    cache.set(key, index);
+    cache.set(key, cached);
+    return { index: cached, cache, key };
+  }
+  let previous = cached;
+  if (!previous || (includeTree && !previous.includesTree)) {
+    for (const candidate of cache.values()) {
+      if (candidate.pathKey === pathKey && (!includeTree || candidate.includesTree)
+        && (!previous || (candidate.snapshot?.windowEnd ?? candidate.snapshot?.size ?? 0)
+          > (previous.snapshot?.windowEnd ?? previous.snapshot?.size ?? 0))) previous = candidate;
+    }
+  }
+  const flights = globalThis.__ompSessionHistoryInFlight ??= new Map();
+  const flightKey = JSON.stringify([key, version, includeTree]);
+  const pending = flights.get(flightKey)
+    ?? (!includeTree ? flights.get(JSON.stringify([key, version, true])) : undefined);
+  let index: SessionHistoryIndex;
+  if (pending) {
+    index = await pending.promise;
+  } else {
+    const flight: SessionHistoryFlight = {
+      pathKey, observedChange: false, revision: 0,
+      promise: Promise.resolve().then(async () => {
+        let built: SessionHistoryIndex;
+        if (cached && cached.version === version && (!includeTree || cached.includesTree)) {
+          const revision = flight.revision;
+          const valid = !cached.snapshot || await matchesSessionFileSnapshot(filePath, cached.snapshot);
+          if (flights.get(flightKey) !== flight || flight.revision !== revision) {
+            throw new Error("Session changed while indexing history");
+          }
+          if (valid) built = cached.observedChange ? { ...cached, observedChange: false } : cached;
+          else {
+            if (cache.get(key) === cached) cache.delete(key);
+            built = await buildHistoryIndex(filePath, version, leafId, includePreCompaction, includeTree, effectiveEnd);
+          }
+        } else {
+          built = await buildHistoryIndex(filePath, version, leafId, includePreCompaction, includeTree, effectiveEnd, previous);
+        }
+        let currentVersion = "";
+        try { currentVersion = historyFileVersion(statSync(filePath)); } catch { /* Missing/unreadable. */ }
+        const complete = !built.snapshot || (built.snapshot.byteOffset ?? 0) + built.snapshot.byteLength === (built.snapshot.windowEnd ?? built.snapshot.size);
+        const revision = flight.revision;
+        const matches = complete && ((!flight.observedChange && currentVersion === built.version)
+          || (built.snapshot !== null && await matchesSessionFileSnapshot(filePath, built.snapshot)));
+        try { currentVersion = historyFileVersion(statSync(filePath)); } catch { currentVersion = ""; }
+        if (flights.get(flightKey) !== flight || flight.revision !== revision || !matches) {
+          throw new Error("Session changed while indexing history");
+        }
+        // Never publish a verified old prefix as the newer file's latest
+        // version. Explicit invalidation retires flights even during hashing.
+        if (stat && currentVersion === built.version && built.bytes <= MAX_HISTORY_INDEX_BYTES && (!cache.get(key)?.tree || built.tree)) {
+          for (const [oldKey, old] of cache) {
+            if (old.pathKey === pathKey && old.version !== built.version) cache.delete(oldKey);
+          }
+          cache.delete(key);
+          cache.set(key, built);
+        }
+        return built;
+      }).catch((error) => {
+        if (cached && cache.get(key) === cached) cache.delete(key);
+        throw error;
+      }).finally(() => {
+        if (flights.get(flightKey) === flight) flights.delete(flightKey);
+      }),
+    };
+    flights.set(flightKey, flight);
+    index = await flight.promise;
   }
   let totalBytes = 0;
-  for (const cached of cache.values()) totalBytes += cached.bytes;
+  for (const retained of cache.values()) totalBytes += retained.bytes;
   while (cache.size > MAX_HISTORY_INDEXES || totalBytes > MAX_HISTORY_INDEX_BYTES) {
     const oldest = cache.keys().next().value!;
     totalBytes -= cache.get(oldest)!.bytes;
@@ -694,71 +866,130 @@ function getSessionHistoryIndex(filePath: string, leafId?: string, includePreCom
 
 /** Current active context IDs only; no body seeks or blob hydration. The
  * returned IDs are cached and immutable, like getSessionEntries results. */
-export function getSessionContextBoundary(filePath: string): { entryIds: string[] } {
-  const { index } = getSessionHistoryIndex(filePath);
+export async function getSessionContextBoundary(filePath: string): Promise<{ entryIds: string[] }> {
+  const { index } = await getSessionHistoryIndex(filePath);
   return { entryIds: index.entryIds };
 }
 
-/** Seek only page bodies. A file changed during indexing/reading must not
- * advance the browser cursor using offsets from a different file version. */
-export function getSessionHistoryPage(
+/** Topology and short branch previews only, never retained transcript bodies. */
+export async function getSessionHistoryTree(filePath: string): Promise<SessionTreeNode[]> {
+  return (await getSessionHistoryIndex(filePath, undefined, false, true)).index.tree!;
+}
+
+/** Seek only page bodies. Appends may extend the next response, but every
+ * returned body and its context metadata must belong to this captured prefix. */
+export async function getSessionHistoryPage(
   filePath: string,
   cursor: SessionHistoryCursor | null,
   limit: number,
   leafId?: string,
-  options: { deferThinking?: boolean; deferToolResultImages?: boolean; includePreCompaction?: boolean } = {},
-): { history: SessionHistoryPage; leafId: string | null; tipId: string | null } {
-  const { index, cache, key } = getSessionHistoryIndex(filePath, leafId, !!options.includePreCompaction);
-  const version = index.version;
-
-  const { start, end, ...page } = selectHistoryRange(index.entryIds, cursor, limit, index.positions);
-  const rawEntries: SessionEntry[] = [];
-  if (start < end) {
-    const fd = openSync(filePath, "r");
-    try {
-      if (historyFileVersion(fstatSync(fd)) !== version) throw new Error("Session changed before reading history");
-      for (let i = start; i < end; i++) {
-        const row = index.rows[i];
-        const buffer = Buffer.allocUnsafe(row.length);
-        let read = 0;
-        while (read < buffer.length) {
-          const count = readSync(fd, buffer, read, buffer.length - read, row.offset + read);
-          if (count === 0) throw new Error("Session truncated while reading history");
-          read += count;
-        }
-        const entry = JSON.parse(buffer.toString("utf8").trim()) as SessionEntry;
-        // Reuse IDs/compaction links assigned by v1 migration; v2 renamed the
-        // hookMessage role. No migrated body is retained between requests.
-        entry.id = row.id;
-        if (entry.type === "compaction") entry.firstKeptEntryId = row.firstKeptEntryId!;
-        if (entry.type === "message" && row.legacyCustom) {
-          const message = entry.message as unknown as Record<string, unknown>;
-          if (message.role === "hookMessage") message.role = "custom";
-        }
-        rawEntries.push(entry);
-      }
-      if (historyFileVersion(fstatSync(fd)) !== version || historyFileVersion(statSync(filePath)) !== version) {
-        throw new Error("Session changed while reading history");
-      }
-    } catch (error) {
-      cache.delete(key);
-      throw error;
-    } finally {
-      closeSync(fd);
+  options: {
+    deferThinking?: boolean; deferToolResultImages?: boolean;
+    includePreCompaction?: boolean; includeTree?: boolean;
+    recent?: boolean; older?: boolean;
+  } = {},
+): Promise<{
+  history: SessionHistoryPage; leafId: string | null; tipId: string | null;
+  entryCount: number; tree?: SessionTreeNode[];
+}> {
+  const pathKey = sessionPathKey(filePath);
+  const active = globalThis.__ompSessionHistoryReads ??= new Map();
+  const reads = active.get(pathKey) ?? new Set<{ invalidated: boolean; observedChange: boolean }>();
+  const read = { invalidated: false, observedChange: false };
+  reads.add(read);
+  active.set(pathKey, reads);
+  try {
+    const { index, cache, key } = await getSessionHistoryIndex(
+      filePath, leafId, !!options.includePreCompaction, !!options.includeTree, cursor?.windowEndOffset,
+    );
+    const { start, end, ...page } = options.recent
+      ? selectRecentHistoryRange(index.entryIds, cursor, limit, index.positions, {
+        older: options.older, rowBytes: index.rowBytes,
+      })
+      : selectHistoryRange(index.entryIds, cursor, limit, index.positions);
+    const windowEnd = index.snapshot?.windowEnd ?? index.snapshot?.size;
+    if (page.hasMore && windowEnd !== undefined && (options.recent || index.metadata.historyWindow)) {
+      page.cursor = { ...page.cursor, windowEndOffset: windowEnd };
     }
+    const rawEntries: SessionEntry[] = [];
+    try {
+      if (read.invalidated) throw new Error("Session changed while reading history");
+      if (start < end) {
+        const fd = openSync(filePath, "r");
+        try {
+          const opened = fstatSync(fd);
+          const snapshot = index.snapshot;
+          if (historyFileVersion(opened) !== index.version && (!snapshot
+            || opened.dev !== snapshot.dev || opened.ino !== snapshot.ino
+            || opened.size <= snapshot.size || opened.size < snapshot.byteLength)) {
+            throw new Error("Session changed before reading history");
+          }
+          for (let i = start; i < end; i++) {
+            const row = index.rows[i];
+            const buffer = Buffer.allocUnsafe(row.length);
+            let bytesRead = 0;
+            while (bytesRead < buffer.length) {
+              const count = readSync(fd, buffer, bytesRead, buffer.length - bytesRead, row.offset + bytesRead);
+              if (count === 0) throw new Error("Session truncated while reading history");
+              bytesRead += count;
+            }
+            if (createHash("sha256").update(buffer).digest("hex") !== row.sha256) {
+              throw new Error("Session changed while reading history");
+            }
+            const entry = JSON.parse(buffer.toString("utf8").trim()) as SessionEntry;
+            // Reuse IDs/compaction links assigned by v1 migration; v2 renamed
+            // hookMessage. No migrated body is retained between requests.
+            entry.id = row.id;
+            if (entry.type === "compaction") entry.firstKeptEntryId = row.firstKeptEntryId!;
+            if (entry.type === "message" && row.legacyCustom) {
+              const message = entry.message as unknown as Record<string, unknown>;
+              if (message.role === "hookMessage") message.role = "custom";
+            }
+            rawEntries.push(entry);
+          }
+          const finished = fstatSync(fd);
+          if (snapshot && (finished.dev !== snapshot.dev || finished.ino !== snapshot.ino
+            || finished.size < snapshot.byteLength || finished.size < snapshot.size)) {
+            throw new Error("Session changed while reading history");
+          }
+        } finally {
+          closeSync(fd);
+        }
+      }
+      let currentVersion = "";
+      try { currentVersion = historyFileVersion(statSync(filePath)); } catch { /* Preserve lenient missing-file results. */ }
+      if (read.observedChange || index.observedChange || currentVersion !== index.version) {
+        if (!index.snapshot || !await matchesSessionFileSnapshot(filePath, index.snapshot)) {
+          throw new Error("Session changed while reading history");
+        }
+        // Even a verified old prefix cannot be reused as the latest index.
+        if (cache.get(key) === index) cache.delete(key);
+      }
+      if (read.invalidated) throw new Error("Session changed while reading history");
+    } catch (error) {
+      if (cache.get(key) === index) cache.delete(key);
+      throw error;
+    }
+    const entries = toDisplayEntries(rawEntries, { skipToolResultImages: options.deferToolResultImages });
+    const history: SessionHistoryPage = {
+      ...page,
+      context: {
+        ...index.metadata,
+        entryIds: index.entryIds.slice(start, end),
+        messages: entries.map((entry) => entry.type === "compaction"
+          ? compactionUiMessage(entry, entry.id === index.compactionId)
+          : entryToUiMessage(entry, options)!),
+      },
+    };
+    if (read.invalidated) throw new Error("Session changed while reading history");
+    return {
+      history, leafId: index.leafId, tipId: index.tipId, entryCount: index.entryIds.length,
+      ...(options.includeTree ? { tree: index.tree! } : {}),
+    };
+  } finally {
+    reads.delete(read);
+    if (reads.size === 0) active.delete(pathKey);
   }
-  const entries = toDisplayEntries(rawEntries, { skipToolResultImages: options.deferToolResultImages });
-  const history: SessionHistoryPage = {
-    ...page,
-    context: {
-      ...index.metadata,
-      entryIds: index.entryIds.slice(start, end),
-      messages: entries.map((entry) => entry.type === "compaction"
-        ? compactionUiMessage(entry, entry.id === index.compactionId)
-        : entryToUiMessage(entry, options)!),
-    },
-  };
-  return { history, leafId: index.leafId, tipId: index.tipId };
 }
 
 function parseTodoPhases(value: unknown): TodoPhase[] | null {
@@ -825,7 +1056,7 @@ const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided aft
 export function buildSessionContext(
   entries: SessionEntry[],
   leafId?: string | null,
-  options: { deferThinking?: boolean; deferToolResultImages?: boolean; includePreCompaction?: boolean } = {},
+  options: { deferThinking?: boolean; deferToolResultImages?: boolean; includePreCompaction?: boolean; prefixOmitted?: boolean } = {},
 ): SessionContext {
   const { selected, compactionId, ...metadata } = selectSessionContext(entries, leafId, options);
   return {
@@ -841,7 +1072,7 @@ export function buildSessionContext(
 function selectSessionContext(
   entries: SessionEntry[],
   leafId?: string | null,
-  options: { includePreCompaction?: boolean } = {},
+  options: { includePreCompaction?: boolean; prefixOmitted?: boolean } = {},
 ) {
   const empty = { selected: [] as SessionEntry[], compactionId: null as string | null, thinkingLevel: "off", model: null as SessionContext["model"], todoPhases: [] as TodoPhase[] };
   const byId = new Map<string, SessionEntry>();
@@ -899,7 +1130,11 @@ function selectSessionContext(
     const activeCompaction = compaction;
     appendEntry(activeCompaction);
     const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === activeCompaction.id);
-    let foundFirstKept = false;
+    // A kept range that starts in the omitted prefix also includes the
+    // surviving ancestors. Never reinterpret a missing legacy index as local.
+    let foundFirstKept = !!options.prefixOmitted && !!activeCompaction.firstKeptEntryId
+      && !byId.has(activeCompaction.firstKeptEntryId)
+      && !!path[0]?.parentId && !byId.has(path[0].parentId);
     for (let i = 0; i < compactionIdx; i++) {
       const entry = path[i];
       if (entry.id === activeCompaction.firstKeptEntryId) foundFirstKept = true;

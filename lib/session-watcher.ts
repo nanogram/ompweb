@@ -1,7 +1,6 @@
 import { watch, type FSWatcher } from "fs";
 import { join } from "path";
 import {
-  getAgentDir,
   invalidateSessionEntriesCache,
   invalidateSessionListCache,
   invalidateSessionListMeta,
@@ -9,6 +8,7 @@ import {
   resolveSessionIdByPath,
 } from "./session-reader";
 import { invalidateLocalSessionLists } from "./hosts/session-index";
+import { getSessionsDir } from "./omp/paths";
 
 // omp owns the writes to a session's JSONL. ompweb streams RPC events only for
 // the sessions it spawned itself, so a session started outside the web UI — by
@@ -40,7 +40,7 @@ function flush(): void {
   if (hadUnknown) {
     // filename was null — fs.watch coalesced the event or overflowed. We
     // don't know which file changed, so fall back to the full invalidation.
-    invalidateSessionListCache();
+    invalidateSessionListCache({ observedChange: true });
     invalidateLocalSessionLists();
     void rescanAndNotify();
     return;
@@ -52,7 +52,7 @@ function flush(): void {
   invalidateSessionListMeta();
   // The sidebar lists this machine's sessions through its daemon: its caches go stale the same way.
   for (const path of paths) {
-    invalidateSessionEntriesCache(path);
+    invalidateSessionEntriesCache(path, { observedChange: true });
     invalidateLocalSessionLists(path);
   }
 
@@ -100,7 +100,7 @@ function scheduleRetry(): void {
 
 function ensureWatcher(): void {
   if (watcher || retryTimer) return;
-  const sessionsDir = join(getAgentDir(), "sessions");
+  const sessionsDir = getSessionsDir();
   try {
     watcher = watch(sessionsDir, { recursive: true, persistent: false }, (_event, filename) => {
       if (!filename) {

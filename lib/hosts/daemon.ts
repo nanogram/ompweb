@@ -118,7 +118,7 @@ export function runHostDaemon(options: DaemonOptions): { stop(): Promise<void>; 
   watcher.on("error", error => log("host.json watch: " + reason(error)));
 
   function sessionsChanged(): void {
-    localHost.invalidateSessionLists(); invalidateWorkspaceRoots();
+    localHost.invalidateSessionLists(undefined, { observedChange: true }); invalidateWorkspaceRoots();
     if (!stopped) for (const link of links.values()) if (link.version >= 7) link.queue({ type: "sessions_changed" }, "sessions");
   }
   function channelsChanged(ch: string): void {
@@ -255,7 +255,12 @@ export function runHostDaemon(options: DaemonOptions): { stop(): Promise<void>; 
         return result;
       }
       case "sessionFileExists": return localHost.sessionFileExists(sessionsPath(args.path));
-      case "invalidateSessionLists": invalidateWorkspaceRoots(); localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path)); sessionsChanged(); return;
+      case "invalidateSessionLists":
+        if (args.observedChange !== undefined && typeof args.observedChange !== "boolean") throw new HostOpError(400, "invalid_request", "Invalid session refresh mode");
+        invalidateWorkspaceRoots();
+        localHost.invalidateSessionLists(args.path === undefined ? undefined : sessionsPath(args.path), { observedChange: args.observedChange === true });
+        sessionsChanged();
+        return;
       case "checkUpdates":
         if (args.force !== undefined && typeof args.force !== "boolean") throw new HostOpError(400, "invalid_request", "force must be a boolean");
         return checkHostUpdates(updateCompatibility(args.compatibility), args.force === true);
@@ -285,7 +290,7 @@ export function runHostDaemon(options: DaemonOptions): { stop(): Promise<void>; 
         const run = sessionOps[op] as (...params: unknown[]) => Promise<unknown>;
         const result = await run.apply(sessionOps, SESSION_OP_PARAMS[op].map(name => args[name]));
         if (op === "addProject" || op === "updateProject" || op === "hideProject") invalidateWorkspaceRoots();
-        if (["renameSessionFile", "deleteSession", "archiveSession", "restoreArchive"].includes(op) && !(isRecord(result) && result.ok === false)) sessionsChanged();
+        if (["renameSessionFile", "deleteSession", "archiveSession"].includes(op) && !(isRecord(result) && result.ok === false)) sessionsChanged();
         return result;
       }
     }

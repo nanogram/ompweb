@@ -6,7 +6,8 @@ const { cleanup, render, screen, waitFor } = await import("@testing-library/reac
 const { default: userEvent } = await import("@testing-library/user-event");
 
 const { ChatInput } = await import("./ChatInput.tsx");
-const { clearDraft, getDraft } = await import("@/lib/draft-store");
+const { clearDraft, getDraft, setDraft } = await import("@/lib/draft-store");
+const { CLIENT_ONLY_COMMAND_NAMES } = await import("./ChatInput-slash-commands.ts");
 
 beforeEach(() => {
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
@@ -63,4 +64,58 @@ test("/btw with an attachment is refused and keeps the draft and the attachment"
   assert.deepEqual(calls, []);
   assert.equal(screen.getByRole("textbox").value, "/btw what is this");
   assert.equal(getDraft("btw-draft")?.files.length, 1);
+});
+
+test("/btw while streaming without onFollowUp (bash running) routes to side question", async () => {
+  const user = userEvent.setup();
+  const { calls } = renderComposer({ isStreaming: true, onFollowUp: undefined, onSteer: undefined });
+  await user.type(screen.getByRole("textbox"), "/btw what is 2+2");
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.deepEqual(calls, [["onBuiltinCommand", "/btw what is 2+2"]]));
+  await waitFor(() => assert.equal(screen.getByRole("textbox").value, ""));
+});
+
+test("/btw stays available in slash menu while streaming while other builtins are omitted", async () => {
+  const user = userEvent.setup();
+  renderComposer({ isStreaming: true });
+  await user.type(screen.getByRole("textbox"), "/");
+  await waitFor(() => assert.ok(screen.getByRole("option", { name: /\/.*btw/i })));
+  for (const name of Object.keys(CLIENT_ONLY_COMMAND_NAMES)) {
+    if (name === "btw") continue;
+    assert.equal(screen.queryByRole("option", { name: new RegExp(`\\/.*${name}`, "i") }), null);
+  }
+});
+
+test("/btw while streaming without onFollowUp shows Ask button and clicking it dispatches to side question", async () => {
+  const user = userEvent.setup();
+  const { calls } = renderComposer({ isStreaming: true, onFollowUp: undefined, onSteer: undefined });
+  await user.type(screen.getByRole("textbox"), "/btw what is 2+2");
+  const askButton = screen.getByRole("button", { name: /ask/i });
+  assert.ok(askButton);
+  await user.click(askButton);
+  await waitFor(() => assert.deepEqual(calls, [["onBuiltinCommand", "/btw what is 2+2"]]));
+  await waitFor(() => assert.equal(screen.getByRole("textbox").value, ""));
+});
+
+for (const command of ["/btw inspect this", "/goal ship this"]) {
+  test(`streaming client command retains completed host uploads: ${command}`, async () => {
+    const upload = { id: "00000000-0000-4000-8000-000000000001", hostId: "remote-host", name: "data.bin", size: 4, proof: "completion-proof" };
+    setDraft("btw-draft", { value: command, images: [], files: [], uploads: [upload] });
+    const user = userEvent.setup();
+    const { calls } = renderComposer({ isStreaming: true, onFollowUp: undefined, onSteer: undefined });
+    await user.click(screen.getByRole("textbox"));
+    await user.keyboard("{Enter}");
+    assert.deepEqual(calls, [], "a command cannot silently discard its uploads");
+    assert.equal(screen.getByRole("textbox").value, command);
+    assert.deepEqual(getDraft("btw-draft")?.uploads, [upload]);
+  });
+}
+
+test("a goal can run during streaming without queue callbacks", async () => {
+  const user = userEvent.setup();
+  const { calls } = renderComposer({ isStreaming: true, onFollowUp: undefined, onSteer: undefined });
+  await user.type(screen.getByRole("textbox"), "/goal ship this");
+  await user.click(screen.getByRole("button", { name: /^send$/i }));
+  await waitFor(() => assert.deepEqual(calls, [["onBuiltinCommand", "/goal ship this"]]));
+  await waitFor(() => assert.equal(screen.getByRole("textbox").value, ""));
 });

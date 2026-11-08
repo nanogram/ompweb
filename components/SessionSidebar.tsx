@@ -2,6 +2,7 @@
 
 import { memo, useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useDeferredValue } from "react";
 import type { ExitedRpcSession, ManagedProject, ProjectLaunchConfig, SessionInfo } from "@/lib/types";
+import type { SessionActivity } from "@/lib/session-activity";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -9,7 +10,7 @@ import { ProjectLaunchConfigDialog } from "./ProjectLaunchConfigDialog";
 import { ProviderUsageBar } from "./ProviderUsageBar";
 import { Tooltip } from "./ui/primitives";
 import { toast } from "./ui/toast";
-import { clearLastOpenSession, setLastOpenSession, workspaceKeyOf } from "@/lib/workspace-memory";
+import { workspaceKeyOf, setLastViewedSession } from "@/lib/workspace-memory";
 import { LOCAL_HOST_ID, foldedHostProjectKey, groupProjectsByHost, groupSessionsByProject, hostProjectKey, nextPinOrder, orderProjects, projectActivityCounts, remoteHostId, type ProjectSortMode } from "@/lib/project-ordering";
 import { isLinkUp } from "@/lib/hosts/host";
 import { useHostRows } from "@/hooks/useHostRows";
@@ -51,7 +52,7 @@ import {
   hostsCameOnline,
 } from "./SessionSidebar-helpers";
 import { OmpWebTitle, SIDEBAR_BUTTON_TRANSITION, SidebarIconButton, SidebarPortalMenu } from "./SessionSidebar-chrome";
-import { HostGroup, ProjectRow } from "./SessionSidebar-rows";
+import { HostGroup, ProjectRow, SessionTreeItem } from "./SessionSidebar-rows";
 
 /** Deadline for one /api/sessions fetch. A wedged-but-listening server never
  * answers; without this the initial spinner would pend forever. */
@@ -76,6 +77,9 @@ interface Props {
   initialSessionId?: string | null;
   skipInitialProjectSelection?: boolean;
   onInitialRestoreDone?: () => void;
+  initialHostId?: string;
+  onInitialSessionMissing?: (id: string) => void;
+  onLoadErrorChange?: (error: string | null) => void;
   refreshKey?: number;
   onSessionDeleted?: (sessionId: string) => void;
   selectedCwd?: string | null;
@@ -137,7 +141,7 @@ function loadCollapsedHosts(): Set<string> {
   }
 }
 
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, initialHostId, onInitialSessionMissing, onLoadErrorChange, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, selectedHostId: selectedHostIdProp, onCwdChange, onWorkspaceOptionsChange, onWorktreeContextChange, addProjectOpen, addProjectHostId = LOCAL_HOST_ID, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, navigation, updateAvailable, settingsOpen = false, onClose, onSearchQueryChange, onOpenSearchMatch }: Props) {
 
 
   const { t } = useI18n();
@@ -196,6 +200,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [runningSessionPlaces, setRunningSessionPlaces] = useState<Record<string, LivePlace>>({});
   const [exitedSessions, setExitedSessions] = useState<Map<string, ExitedRpcSession>>(() => new Map());
+  const [sessionActivities, setSessionActivities] = useState<Map<string, SessionActivity>>(() => new Map());
+  const previousActivitiesRef = useRef<Map<string, SessionActivity>>(new Map());
   const knownRunningPlacesRef = useRef<Map<string, LivePlace>>(new Map());
   const { limit: recentRunsLimit } = useRecentRunsLimit();
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
@@ -250,6 +256,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // Once the SSE stream has delivered a frame it is the source of truth for
   // running state; late /api/sessions responses must not overwrite it.
   const sseAuthoritativeRef = useRef(false);
+  const activitySnapshotVersionRef = useRef(0);
   const sessionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const sessionsEtagRef = useRef<string | null>(null);
@@ -257,10 +264,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // Set once the first /api/sessions fetch settles (success OR failure) so the
   // initial-restore effect can stop waiting on a load that never yields rows.
   const initialLoadedRef = useRef(false);
+  const [sessionLoadVersion, setSessionLoadVersion] = useState(0);
   const loadSessions = useCallback(async (showLoading = false) => {
     sessionsAbortRef.current?.abort();
     const controller = new AbortController();
     sessionsAbortRef.current = controller;
+    const activitySnapshotVersion = activitySnapshotVersionRef.current;
     // A wedged-but-listening server (the long-idle failure mode) accepts the
     // TCP connection and never answers: without a deadline the fetch pends
     // forever and the sidebar shows its initial spinner indefinitely. Abort
@@ -272,11 +281,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       const headers: Record<string, string> = {};
       if (sessionsEtagRef.current) headers["If-None-Match"] = sessionsEtagRef.current;
       const res = await fetch("/api/sessions", { headers, signal: controller.signal });
-      if (res.status === 304) return;
+      if (sessionsAbortRef.current !== controller) return;
+      if (res.status === 304) { setError(null); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const etag = res.headers.get("ETag");
+      const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[]; runningSessions?: Array<LivePlace & { id: string }>; sessionActivities?: SessionActivity[] };
+      if (sessionsAbortRef.current !== controller) return;
       if (etag) sessionsEtagRef.current = etag;
-      const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[]; runningSessions?: Array<LivePlace & { id: string }> };
       setAllSessions(data.sessions);
       if (data.runningSessions) {
         for (const rs of data.runningSessions) {
@@ -285,7 +296,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       }
       // Treat the fetched running set as an initial fallback only. Once SSE is
       // live it owns this state, so a slow fetch can't revive a stale snapshot.
-      if (!sseAuthoritativeRef.current) {
+      if (!sseAuthoritativeRef.current && activitySnapshotVersion === activitySnapshotVersionRef.current) {
+        setSessionActivities(new Map((data.sessionActivities ?? []).map((activity) => [activity.id, activity])));
         setRunningSessionIds(new Set(data.runningSessionIds ?? []));
         if (data.runningSessions) {
           const nextPlaces: Record<string, LivePlace> = {};
@@ -309,14 +321,19 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         sessionRefreshTimerRef.current = setTimeout(() => setSessionRefreshDone(false), 2000);
       }
     } catch (e) {
-      if ((e as Error)?.name === "AbortError") return;
+      if (sessionsAbortRef.current !== controller || ((e as Error)?.name === "AbortError" && controller.signal.reason?.name !== "TimeoutError")) return;
       setError(t("sessionSidebar.loadFailed", { detail: e instanceof Error ? e.message : String(e) }));
     } finally {
       clearTimeout(timeout);
-      initialLoadedRef.current = true;
-      if (showLoading) setLoading(false);
+      if (sessionsAbortRef.current === controller) {
+        initialLoadedRef.current = true;
+        setLoading(false);
+        setSessionLoadVersion((version) => version + 1);
+      }
     }
   }, [t]);
+
+  useEffect(() => { onLoadErrorChange?.(error); }, [error, onLoadErrorChange]);
 
   const initialLoadDone = useRef(false);
   useEffect(() => {
@@ -392,6 +409,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     }, 300);
   }, [loadSessions]);
   useEffect(() => () => {
+    sessionsAbortRef.current?.abort();
+    sessionsAbortRef.current = null;
     if (sessionRefreshTimerRef.current) {
       clearTimeout(sessionRefreshTimerRef.current);
       sessionRefreshTimerRef.current = null;
@@ -421,11 +440,14 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
           runningSessionIds?: string[];
           runningSessions?: Array<LivePlace & { id: string }>;
           exitedSessions?: ExitedRpcSession[];
+          sessionActivities?: SessionActivity[];
           refreshSessionList?: boolean;
           sessionIds?: string[];
         };
         if (data.type === "running") {
           sseAuthoritativeRef.current = true;
+          activitySnapshotVersionRef.current += 1;
+          setSessionActivities(new Map((data.sessionActivities ?? []).map((activity) => [activity.id, activity])));
           setRunningSessionIds(new Set(data.runningSessionIds ?? []));
           setExitedSessions(new Map((data.exitedSessions ?? []).map((session) => [session.id, session])));
           if (data.runningSessions) {
@@ -478,7 +500,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   useEffect(() => {
     const previous = previousRunningSessionIdsRef.current;
     const allCompleted = [...previous].filter((id) => !runningSessionIds.has(id));
-    const completedInBackground = allCompleted.filter((id) => id !== selectedSessionId);
+    const completedInBackground = allCompleted.filter((id) => id !== selectedSessionId && (sessionActivities.get(id)?.status ?? allSessions.find((s) => s.id === id)?.activityStatus) === "completed");
     const newlyRunning = [...runningSessionIds].filter((id) => !previous.has(id));
 
     if (allCompleted.length > 0 || newlyRunning.length > 0) {
@@ -512,7 +534,20 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     }
 
     previousRunningSessionIdsRef.current = runningSessionIds;
-  }, [runningSessionIds, selectedSessionId, loadSessions, recentRunsLimit]);
+  }, [runningSessionIds, selectedSessionId, loadSessions, recentRunsLimit, sessionActivities, allSessions]);
+
+  useEffect(() => {
+    const previous = previousActivitiesRef.current;
+    setUnreadSessionIds((prev) => {
+      const next = new Set(prev);
+      for (const [id, activity] of sessionActivities) {
+        if (id === selectedSessionId || activity.status === "running") next.delete(id);
+        else if (activity.status === "completed" && previous.has(id) && previous.get(id)?.updatedAt !== activity.updatedAt) next.add(id);
+      }
+      return next;
+    });
+    previousActivitiesRef.current = sessionActivities;
+  }, [sessionActivities, selectedSessionId]);
 
   useEffect(() => {
     if (!selectedSessionId) return;
@@ -705,6 +740,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     const placeholders: SessionInfo[] = [];
     const visibleLiveIds = new Set(runningSessionIds);
     for (const id of exitedSessions.keys()) visibleLiveIds.add(id);
+    for (const id of sessionActivities.keys()) visibleLiveIds.add(id);
     for (const id of visibleLiveIds) {
       if (known.has(id)) continue;
       let ts = placeholderTsRef.current.get(id);
@@ -713,7 +749,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         placeholderTsRef.current.set(id, ts);
       }
       const isOptimistic = optimisticSession?.id === id;
-      const place = livePlace(id, optimisticSession, runningSessionPlaces, exitedSessions, knownRunningPlacesRef.current, { cwd: selectedCwd ?? "", hostId: selectedHostId });
+      const place = livePlace(id, optimisticSession, runningSessionPlaces, exitedSessions, knownRunningPlacesRef.current, sessionActivities.get(id) ?? { cwd: selectedCwd ?? "", hostId: selectedHostId });
       const hostId = remoteHostId(place.hostId);
       const resolvedRoot = isOptimistic
         ? (optimisticProjectRoot ?? optimisticSession.projectRoot ?? optimisticSession.cwd)
@@ -747,7 +783,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       }
     }
     return placeholders.length ? [...base, ...placeholders] : base;
-  }, [allSessions, optimisticSession, optimisticProjectRoot, runningSessionIds, runningSessionPlaces, exitedSessions, projectRootFor, selectedCwd, selectedHostId]);
+  }, [allSessions, optimisticSession, optimisticProjectRoot, runningSessionIds, runningSessionPlaces, exitedSessions, sessionActivities, projectRootFor, selectedCwd, selectedHostId]);
   const visibleProjects = useMemo(() => {
     let base = projects;
     const hasOpt = optimisticProjectRoot ? base.some((p) => foldedHostProjectKey(p.hostId, p.path) === foldedHostProjectKey(optimisticSession?.hostId, optimisticProjectRoot)) : false;
@@ -760,10 +796,11 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     const knownFolded = new Set(base.map((p) => foldedHostProjectKey(p.hostId, p.path)));
     const visibleLiveIds = new Set(runningSessionIds);
     for (const id of exitedSessions.keys()) visibleLiveIds.add(id);
+    for (const id of sessionActivities.keys()) visibleLiveIds.add(id);
     for (const id of visibleLiveIds) {
       if (allSessions.some((s) => s.id === id)) continue;
       const isOptimistic = optimisticSession?.id === id;
-      const place = livePlace(id, optimisticSession, runningSessionPlaces, exitedSessions, knownRunningPlacesRef.current, { cwd: selectedCwd ?? "", hostId: selectedHostId });
+      const place = livePlace(id, optimisticSession, runningSessionPlaces, exitedSessions, knownRunningPlacesRef.current, sessionActivities.get(id) ?? { cwd: selectedCwd ?? "", hostId: selectedHostId });
       const hostId = remoteHostId(place.hostId);
       const resolvedRoot = isOptimistic
         ? (optimisticProjectRoot ?? optimisticSession.projectRoot ?? optimisticSession.cwd)
@@ -776,7 +813,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       }
     }
     return base;
-  }, [optimisticProjectRoot, projects, runningSessionIds, runningSessionPlaces, exitedSessions, allSessions, optimisticSession, projectRootFor, selectedCwd, selectedHostId]);
+  }, [optimisticProjectRoot, projects, runningSessionIds, runningSessionPlaces, exitedSessions, sessionActivities, allSessions, optimisticSession, projectRootFor, selectedCwd, selectedHostId]);
 
   // ---- Derived project list ---------------------------------------------------
   const selectedProject = useMemo(() => projectRootFor(selectedCwd, selectedHostId), [projectRootFor, selectedCwd, selectedHostId]);
@@ -787,7 +824,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // frozen rows still show the fresh project data.
   const hasPendingNewSession = Boolean(
     optimisticSession
-    || [...runningSessionIds, ...exitedSessions.keys()].some((id) => !allSessions.some((session) => session.id === id)),
+    || [...runningSessionIds, ...exitedSessions.keys(), ...sessionActivities.keys()].some((id) => !allSessions.some((session) => session.id === id)),
   );
   // Only "Last updated" reads sessions; other modes must not re-sort on every session refresh.
   const orderingSessions = projectSortMode === "updated" ? visibleSessions : NO_SESSIONS;
@@ -821,13 +858,27 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   useEffect(() => {
     onWorkspaceOptionsChange?.(sortedProjects, selectedProject, selectedCwd, selectedHostId);
   }, [onWorkspaceOptionsChange, sortedProjects, selectedProject, selectedCwd, selectedHostId]);
+  // Cwd-less transcripts are browseable sessions, not launchable workspaces.
+  // Keep these virtual rows out of workspace selection, persistence and menus.
+  const sidebarProjects = useMemo(() => {
+    const list = [...sortedProjects];
+    const hosts = new Set<string>();
+    for (const session of visibleSessions) {
+      if (workspaceKeyOf(session)) continue;
+      const hostId = session.hostId ?? LOCAL_HOST_ID;
+      if (hosts.has(hostId)) continue;
+      hosts.add(hostId);
+      list.push({ path: "", hostId, alias: t("projects.unknownWorkspace") });
+    }
+    return list;
+  }, [sortedProjects, visibleSessions, t]);
   const sessionsByProject = useMemo(
-    () => groupSessionsByProject(sortedProjects, visibleSessions),
-    [sortedProjects, visibleSessions],
+    () => groupSessionsByProject(sidebarProjects, visibleSessions),
+    [sidebarProjects, visibleSessions],
   );
   const projectActivity = useMemo(
-    () => projectActivityCounts(visibleSessions, runningSessionIds, unreadSessionIds, exitedSessions.keys()),
-    [visibleSessions, runningSessionIds, unreadSessionIds, exitedSessions],
+    () => projectActivityCounts(visibleSessions, runningSessionIds, [...unreadSessionIds].filter((id) => id !== selectedSessionId), exitedSessions.keys(), sessionActivities),
+    [visibleSessions, runningSessionIds, unreadSessionIds, exitedSessions, sessionActivities, selectedSessionId],
   );
 
   // Client-side filtering (Workspaces header: search + "running only").
@@ -905,7 +956,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     const query = compileSearchQuery(trimmedSearchQuery);
     const serverScores = currentTranscriptSearch?.scores;
     const entries: { project: ManagedProject; hostId?: string; sessions: SessionInfo[]; scores?: Map<string, number>; rank: number }[] = [];
-    for (const project of sortedProjects) {
+    for (const project of sidebarProjects) {
       let list = sessionsByProject.get(hostProjectKey(project.hostId, project.path)) ?? [];
       if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id) || effectiveRecentCompletedSet.has(s.id));
       if (!query) {
@@ -931,7 +982,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     // Best match first; ties keep the workspace order (stable sort).
     if (query) entries.sort((a, b) => b.rank - a.rank);
     return entries;
-  }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
+  }, [sidebarProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -977,12 +1028,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
     // If restoring a session, set cwd to match that session
     if (initialSessionId && !restoredRef.current) {
-      // An empty list only blocks while the first load is still in flight —
-      // a settled-but-empty or failed load means the target will never appear
-      // (shared ?session= link, deleted session), so fall through to the
-      // retry/exhaustion path below instead of returning forever.
-      if (allSessions.length === 0 && !initialLoadedRef.current) return; // wait for sessions to load
-      const target = allSessions.find((s) => s.id === initialSessionId);
+      if (!initialLoadedRef.current || error) return;
+      const target = allSessions.find((s) => s.id === initialSessionId && (!initialHostId || hostOf(s) === initialHostId));
       if (target) {
         restoreRetryRef.current = 0;
         restoredRef.current = true;
@@ -1004,10 +1051,32 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         }, INITIAL_RESTORE_RETRY_MS);
         return;
       }
-      restoreRetryRef.current = 0;
-      restoredRef.current = true;
-      // Session not found — notify parent so it can show the placeholder
-      onInitialRestoreDone?.();
+      // An aggregate list can omit an offline host; confirm absence on its owner.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(new DOMException("Session lookup timed out", "TimeoutError")), SESSIONS_FETCH_TIMEOUT_MS);
+      const params = new URLSearchParams({ id: initialSessionId });
+      if (initialHostId) params.set("hostId", initialHostId);
+      void fetch(`/api/sessions?${params}`, { signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const data = await response.json() as { sessions: SessionInfo[] };
+          if (controller.signal.aborted) return;
+          const found = data.sessions.find((s) => s.id === initialSessionId && (!initialHostId || hostOf(s) === initialHostId));
+          if (found) {
+            setAllSessions((prev) => [...prev.filter((s) => s.id !== found.id), found]);
+            return;
+          }
+          restoredRef.current = true;
+          onInitialSessionMissing?.(initialSessionId);
+          onInitialRestoreDone?.();
+          setSessionLoadVersion((version) => version + 1);
+        })
+        .catch((failure: unknown) => {
+          if (controller.signal.aborted && controller.signal.reason?.name !== "TimeoutError") return;
+          setError(t("sessionSidebar.loadFailed", { detail: failure instanceof Error ? failure.message : String(failure) }));
+        })
+        .finally(() => clearTimeout(timeout));
+      return () => { clearTimeout(timeout); controller.abort(); };
     }
     // No restore target: activate the top project (most recently added) so New
     // Session and Explorer have a context. When projects have not loaded yet
@@ -1021,7 +1090,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     setSelectedHostId(LOCAL_HOST_ID);
     expandProject(top.path);
     provisionalSelectionRef.current = allSessions.length === 0;
-  }, [allSessions, selectedCwd, initialSessionId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone, sortedProjects, expandProject, loadSessions]);
+  }, [allSessions, sessionLoadVersion, error, selectedCwd, initialSessionId, initialHostId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone, onInitialSessionMissing, sortedProjects, expandProject, loadSessions, t]);
 
   // Default expansion: when the user has never stored an expansion choice,
   // expand only the active project.
@@ -1282,7 +1351,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       return;
     }
     provisionalSelectionRef.current = false;
-    if (s.cwd) setSelectedCwd(s.cwd);
+    setSelectedCwd(s.cwd || null);
     setSelectedHostId(hostOf(s));
     expandProject(workspaceKeyOf(s), hostOf(s));
     onSelectSession(s);
@@ -1379,15 +1448,16 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // Stable callbacks for the session list so memoized children don't re-render
   // on every parent state change.
   const handleSessionDeleted = useCallback((id: string) => {
-    const deleted = allSessions.find((session) => session.id === id);
-    if (deleted) clearLastOpenSession(hostProjectKey(deleted.hostId, workspaceKeyOf(deleted)));
     onSessionDeleted?.(id);
     loadSessions();
-  }, [allSessions, onSessionDeleted, loadSessions]);
+  }, [onSessionDeleted, loadSessions]);
 
   useEffect(() => {
     const selected = allSessions.find((session) => session.id === selectedSessionId);
-    if (selected) setLastOpenSession(hostProjectKey(selected.hostId, workspaceKeyOf(selected)), selected.id);
+    if (selected) {
+      const workspace = hostProjectKey(selected.hostId, workspaceKeyOf(selected));
+      setLastViewedSession({ sessionId: selected.id, hostId: selected.hostId, workspace });
+    }
   }, [allSessions, selectedSessionId]);
 
   return (
@@ -1711,12 +1781,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               <button className="load-retry-button" type="button" onClick={() => { loadSessions(false); void loadProjects(); }} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("sessionSidebar.refresh")}</button>
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length === 0 && (
+          {!loading && !projectsError && !error && sidebarProjects.length === 0 && (
             <div style={{ padding: "10px 4px", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
               {t("projects.noProjects")}
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length > 0 && visibleProjectEntries.length === 0 && (
+          {!loading && !projectsError && !error && sidebarProjects.length > 0 && visibleProjectEntries.length === 0 && (
             <div style={{ padding: "14px 4px", color: "var(--text-dim)", fontSize: 11.5, lineHeight: 1.5 }}>
               {t("sessionSidebar.noMatches")}
             </div>
@@ -1728,6 +1798,28 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             const rows = entries.map(({ project, sessions }) => {
               const projectKey = hostProjectKey(project.hostId, project.path);
               const tree = treesByProject.get(projectKey) ?? buildSessionTree(sessions);
+              if (!project.path) {
+                return <section key={projectKey} aria-label={t("projects.unknownWorkspace")}>
+                  <div style={{ padding: "10px 8px 4px", color: "var(--text-muted)", fontSize: 12 }}>{t("projects.unknownWorkspace")}</div>
+                  <div style={{ padding: "0 8px 6px", color: "var(--text-dim)", fontSize: 11 }}>{t("projects.unknownWorkspaceDescription")}</div>
+                  {tree.map((node) => <SessionTreeItem
+                    key={node.session.id}
+                    node={node}
+                    depth={0}
+                    selectedSessionId={selectedSessionId}
+                    runningSessionIds={runningSessionIds}
+                    unreadSessionIds={unreadSessionIds}
+                    exitedSessions={exitedSessions}
+                    sessionActivities={sessionActivities}
+                    relativeTimeNow={relativeTimeNow}
+                    onSelectSession={handleSelectSessionFromList}
+                    onRenamed={loadSessions}
+                    onSessionDeleted={handleSessionDeleted}
+                    searchQuery={trimmedSearchQuery || undefined}
+                    onOpenSearchMatch={onOpenSearchMatch ? handleOpenSearchMatch : undefined}
+                  />)}
+                </section>;
+              }
               // Sessions group under a project through the case-folded comparable
               // form (see groupSessionsByProject), so the active highlight must
               // use the same comparison: a session whose cwd/projectRoot spells
@@ -1747,7 +1839,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                   runningSessionIds={runningSessionIds}
                   unreadSessionIds={unreadSessionIds}
                   exitedSessions={exitedSessions}
-                  recentlyCompletedIds={effectiveRecentCompletedSet}
+                  sessionActivities={sessionActivities}
                   relativeTimeNow={relativeTimeNow}
                   onActivate={activateProject}
                   onToggleExpand={toggleProjectExpanded}

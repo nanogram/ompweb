@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { homedir } from "os";
 import { isAbsolute, resolve } from "path";
 import { comparableProjectPath } from "./comparable-path";
+import { isValidOmpProfile } from "./omp-profile";
 import { getAgentDir } from "./omp/paths";
 import type { ManagedProject, ProjectLaunchConfig } from "./types";
 
@@ -61,27 +62,45 @@ function canonicalProjectPath(value: string): string {
   }
 }
 
-/** Launch args the web UI manages itself; a workspace config must never carry
- *  them (bare or `--flag=value`), or a stored config could hijack the session
- *  boundary (`--cwd`/`--resume`) or the rpc-ui mode. */
-const RESERVED_LAUNCH_ARGS: Record<string, true> = { "--mode": true, "rpc-ui": true, "--cwd": true, "--resume": true };
-const RESERVED_LAUNCH_ARG_PREFIXES = ["--mode=", "--cwd=", "--resume="];
+/** Session-boundary and code-loader options belong to the daemon, not a
+ * workspace's additional arguments. Reject the entire configuration rather
+ * than stripping a flag and accidentally keeping its value as a prompt. */
+const RESERVED_LAUNCH_ARGS: Record<string, true> = {
+  "--mode": true, "rpc-ui": true, "--cwd": true, "--resume": true, "--profile": true,
+  "--extension": true, "--hook": true, "-e": true, "--plugin-dir": true, "--": true,
+};
+const RESERVED_LAUNCH_ARG_PREFIXES = Object.keys(RESERVED_LAUNCH_ARGS).filter((arg) => arg.startsWith("-")).map((arg) => `${arg}=`);
 export function isReservedLaunchArg(arg: string): boolean {
   return RESERVED_LAUNCH_ARGS[arg] === true || RESERVED_LAUNCH_ARG_PREFIXES.some((prefix) => arg.startsWith(prefix));
 }
 
-/** Parse the on-disk registry's launch config; invalid fields are safely ignored. */
-function parseLaunchConfig(item: Record<string, unknown>): ProjectLaunchConfig | undefined {
-  const raw = item.launchConfig;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const value = raw as Record<string, unknown>;
-  const profile = typeof value.profile === "string" && value.profile.trim() && !value.profile.trim().startsWith("-") ? value.profile.trim() : undefined;
-  const advisor = value.advisor === true ? true : undefined;
-  const extraArgs = Array.isArray(value.extraArgs)
-    ? value.extraArgs.filter((arg): arg is string => typeof arg === "string" && arg.length > 0 && arg.length <= 256 && !isReservedLaunchArg(arg)).slice(0, 32)
-    : undefined;
-  if (!profile && advisor === undefined && (!extraArgs || extraArgs.length === 0)) return undefined;
-  return { profile, advisor, extraArgs };
+/** Validate at the actual daemon boundary. Legacy --profile pairs migrate in
+ * memory only, atomically; conflicting or malformed selections fail closed. */
+export function resolveProjectLaunchConfig(config: ProjectLaunchConfig | undefined): ProjectLaunchConfig | undefined {
+  if (config === undefined) return undefined;
+  if (!config || typeof config !== "object" || Array.isArray(config)) throw new ProjectPathError("invalid_launch_config", "Launch config must be an object");
+  let profile = config.profile;
+  if (profile !== undefined && (typeof profile !== "string" || !profile || !isValidOmpProfile(profile))) {
+    throw new ProjectPathError("invalid_profile", "Invalid stored OMP profile; edit the workspace launch configuration");
+  }
+  if (config.advisor !== undefined && typeof config.advisor !== "boolean") throw new ProjectPathError("invalid_advisor", "Advisor must be a boolean");
+  if (config.extraArgs !== undefined && (!Array.isArray(config.extraArgs) || config.extraArgs.length > 32)) throw new ProjectPathError("invalid_extra_args", "Extra args must contain at most 32 arguments");
+  const extraArgs: string[] = [];
+  for (let i = 0; i < (config.extraArgs?.length ?? 0); i++) {
+    const arg = config.extraArgs![i];
+    if (typeof arg !== "string" || !arg || arg.length > 256 || arg.includes("\0")) throw new ProjectPathError("invalid_extra_args", "Invalid stored launch argument");
+    if (arg === "--profile" || arg.startsWith("--profile=")) {
+      const legacy = arg === "--profile" ? config.extraArgs![++i] : arg.slice("--profile=".length);
+      if (typeof legacy !== "string" || !legacy || !isValidOmpProfile(legacy) || (profile !== undefined && profile !== legacy)) {
+        throw new ProjectPathError("invalid_profile", "Invalid or conflicting stored OMP profile argument");
+      }
+      profile = legacy;
+      continue;
+    }
+    if (isReservedLaunchArg(arg)) throw new ProjectPathError("invalid_extra_args", `Reserved workspace launch argument: ${arg}`);
+    extraArgs.push(arg);
+  }
+  return { profile, advisor: config.advisor, extraArgs: config.extraArgs === undefined ? undefined : extraArgs };
 }
 
 /** Parse registry JSON; missing, corrupt, or foreign-shaped input yields an
@@ -104,7 +123,9 @@ export function parseProjectRegistry(raw: string): ProjectRegistryFile {
         alias: "alias" in item && typeof item.alias === "string" && item.alias.trim() ? item.alias.trim() : undefined,
         sortOrder: "sortOrder" in item && typeof item.sortOrder === "number" && Number.isFinite(item.sortOrder) ? item.sortOrder : undefined,
         pinOrder: "pinOrder" in item && typeof item.pinOrder === "number" && Number.isFinite(item.pinOrder) ? item.pinOrder : undefined,
-        launchConfig: parseLaunchConfig(item as Record<string, unknown>),
+        // Preserve invalid values so unrelated registry writes cannot change
+        // the selected settings. The daemon rejects them before spawning.
+        launchConfig: "launchConfig" in item ? item.launchConfig as ProjectLaunchConfig : undefined,
       });
     }
     return { version: 1, projects: entries };
@@ -154,10 +175,8 @@ export function upsertProject(
   const key = comparableProjectPath(canonical);
   const existing = registry.projects.find((p) => comparableProjectPath(p.path) === key);
   const projects = registry.projects.filter((p) => comparableProjectPath(p.path) !== key);
-  // An omitted launchConfig preserves the stored one: re-adding a workspace
-  // (e.g. un-hiding) without config must not wipe it. Explicit clear goes
-  // through PATCH with null.
-  projects.push({ path: canonical, addedAt: now, hidden: false, launchConfig: launchConfig ?? existing?.launchConfig });
+  // Re-adding restores presentation metadata as well as launch configuration.
+  projects.push({ ...existing, path: canonical, addedAt: now, hidden: false, launchConfig: launchConfig ?? existing?.launchConfig });
   return { version: 1, projects };
 }
 

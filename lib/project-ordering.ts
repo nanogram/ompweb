@@ -1,5 +1,6 @@
 import { comparableProjectPath } from "./comparable-path";
 import type { ManagedProject, SessionInfo } from "./types";
+import type { SessionActivity, SessionActivityStatus } from "./session-activity";
 import { workspaceKeyOf } from "./workspace-memory";
 
 // ============================================================================
@@ -119,6 +120,20 @@ export function nextPinOrder(projects: ManagedProject[]): number {
   return Math.max(-1, ...projects.map((p) => p.pinOrder ?? -1)) + 1;
 }
 
+/** Live outcomes outrank disk summaries, including explicit idle/interrupted states. */
+export function sessionRowStatus(
+  session: SessionInfo,
+  activity: SessionActivity | undefined,
+  running: boolean,
+  unread: boolean,
+): SessionActivityStatus | undefined {
+  const status = activity?.status ?? (running ? "running" : session.activityStatus);
+  if (status === "completed") return unread ? status : undefined;
+  return status === "idle" || status === "interrupted" ? undefined : status;
+}
+
+const OUTCOME_PRIORITY: Partial<Record<SessionActivityStatus, number>> = { error: 4, quota: 3, waiting_input: 2, completed: 1 };
+
 /** Running/unread/exit session counts per project, for the activity indicators
  *  on project rows. Keys are the case-folded comparable form of the projectRoot
  *  so casing-only differences (Windows/NTFS) still resolve — callers must
@@ -128,11 +143,12 @@ export function projectActivityCounts(
   runningIds: Iterable<string>,
   unreadIds: Iterable<string>,
   exitedIds: Iterable<string> = [],
-): Map<string, { running: number; unread: number; exited: number }> {
+  activities: ReadonlyMap<string, SessionActivity> = new Map(),
+): Map<string, { running: number; unread: number; exited: number; status?: SessionActivityStatus }> {
   const running = new Set(runningIds);
   const unread = new Set(unreadIds);
   const exited = new Set(exitedIds);
-  const result = new Map<string, { running: number; unread: number; exited: number }>();
+  const result = new Map<string, { running: number; unread: number; exited: number; status?: SessionActivityStatus }>();
   for (const session of sessions) {
     const key = workspaceKeyOf(session);
     if (!key) continue;
@@ -141,6 +157,10 @@ export function projectActivityCounts(
     if (running.has(session.id)) current.running += 1;
     if (unread.has(session.id)) current.unread += 1;
     if (exited.has(session.id)) current.exited += 1;
+    const status = sessionRowStatus(session, activities.get(session.id), running.has(session.id), unread.has(session.id));
+    const priority = status ? OUTCOME_PRIORITY[status] ?? 0 : 0;
+    const currentPriority = current.status ? OUTCOME_PRIORITY[current.status] ?? 0 : 0;
+    if (priority > currentPriority) current.status = status;
     result.set(folded, current);
   }
   return result;
@@ -167,12 +187,17 @@ export function groupSessionsByProject(
   }
   for (const session of sessions) {
     const key = workspaceKeyOf(session);
-    if (!key) continue;
     // workspaceKeyOf already prefers projectKey, so this IS the session's
     // key; bucketByKey covers every registered project under its case-folded
     // path, and an exact-case fallback here could only hit when the folded
     // lookup already did — otherwise it silently dropped the session.
-    const bucket = bucketByKey.get(foldedHostProjectKey(session.hostId, key));
+    const folded = foldedHostProjectKey(session.hostId, key);
+    let bucket = bucketByKey.get(folded);
+    if (!bucket && !key) {
+      bucket = [];
+      bucketByKey.set(folded, bucket);
+      grouped.set(hostProjectKey(session.hostId, ""), bucket);
+    }
     if (bucket) bucket.push(session);
   }
   return grouped;

@@ -1,5 +1,6 @@
 // Types mirrored from oh-my-pi coding-agent session-entries (v3 format).
 import type { RpcAskDialogAnswer, RpcAskDialogQuestion, TodoPhase } from "./pi-types";
+import type { SessionActivityStatus } from "./session-activity";
 
 // omp-web cannot import the Bun-only @oh-my-pi packages, so the on-disk
 // shapes are re-declared here. Legacy pi v1/v2 fields are kept optional.
@@ -447,6 +448,8 @@ export interface SessionInfo {
   lastMessageAt?: string;
   messageCount: number;
   firstMessage: string;
+  /** Bounded on-disk fallback; live session activity always takes precedence. */
+  activityStatus?: SessionActivityStatus;
   parentSessionId?: string; // set if this session was forked from another
   /** Main repo root shared by all worktrees of this cwd (cwd itself for non-git dirs).
    *  Always set by the server; optional because the client builds transient
@@ -473,10 +476,6 @@ export interface ArchivedSessionInfo {
   firstMessage: string;
   size: number;
   status?: "complete" | "interrupted" | "aborted" | "error" | "pending" | "unknown";
-  /** In-progress/interrupted restore evidence; its unique capture key is not an actionable restore target. */
-  restorePending?: true;
-  /** Host whose archive holds it ("local" for this machine). Set by the all-hosts list; a host's own list leaves it out. */
-  hostId?: string;
 }
 
 /** Workspace-level omp launch configuration; only affects omp children spawned for that workspace. */
@@ -509,9 +508,18 @@ export interface ManagedProject {
   hostId?: string;
 }
 
+/** Raw transcript interval retained for UI history; older bytes remain saved. */
+export interface SessionHistoryWindow {
+  maxBytes: number;
+  startOffset: number;
+  endOffset: number;
+}
+
 export interface SessionContext {
   messages: AgentMessage[];
   entryIds: string[]; // parallel to messages — the session entry id for each message
+  /** Present only when older transcript bytes are omitted from this view. */
+  historyWindow?: SessionHistoryWindow;
   thinkingLevel: string;
   model: { provider: string; modelId: string } | null;
   /** Latest persisted todo snapshot on the selected session branch. */

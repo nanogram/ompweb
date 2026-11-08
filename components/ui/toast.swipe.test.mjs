@@ -65,3 +65,14 @@ test("a touch drag that starts on a toast's action button leaves the toast in pl
   pointer(button, "pointerup", 340, 52, "touch");
   assert.equal(card.hasAttribute("data-ending-style"), false);
 });
+
+test("a swipe beginning on expandable description text still dismisses the toast", () => {
+  render(React.createElement(ToastProvider, null));
+  act(() => { toast.info("Inventory", "Long expandable description", { clamp: true }); });
+  const card = document.querySelector(".toast-card");
+  const description = card.querySelector("[aria-expanded]");
+  pointer(description, "pointerdown", 200, 50, "touch");
+  for (const dx of [20, 80, 140]) pointer(description, "pointermove", 200 + dx, 52, "touch");
+  pointer(description, "pointerup", 340, 52, "touch");
+  assert.equal(card.hasAttribute("data-ending-style"), true);
+});

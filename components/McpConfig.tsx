@@ -44,6 +44,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
   const [liveError, setLiveError] = useState<string | null>(null);
   const [path, setPath] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
   const [name, setName] = useState("");
   const [source, setSource] = useState(newServer);
   const [loading, setLoading] = useState(true);
@@ -89,7 +90,13 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
       setInventory(Array.isArray(data.inventory) ? data.inventory : null);
       setLiveError(data.liveError ?? null);
       setPath(data.path ?? null);
-      setSelected((current) => current && data.servers?.some((server) => server.name === current) ? current : null);
+      const current = selectedRef.current;
+      if (current && !data.servers?.some((server) => server.name === current)) {
+        selectedRef.current = null;
+        setSelected(null);
+        setName("");
+        setSource(newServer());
+      }
 
       // Live status can start or reuse an OMP child and wait for /mcp list.
       // Keep it off the initial paint path; the static inventory is already
@@ -130,6 +137,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
   };
 
   const choose = (server: McpServer) => {
+    selectedRef.current = server.name;
     setSelected(server.name);
     setName(server.name);
     setSource(JSON.stringify(server.config, null, 2));
@@ -137,6 +145,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
   };
 
   const add = () => {
+    selectedRef.current = null;
     setSelected(null);
     setName("");
     setSource(newServer());
@@ -179,6 +188,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
       const response = await fetch("/api/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, name, previousName: selected ?? undefined, server }) });
       const data = await response.json() as { error?: string };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+      selectedRef.current = name;
       setSelected(name);
       toast.success(t("mcpConfig.serverSaved", { name }));
       await load();

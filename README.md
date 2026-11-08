@@ -7,7 +7,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/kahme247/ompweb.svg?logo=github)](https://github.com/kahme247/ompweb/stargazers)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/kahme247/ompweb/pulls)
 
-[English](./README.md) | [简体中文](./README.zh-CN.md) | [日本語](./README.ja.md)
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [繁體中文](./README.zh-TW.md) | [日本語](./README.ja.md)
 
 Community: [Join the OMPWEB Discord](https://discord.gg/evqgGzRfM5)
 
@@ -69,6 +69,47 @@ available for a selected running session when notices are off. Inspection does
 not resume stopped sessions. Missing support or no running session is unavailable,
 not a clean result.
 
+## Conversation controls
+
+**Settings → Interface & Behavior** controls the conversation outline: a desktop
+minimap rail, floating button or hidden outline, plus a separate mobile floating
+button. Outline entries and search jumps use the same rendered transcript.
+
+**Classic** keeps the existing transcript presentation. Optional **Focused** mode
+folds completed progress before the final reply, while live, incomplete and
+failed output stays visible. Search reveals folded matches. **Expand Process
+details by default** applies in either mode.
+
+**Reopen last chat on startup** is off by default. Enable it to restore this
+browser's last-viewed chat in a new tab or on reload; explicit session/workspace
+links take priority. Unavailable hosts remain retryable instead of erasing the
+saved destination.
+
+Sidebar status marks reflect the outcome: red for errors or exhausted usage,
+a static amber question mark for input, and green only for a successful finish
+you have not viewed. Viewing the chat clears its green mark. Folder status marks
+use the highest descendant priority: error, question, then unread completion;
+ordinary idle or running descendants do not add a folder status mark.
+
+Chat history initially loads the newest 50 messages, with a soft 256 KiB page
+budget; **Load older messages** prepends earlier pages without losing your place.
+Normal browsing indexes only the latest 128 MiB of canonical JSONL. Older bytes
+remain saved, and OMP's agent context, exports and edits are not truncated.
+An optional browser cache can show recent messages while HTTP revalidates them;
+it never restores live controls or authorizes sending before revalidation.
+
+`/goal` uses OMP's native goal state, with pause, resume and drop controls shared
+across clients. Native slash commands require support from the installed OMP;
+an unsupported command reports an error rather than creating a browser-only goal.
+Queue progress follows OMP's own queue. Finished display records are bounded;
+pending messages are never discarded by the display limit.
+
+Native clients can discover capabilities at `/api/app-info`, request a heartbeat
+on their event stream, and search local user/assistant messages with
+`/api/sessions/messages/search?q=...&limit=...&cursor=...`. Search is bounded and
+cursor-paged, excluding linked hosts, reasoning, tool output, lines above 1 MiB
+and files above 64 MiB; inspect `partial`, `cursor` and `skippedFiles`.
+
 ## Notifications
 
 Turn on notifications in **Settings → Notifications**. Each browser keeps its own
@@ -94,6 +135,14 @@ session you are viewing. Clicking a notification opens its session.
 
 Completion notifications use omp's `prompt_result` and `session_settled` RPC
 frames (omp 18.3.1 or later).
+
+Where the browser supports notification actions, confirmations and small
+two-choice dialogs can be answered from the notification. Other questions open
+the chat. Answers target only the live pending request; answering twice cannot
+repeat the action. Connected clients dismiss notifications after settlement.
+Offline Apple push notifications cannot be silently retracted without risking
+push permission, so they can remain visible until opened or dismissed.
+
 
 ## Quick Start
 
@@ -685,7 +734,7 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 - **Notifications**: Desktop and mobile (PWA) notifications for finished tasks, questions waiting for an answer, failed runs, and automatic model switches, with Web Push when served over HTTPS. See [Notifications](#notifications).
 - **Web-based Settings** (11 tabs): Interface & Behavior, Safety & Approvals, AI Model Defaults, API Keys & Providers, Usage, Agent & Intelligence (advisor, memory, compaction), Agents, Extensions & Tools (MCP, skills, plugins), Hosts, Notifications, System.
 - **Slash Commands & Shortcuts**: Quick prompts (`/plan`, `/review`, `/fix`, `/test`, etc.), `⌘K` / `Ctrl+K` palette, and model/reasoning cycling.
-- **UI Themes & Localization**: Warm paper light/dark themes plus an omp.sh-inspired midnight (`omp`) theme, chat font size & interface scale, with full English, Chinese (简体中文), and Japanese (日本語) translations.
+- **UI Themes & Localization**: Warm paper light/dark themes plus an omp.sh-inspired midnight (`omp`) theme, chat font size & interface scale, with full English, Simplified Chinese (简体中文), Traditional Chinese (繁體中文), and Japanese (日本語) translations.
 
 ## Environment Variables
 

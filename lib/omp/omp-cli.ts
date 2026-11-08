@@ -19,13 +19,22 @@ let versionProbe: Promise<string | null> | null = null;
 const BIN_NAME = process.platform === "win32" ? "omp.exe" : "omp";
 // .cmd/.bat launchers (e.g. OMP_WEB_OMP_BIN pointing at a wrapper script) cannot
 // be spawned directly by Node — spawning them requires a shell. Route them
-// through `cmd.exe /c`; every other platform and binary passes through.
+// through cmd.exe with one escaped command line; Node's normal argv quoting
+// does not match cmd's /s /c rules for a launcher path containing spaces.
 const WINDOWS_SCRIPT_RE = /\.cmd$|\.bat$/i;
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
 
-/** Spawn target for `bin args`, routing Windows script launchers through cmd.exe. */
-export function wrapWindowsScript(bin: string, args: string[]): { file: string; args: string[] } {
+function escapeCmdArgument(value: string): string {
+  // Escape CRT quotes/trailing slashes before cmd consumes its own metacharacters.
+  const escaped = value.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"').replace(/(?=(\\+?)?)\1$/, "$1$1");
+  return `"${escaped}"`.replace(CMD_META, "^$1");
+}
+
+/** Spawn target and quoting options shared by every omp launcher. */
+export function wrapWindowsScript(bin: string, args: string[]): { file: string; args: string[]; windowsVerbatimArguments?: boolean } {
   if (process.platform === "win32" && WINDOWS_SCRIPT_RE.test(bin)) {
-    return { file: "cmd.exe", args: ["/c", bin, ...args] };
+    const command = [bin.replace(/\//g, "\\").replace(CMD_META, "^$1"), ...args.map(escapeCmdArgument)].join(" ");
+    return { file: "cmd.exe", args: ["/d", "/s", "/c", `"${command}"`], windowsVerbatimArguments: true };
   }
   return { file: bin, args };
 }
@@ -116,7 +125,7 @@ async function probeOmpVersion(): Promise<string | null> {
       const target = wrapWindowsScript(bin, ["--version"]);
       // Without an explicit env this probe would inherit the server's full
       // environment, including omp-web's own secrets, into the child.
-      execFile(target.file, target.args, { timeout: 10_000, windowsHide: true, env: createChildProcessEnvironment() }, (error, stdout) => {
+      execFile(target.file, target.args, { timeout: 10_000, windowsHide: true, windowsVerbatimArguments: target.windowsVerbatimArguments, env: createChildProcessEnvironment() }, (error, stdout) => {
         if (error) reject(error);
         else resolve(stdout);
       });

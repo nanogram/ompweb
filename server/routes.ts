@@ -4,6 +4,7 @@ import * as agentIdBashOutput from "@/app/api/agent/[id]/bash-output/route";
 import * as agentId from "@/app/api/agent/[id]/route";
 import * as agentNew from "@/app/api/agent/new/route";
 import * as agents from "@/app/api/agents/route";
+import * as appInfo from "@/app/api/app-info/route";
 import * as appUpdateNotes from "@/app/api/app-update/notes/route";
 import * as appUpdate from "@/app/api/app-update/route";
 import * as authAccountsProvider from "@/app/api/auth/accounts/[provider]/route";
@@ -33,6 +34,7 @@ import * as modelsConfigCatalog from "@/app/api/models-config/catalog/route";
 import * as modelsConfig from "@/app/api/models-config/route";
 import * as modelsConfigTest from "@/app/api/models-config/test/route";
 import * as models from "@/app/api/models/route";
+import * as notificationsAnswer from "@/app/api/notifications/answer/route";
 import * as notificationsDevices from "@/app/api/notifications/devices/route";
 import * as notificationsHistory from "@/app/api/notifications/history/route";
 import * as notificationsPresence from "@/app/api/notifications/presence/route";
@@ -59,6 +61,7 @@ import * as sessionsIdSubagents from "@/app/api/sessions/[id]/subagents/route";
 import * as sessionsArchive from "@/app/api/sessions/archive/route";
 import * as sessionsImport from "@/app/api/sessions/import/route";
 import * as sessions from "@/app/api/sessions/route";
+import * as sessionsMessagesSearch from "@/app/api/sessions/messages/search/route";
 import * as sessionsSearch from "@/app/api/sessions/search/route";
 import * as skillsCheck from "@/app/api/skills/check/route";
 import * as skillsInstall from "@/app/api/skills/install/route";
@@ -100,6 +103,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "agent/[id]": agentId,
   "agent/new": agentNew,
   "agents": agents,
+  "app-info": appInfo,
   "app-update/notes": appUpdateNotes,
   "app-update": appUpdate,
   "auth/accounts/[provider]": authAccountsProvider,
@@ -129,6 +133,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "models-config": modelsConfig,
   "models-config/test": modelsConfigTest,
   "models": models,
+  "notifications/answer": notificationsAnswer,
   "notifications/devices": notificationsDevices,
   "notifications/history": notificationsHistory,
   "notifications/presence": notificationsPresence,
@@ -155,6 +160,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "sessions/archive": sessionsArchive,
   "sessions/import": sessionsImport,
   "sessions": sessions,
+  "sessions/messages/search": sessionsMessagesSearch,
   "sessions/search": sessionsSearch,
   "skills/check": skillsCheck,
   "skills/install": skillsInstall,

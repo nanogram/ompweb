@@ -96,7 +96,7 @@ function formatMessageSize(chars: number): string {
   return chars >= 1_000_000 ? `${(chars / 1_000_000).toFixed(1)} MB` : `${Math.round(chars / 1_000)} KB`;
 }
 
-export function SafeMarkdownBody({ children, className, ...props }: ComponentProps<typeof MarkdownBody>) {
+export const SafeMarkdownBody = memo(function SafeMarkdownBody({ children, className, ...props }: ComponentProps<typeof MarkdownBody>) {
   const { t } = useI18n();
   const [showRaw, setShowRaw] = useState(false);
 
@@ -123,7 +123,7 @@ export function SafeMarkdownBody({ children, className, ...props }: ComponentPro
       </pre>
     </div>
   );
-}
+});
 
 function loadThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
   const key = `${sessionId}:${entryId}:${blockIndex}`;
@@ -199,18 +199,39 @@ function formatTime(ts: number | undefined, locale: Locale): string | null {
   return `${date} ${time}`;
 }
 
-function haveSameRelevantToolResults(
+export function haveSameRelevantToolResults(
   message: AgentMessage,
   previous: Map<string, ToolResultMessage> | undefined,
   next: Map<string, ToolResultMessage> | undefined,
 ): boolean {
   if (previous === next || message.role !== "assistant") return true;
-  for (const block of (message as AssistantMessage).content ?? []) {
-    if (block.type === "toolCall" && previous?.get(block.toolCallId) !== next?.get(block.toolCallId)) {
-      return false;
-    }
+  const content = (message as AssistantMessage).content;
+  if (!Array.isArray(content)) return true;
+  for (const block of content) {
+    if (block?.type === "toolCall" && previous?.get(block.toolCallId) !== next?.get(block.toolCallId)) return false;
   }
   return true;
+}
+
+/** Compare every prop, except the result map whose unrelated entries do not
+ * affect this message. New props automatically participate in memoization. */
+export function areMessageViewPropsEqual(previous: Props, next: Props): boolean {
+  for (const key in previous) {
+    if (key === "toolResults") continue;
+    if (key === "sourceBlockIndices") {
+      const a = previous.sourceBlockIndices;
+      const b = next.sourceBlockIndices;
+      if (a === b) continue;
+      if (!a || !b || a.length !== b.length) return false;
+      for (let index = 0; index < a.length; index++) if (a[index] !== b[index]) return false;
+      continue;
+    }
+    if (!Object.is(previous[key as keyof Props], next[key as keyof Props])) return false;
+  }
+  for (const key in next) {
+    if (!(key in previous) && key !== "toolResults" && next[key as keyof Props] !== undefined) return false;
+  }
+  return haveSameRelevantToolResults(previous.message, previous.toolResults, next.toolResults);
 }
 
 export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
@@ -241,31 +262,7 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} entryId={entryId} />;
   }
   return null;
-}, (prev, next) => {
-  return prev.message === next.message
-    && prev.isStreaming === next.isStreaming
-    && haveSameRelevantToolResults(prev.message, prev.toolResults, next.toolResults)
-    && prev.modelNames === next.modelNames
-    && prev.cwd === next.cwd
-    && prev.onOpenFile === next.onOpenFile
-    && prev.entryId === next.entryId
-    && prev.forkEntryId === next.forkEntryId
-    && prev.forkEditsPrompt === next.forkEditsPrompt
-    && prev.onFork === next.onFork
-    && prev.forking === next.forking
-    && prev.forkDisabled === next.forkDisabled
-    && prev.onEdit === next.onEdit
-    && prev.editing === next.editing
-    && prev.editDisabled === next.editDisabled
-    && prev.showTimestamp === next.showTimestamp
-    && prev.prevTimestamp === next.prevTimestamp
-    && prev.sessionId === next.sessionId
-    && prev.toolCallsDefaultCollapsed === next.toolCallsDefaultCollapsed
-    && prev.expandThinkingByDefault === next.expandThinkingByDefault
-    && prev.hideThinking === next.hideThinking
-    && prev.sourceBlockIndices?.join() === next.sourceBlockIndices?.join()
-    && (!prev.isStreaming || prev.liveTokensPerSecond === next.liveTokensPerSecond);
-});
+}, areMessageViewPropsEqual);
 
 // lib/types.ts ImageContent uses the Anthropic-style {source:{type,data,media_type,url}}
 // shape; pi-ai on-disk format uses flat {data, mimeType} — handle both.
@@ -675,7 +672,7 @@ function AssistantMessageView({
   const blocks = blockItems.map(({ block }) => block);
   // Activity rows stay compact; a row that also carries reply text keeps its model label.
   const hideHeader = blocks.some((block) => block.type === "thinking" || block.type === "toolCall") && !blocks.some(isReplyBlock);
-  const errorMessage = message.errorMessage?.trim() || null;
+  const errorMessage = message.errorMessage?.trim() || (message.stopReason === "aborted" ? t("messageView.interruptedByUser") : message.stopReason === "error" ? t("agentSession.responseFailed") : null);
   const isInterrupted = isInterruptedMessage(errorMessage, message.stopReason);
   const blockItemsRef = useRef(blockItems);
   blockItemsRef.current = blockItems;

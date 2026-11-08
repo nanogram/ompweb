@@ -1,11 +1,11 @@
 "use client";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
-import { ArrowDown, ChevronDown, ChevronUp, Layers, Paperclip, Square } from "lucide-react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { ArrowDown, ChevronDown, ChevronUp, CircleHelp, Layers, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
-import { collectToolResults, isGroupAnchor, planTranscriptRows, type ActivityPiece, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { collectToolResults, isGroupAnchor, planTranscriptRows, transcriptRowIndex, type ActivityPiece, type TranscriptPresentation, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { isReplyBlock } from "@/lib/message-display";
 import { resolveForkTargets } from "@/lib/chat-fork";
 import { HeldMessageView, MessageView } from "./MessageView";
@@ -13,6 +13,10 @@ import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ExtensionDialog } from "./ExtensionDialog";
 import { SubagentTranscriptDialog } from "./SubagentTranscriptDialog";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
+import { ChatOutlineFab } from "./ChatOutlineFab";
+import { AssistantOutputStep } from "./TranscriptOutput";
+import { useChatMinimapPreference } from "@/hooks/useChatMinimapPreference";
+import { useTranscriptPreference } from "@/hooks/useTranscriptPreference";
 import { ComposerPanels } from "./ComposerPanels";
 import { SkillDiagnosticsNotice } from "./SkillDiagnostics";
 import { BtwHistoryDialog, type BtwPanelProps } from "./BtwPanel";
@@ -79,7 +83,6 @@ interface Props {
   onSystemPromptChange?: (prompt: string | null) => void;
   onSystemPromptLoaderChange?: (loader: (() => Promise<void>) | null) => void;
   onSessionStatsChange?: (stats: SessionStatsInfo | null) => void;
-  onSessionStatsPanelOpen?: () => void;
   onProviderUsageContextChange?: (context: ProviderUsageContext | null) => void;
   onOpenFile?: (filePath: string, name: string, source: WorkspaceFileSource) => void;
   /** Handles the open_url host tool; returns the result text for the agent. */
@@ -216,9 +219,11 @@ export function OmpRuntimeVersion() {
   );
 }
 
-function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messageCount: number; toolCallCount: number; children: () => ReactNode }) {
+export function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = false, forceExpanded = false, children }: { messageCount: number; toolCallCount: number; defaultExpanded?: boolean; forceExpanded?: boolean; children: () => ReactNode }) {
   const { t, tn } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  const [userExpanded, setExpanded] = useState(defaultExpanded);
+  const expanded = forceExpanded || userExpanded;
+  const contentId = useId();
   const parts = [t("chatWindow.processDetails"), tn("chatWindow.messageCount", messageCount)];
   if (toolCallCount > 0) parts.push(tn("chatWindow.toolCallCount", toolCallCount));
 
@@ -227,6 +232,8 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messag
       <button
         type="button"
         aria-expanded={expanded}
+        aria-controls={contentId}
+        disabled={forceExpanded}
         onClick={() => setExpanded((v) => !v)}
         className="process-details-toggle"
         title={expanded ? t("chatWindow.collapseProcessDetails") : t("chatWindow.expandProcessDetails")}
@@ -251,11 +258,9 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messag
           {parts.join(" · ")}
         </span>
       </button>
-      {expanded && (
-        <div style={{ marginTop: 3 }}>
-          {children()}
-        </div>
-      )}
+      <div id={contentId} hidden={!expanded} style={{ marginTop: expanded ? 3 : 0 }}>
+        {expanded && children()}
+      </div>
     </div>
   );
 }
@@ -270,7 +275,7 @@ export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityP
     return renderMessage(piece.index, {
       attachRef: false,
       keyPrefix: `activity-${pieceIdx}`,
-      messageOverride: { ...withAssistantBlocks(msg, piece.blocks, { omitUsage: true }), errorMessage: undefined },
+      messageOverride: { ...withAssistantBlocks(msg, piece.blocks, { omitUsage: true }), errorMessage: undefined, stopReason: undefined },
       showTimestamp: false,
       sourceBlockIndices: piece.blocks.map((block) => msg.content.indexOf(block)),
     });
@@ -280,6 +285,11 @@ export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityP
 interface CommittedTranscriptProps {
   messages: AgentMessage[];
   entryIds: string[];
+  rows: TranscriptRow[];
+  presentation: TranscriptPresentation;
+  expandProcessDetails: boolean;
+  revealFolded: boolean;
+  selectedMessageIndex: number | null;
   conversationMeta: { toolResultsMap: Map<string, ToolResultMessage>; lastAnchorIdx: number; visibleRefIndexByMessage: Map<number, number> };
   messageRefs: React.RefObject<(HTMLDivElement | null)[]>;
   isStreaming: boolean;
@@ -302,8 +312,6 @@ interface CommittedTranscriptProps {
   toolCallsDefaultCollapsed: boolean;
   /** Fold a running turn's tool calls; off restores the flat live tail. */
   hideToolActivity: boolean;
-  neverFoldActivity: boolean;
-  showToolCallsUnfolded: boolean;
   expandThinkingByDefault: boolean;
   hideThinkingBlock: boolean;
   visibleCount: number;
@@ -314,6 +322,10 @@ interface CommittedTranscriptProps {
   nearBottom: boolean;
   sentinelRef: React.RefObject<HTMLButtonElement | null>;
   handleLoadMoreClick: () => void;
+  hasOlder: boolean;
+  loadingOlder: boolean;
+  olderHistoryError: boolean;
+  handleLoadOlder: () => void;
 }
 
 /**
@@ -322,10 +334,11 @@ interface CommittedTranscriptProps {
  * change `streamingMessage`, rendered separately) do not re-run the O(history)
  * grouping/splitting work at display-frame cadence.
  */
-const CommittedTranscript = memo(function CommittedTranscript({
-  messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
+export const CommittedTranscript = memo(function CommittedTranscript({
+  messages, rows, presentation, expandProcessDetails, revealFolded, selectedMessageIndex, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
-  toolCallsDefaultCollapsed, hideToolActivity, neverFoldActivity, showToolCallsUnfolded, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  toolCallsDefaultCollapsed, hideToolActivity, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  hasOlder, loadingOlder, olderHistoryError, handleLoadOlder,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
@@ -341,6 +354,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
     const isVisible = msg.role === "user" || msg.role === "assistant";
     const currentRefIdx = visibleRefIndexByMessage.get(idx);
     const keyPrefix = options.keyPrefix ?? "message";
+    const messageKey = entryIds[idx] ?? idx;
     let showTimestamp = false;
     if (msg.role === "assistant") {
       showTimestamp = true;
@@ -364,7 +378,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
     const historyMutationPending = forkingEntryId !== null || editingEntryId !== null;
     const view = (
       <MessageView
-        key={`${keyPrefix}-view-${idx}`}
+        key={`${keyPrefix}-view-${messageKey}`}
         message={msg}
         toolResults={toolResultsMap}
         modelNames={modelNames}
@@ -388,24 +402,14 @@ const CommittedTranscript = memo(function CommittedTranscript({
         sourceBlockIndices={options.sourceBlockIndices}
       />
     );
-    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
+    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx}>{view}</div>;
     return (
-      <div key={`${keyPrefix}-${idx}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
+      <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
         {view}
       </div>
     );
   };
 
-  // Rows are plain descriptors; element creation below only happens for the
-  // visible window. Invisible history never allocates React elements, so long
-  // sessions pay element cost proportional to the visible window instead of
-  // the whole transcript.
-  // Expanded-by-default thinking, and tool calls when asked, stay out of the
-  // fold: folding on commit would hide the block the preference just opened.
-  const rows = useMemo<TranscriptRow[]>(
-    () => planTranscriptRows(messages, { hideThinking: hideThinkingBlock, showThinking: expandThinkingByDefault, showToolCalls: showToolCallsUnfolded, neverFold: neverFoldActivity }),
-    [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity],
-  );
   const rendersFlat = (row: TranscriptRow): boolean => {
     if (row.kind !== "group") return false;
     // With "Hide tool activity while working" on (the default) the running turn
@@ -457,19 +461,23 @@ const CommittedTranscript = memo(function CommittedTranscript({
     rendered.push(renderMessage(userIdx));
     // A message split across segments keeps its navigation ref on the first one.
     const attached = new Set<number>();
+    const lastOutput = segments.findLastIndex((segment) => segment.kind === "text" && segment.blocks.some(isReplyBlock));
     segments.forEach((segment, segmentIdx) => {
       if (segment.kind === "text") {
         const msg = messages[segment.index] as AssistantMessage;
         const override = withAssistantBlocks(msg, segment.blocks, { omitUsage: !segment.last });
-        if (!segment.last) override.errorMessage = undefined;
-        rendered.push(renderMessage(segment.index, {
+        if (!segment.last) { override.errorMessage = undefined; override.stopReason = undefined; }
+        const message = renderMessage(segment.index, {
           attachRef: !attached.has(segment.index),
           keyPrefix: `text-${segmentIdx}`,
           messageOverride: override,
           ...(segment.last ? {} : { showTimestamp: false }),
           // Thinking can ride in a text segment; deferred text loads by source index.
           sourceBlockIndices: segment.blocks.map((block) => msg.content.indexOf(block)),
-        }));
+        });
+        rendered.push(presentation === "focused"
+          ? <AssistantOutputStep key={`output-${entryIds[userIdx] ?? userIdx}-${segmentIdx}`} final={row.finalReplyIndex === segment.index && segmentIdx === lastOutput} latest={row.finalReplyIndex === undefined && segmentIdx === lastOutput}>{message}</AssistantOutputStep>
+          : message);
         attached.add(segment.index);
         return;
       }
@@ -480,10 +488,10 @@ const CommittedTranscript = memo(function CommittedTranscript({
       for (const piece of segment.pieces) attached.add(piece.index);
       rendered.push(
         <div
-          key={`activity-${userIdx}-${segmentIdx}`}
+          key={`activity-${entryIds[userIdx] ?? userIdx}-${segmentIdx}`}
           ref={refIdx === undefined ? undefined : (el) => { messageRefs.current[refIdx] = el; }}
         >
-          <ProcessDetailsGroup messageCount={segment.stepCount} toolCallCount={segment.toolCallCount}>
+          <ProcessDetailsGroup key={`${expandProcessDetails}:${row.finalReplyIndex === undefined ? "activity" : entryIds[row.finalReplyIndex] ?? row.finalReplyIndex}`} messageCount={segment.stepCount} toolCallCount={segment.toolCallCount} defaultExpanded={expandProcessDetails} forceExpanded={revealFolded || segment.pieces.some((piece) => piece.index === selectedMessageIndex)}>
             {() => renderActivityPieces(messages, segment.pieces, renderMessage)}
           </ProcessDetailsGroup>
         </div>,
@@ -492,14 +500,18 @@ const CommittedTranscript = memo(function CommittedTranscript({
   }
   return (
     <>
-      {hasMore && (
+      {(hasMore || hasOlder) && (
         <button
           ref={sentinelRef}
           type="button"
-          onClick={handleLoadMoreClick}
+          data-remote-history={!hasMore || undefined}
+          onClick={hasMore ? handleLoadMoreClick : handleLoadOlder}
+          disabled={!hasMore && loadingOlder}
+          aria-busy={!hasMore && loadingOlder || undefined}
           className="py-3 w-full text-center text-xs text-text-muted hover:text-text transition-colors cursor-pointer"
         >
-          {t("chatWindow.scrollUpToLoad", { count: startIndex })}
+          {hasMore ? t("chatWindow.scrollUpToLoad", { count: startIndex })
+            : t(loadingOlder ? "chatWindow.loadingOlderMessages" : olderHistoryError ? "chatWindow.retryOlderMessages" : "chatWindow.loadOlderMessages")}
         </button>
       )}
       {rendered}
@@ -507,8 +519,10 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
   const { t, tn } = useI18n();
+  const { desktopMode, mobileFab } = useChatMinimapPreference();
+  const { presentation, expandProcessDetails } = useTranscriptPreference();
   const fileSource = useMemo<WorkspaceFileSource>(() => ({
     hostId: session?.hostId ?? newSessionHostId ?? "local",
     cwd: session?.cwd ?? newSessionCwd, sessionId: session?.id ?? null,
@@ -555,7 +569,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   }, [onAgentEnd]);
 
   const {
-    loading, error, messages, entryIds, showPreCompactionHistory, streamState,
+    loading, error, messages, entryIds, historyWindow, showPreCompactionHistory, streamState,
+    hasOlder, loadingOlder, loadOlder, olderHistoryError, historyCached,
     agentRunning, bashRunning, pendingBash, deferredBash, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, thinkingLevel, fastModeEnabled, fastModeActive, slowModeSupported, slowModeEnabled, slowModeScope, usageLimit,
     externalRunActive,
     toolPreset,
@@ -566,7 +581,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     notices, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     skillDiagnostics, setSkillStartupDiagnostics,
     isAutoModelSelection,
-    agentPhase, activeGoal, activePlan,
+    agentPhase, activePlan,
     liveToolResults,
     subagents, subagentEvents, subagentTranscriptVersions, activeSubagentCount, currentTodoPhase, todoPhases,
     isNew, hostStatus: frameHostStatus,
@@ -579,9 +594,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     handleThinkingLevelChange, handleFastModeChange, handleSlowModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, loadSlashCommands,
     handleToolPresetChange,
     btw, askBtw,
+    goalState, handleGoalAction, queueProgress, handleDismissQueueProgress,
   } = useAgentSession({
     session, newSessionCwd, newSessionHostId, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
-    modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
+    modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange,
     onOpenFile: onOpenWorkspaceFile, onOpenUrl,
   });
   useEffect(() => {
@@ -594,6 +610,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     if (speech) ttsRef.current.speak(speech.id, speech.text);
   }, [messages, entryIds, streamState, agentRunning]);
   const sessionBusy = agentRunning || bashRunning;
+  // Dialog requests block for an answer; they do not pause native run ownership.
+  const waitingForInput = extensionDialog !== null;
   const modelCapacity = useMemo(() => {
     if (!displayModelValue) return null;
     const model = modelList.find((entry) => entry.provider === displayModelValue.provider && entry.id === displayModelValue.modelId);
@@ -737,23 +755,70 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   // The empty new-session screen has its own scroller, so the conversation's
   // scroller mounts after the first send without a remount or a load.
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !sessionBusy;
-  // Widen the lazy render window until it includes the message's transcript row.
+  // One exact plan drives the renderer, search expansion, rail and outline.
+  const transcriptRows = useMemo(() => planTranscriptRows(messages, {
+    hideThinking: hideThinkingBlock,
+    showThinking: expandThinkingByDefault,
+    showToolCalls: showToolCallsUnfolded,
+    neverFold: neverFoldActivity,
+    presentation,
+    running: sessionBusy || externalRunActive || streamState.isStreaming,
+  }), [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity, presentation, sessionBusy, externalRunActive, streamState.isStreaming]);
+  const upwardIntentRef = useRef(0);
+  const holdNavigationScroll = useCallback(() => {
+    upwardIntentRef.current = 0;
+    holdScrollPosition();
+    setNearBottom(false);
+  }, [holdScrollPosition]);
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
+  const selectedMessageIndex = selectedEntryId === null ? null : entryIds.indexOf(selectedEntryId);
+  const [pendingOutlineJump, setPendingOutlineJump] = useState<{ entryId: string | null; messageIndex: number; smooth: boolean } | null>(null);
+  useEffect(() => {
+    setSelectedEntryId(null);
+    setPendingOutlineJump(null);
+  }, [sessionKeyForPaging]);
   const revealMessage = useCallback((messageIndex: number) => {
-    const rows = planTranscriptRows(messages, { hideThinking: hideThinkingBlock, showThinking: expandThinkingByDefault, showToolCalls: showToolCallsUnfolded, neverFold: neverFoldActivity });
-    const rowIndex = rows.findIndex((row) => (row.kind === "message" ? row.index === messageIndex : messageIndex >= row.userIndex && messageIndex < row.endIndex));
-    const needed = rows.length - Math.max(0, rowIndex);
+    const rowIndex = transcriptRowIndex(transcriptRows, messageIndex);
+    if (rowIndex < 0) return true;
+    const needed = transcriptRows.length - rowIndex;
     if (needed <= visibleCount) return true;
     setVisibleCount(needed);
     return false;
-  }, [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity, visibleCount]);
+  }, [transcriptRows, visibleCount]);
+  const ensureOutlineVisible = useCallback((messageIndex: number, smooth = true) => {
+    holdNavigationScroll();
+    setSelectedEntryId(entryIds[messageIndex] ?? null);
+    const alreadyVisible = revealMessage(messageIndex);
+    // A newly mounted lazy page must jump instantly, as search does, so its
+    // sentinel cannot prepend another page mid-animation.
+    setPendingOutlineJump({ entryId: entryIds[messageIndex] ?? null, messageIndex, smooth: smooth && alreadyVisible });
+  }, [holdNavigationScroll, revealMessage, entryIds]);
+  useEffect(() => {
+    if (!pendingOutlineJump || loading || isEmptyNew) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const messageIndex = pendingOutlineJump.entryId === null ? pendingOutlineJump.messageIndex : entryIds.indexOf(pendingOutlineJump.entryId);
+    if (messageIndex < 0) { setPendingOutlineJump(null); return; }
+    const frame = requestAnimationFrame(() => {
+      const target = container.querySelector<HTMLElement>(`[data-message-index="${messageIndex}"]`);
+      if (!target) return;
+      // Run after lazy-page viewport restoration, never race it.
+      holdNavigationScroll();
+      const top = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 16;
+      container.scrollTo({ top: Math.max(0, top), behavior: pendingOutlineJump.smooth ? "smooth" : "auto" });
+      setPendingOutlineJump(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [pendingOutlineJump, visibleCount, transcriptRows, entryIds, loading, isEmptyNew, scrollContainerRef, holdNavigationScroll]);
   useChatSearchHighlights({
     container: scrollContainerRef,
     query: searchQuery,
     target: searchTarget,
-    ready: !loading && !isEmptyNew,
+    ready: !loading && !isEmptyNew && !historyCached
+      && !(searchTarget && !entryIds.includes(searchTarget.entryId) && (hasOlder || loadingOlder)),
     entryIds,
     revealMessage,
-    holdScrollPosition,
+    holdScrollPosition: holdNavigationScroll,
     onTargetHandled: onSearchTargetHandled,
   });
   // The hosts channel is the source of truth; a frame only speaks before its first snapshot.
@@ -803,6 +868,32 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   // content; "click" (user pressed the banner) reveals the loaded messages at
   // the top of the viewport instead.
   const loadMoreModeRef = useRef<"auto" | "click">("auto");
+  const remoteScrollDistanceRef = useRef<number | null>(null);
+  const handleLoadOlder = useCallback(() => {
+    if (loadingOlder || historyCached) return;
+    upwardIntentRef.current = 0;
+    void loadOlder(() => {
+      const container = scrollContainerRef.current;
+      if (container) remoteScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+      setVisibleCount((count) => count + VISIBLE_PAGE_SIZE);
+      setNearBottom(false);
+    });
+  }, [loadingOlder, historyCached, loadOlder, scrollContainerRef]);
+  useLayoutEffect(() => {
+    if (remoteScrollDistanceRef.current === null) return;
+    const container = scrollContainerRef.current;
+    if (container) container.scrollTop = restoreScrollTop(container.scrollHeight, remoteScrollDistanceRef.current);
+    remoteScrollDistanceRef.current = null;
+  }, [entryIds, visibleCount, scrollContainerRef]);
+  // An explicit sidebar hit may live in an unloaded page. Only that request
+  // walks older pages; ordinary open and scrolling never drain history.
+  useEffect(() => {
+    if (!searchTarget || loading || historyCached || loadingOlder || olderHistoryError
+      || !hasOlder || entryIds.includes(searchTarget.entryId)) return;
+    holdScrollPosition();
+    setNearBottom(false);
+    handleLoadOlder();
+  }, [searchTarget, loading, historyCached, loadingOlder, olderHistoryError, hasOlder, entryIds, holdScrollPosition, handleLoadOlder]);
 
   // IntersectionObserver on the sentinel banner at the top of the message
   // list. When the user scrolls near the top, load the next page of older
@@ -810,7 +901,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   useEffect(() => {
     const sentinel = sentinelRef.current;
     const container = scrollContainerRef.current;
-    if (!sentinel || !container) return;
+    if (!sentinel || !container || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(
       (entries) => {
         // Only auto-load on a genuine upward scroll. On fresh open the
@@ -818,11 +909,14 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         // scrollTop = 0 — auto-loading then races the initial scroll-to-bottom
         // (the capture happens before the scroll, and the restore pins the
         // viewport to the top of the last page until every page is loaded).
-        if (entries[0]?.isIntersecting && container.scrollTop > 0) {
-          // Save distance from top before prepending to restore scroll later
-          prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
-          loadMoreModeRef.current = "auto";
-          setVisibleCount((prev) => getNextVisibleCount(prev));
+        if (!pendingOutlineJump && entries[0]?.isIntersecting && Date.now() < upwardIntentRef.current) {
+          upwardIntentRef.current = 0;
+          if (sentinel.dataset.remoteHistory) handleLoadOlder();
+          else {
+            prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+            loadMoreModeRef.current = "auto";
+            setVisibleCount((prev) => getNextVisibleCount(prev));
+          }
         }
       },
       // Expand the root upward so the page loads while the banner is still
@@ -832,11 +926,67 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [visibleCount, messages.length, scrollContainerRef]);
+  }, [visibleCount, messages.length, hasOlder, loadingOlder, handleLoadOlder, scrollContainerRef, pendingOutlineJump]);
+
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    let touchY: number | null = null;
+    let lastTop = container.scrollTop;
+    const loadAtTop = () => {
+      if (pendingOutlineJump || Date.now() >= upwardIntentRef.current || container.scrollTop > 400) return;
+      const sentinel = sentinelRef.current;
+      if (!sentinel || sentinel.disabled) return;
+      upwardIntentRef.current = 0;
+      if (sentinel.dataset.remoteHistory) handleLoadOlder();
+      else {
+        prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+        loadMoreModeRef.current = "auto";
+        setVisibleCount((count) => getNextVisibleCount(count));
+      }
+    };
+    const wheel = (event: WheelEvent) => {
+      if (event.deltaY >= 0) return;
+      upwardIntentRef.current = Date.now() + 1000;
+      loadAtTop();
+    };
+    const touchStart = (event: TouchEvent) => { touchY = event.touches[0]?.clientY ?? null; };
+    const touchMove = (event: TouchEvent) => {
+      const next = event.touches[0]?.clientY;
+      if (touchY !== null && next !== undefined && next > touchY) {
+        upwardIntentRef.current = Date.now() + 1000;
+        loadAtTop();
+      }
+      touchY = next ?? null;
+    };
+    const key = (event: KeyboardEvent) => {
+      if (!["ArrowUp", "PageUp", "Home"].includes(event.key)) return;
+      upwardIntentRef.current = Date.now() + 1000;
+      loadAtTop();
+    };
+    const scroll = () => {
+      const movingUp = container.scrollTop < lastTop;
+      lastTop = container.scrollTop;
+      if (movingUp) loadAtTop();
+    };
+    container.addEventListener("wheel", wheel, { passive: true });
+    container.addEventListener("touchstart", touchStart, { passive: true });
+    container.addEventListener("touchmove", touchMove, { passive: true });
+    container.addEventListener("keydown", key);
+    container.addEventListener("scroll", scroll, { passive: true });
+    return () => {
+      container.removeEventListener("wheel", wheel);
+      container.removeEventListener("touchstart", touchStart);
+      container.removeEventListener("touchmove", touchMove);
+      container.removeEventListener("keydown", key);
+      container.removeEventListener("scroll", scroll);
+    };
+  }, [loading, handleLoadOlder, scrollContainerRef, pendingOutlineJump]);
 
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
   useEffect(() => {
+    if (pendingOutlineJump) { prevScrollDistanceRef.current = null; return; }
     if (prevScrollDistanceRef.current == null) return;
     const container = scrollContainerRef.current;
     if (!container) return;
@@ -860,7 +1010,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     }
     loadMoreModeRef.current = "auto";
     prevScrollDistanceRef.current = null;
-  }, [visibleCount, scrollContainerRef]);
+  }, [visibleCount, scrollContainerRef, pendingOutlineJump]);
 
   const handleLoadMoreClick = useCallback(() => {
     const container = scrollContainerRef.current;
@@ -1087,6 +1237,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     requestAnimationFrame(() => composerRef.current?.focus());
   }, [composerRef]);
   const composerStatusText = useMemo(() => {
+    if (waitingForInput) return t("chatWindow.waitingForInput");
     if (bashRunning && !pendingBash) {
       return t("chatWindow.runningCommand");
     }
@@ -1105,7 +1256,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       ].filter(Boolean).join(" · ");
     }
     return null;
-  }, [bashRunning, pendingBash, isCompacting, agentRunning, streamState.streamingMessage, pendingToolHeaders.length, agentPhase, activeSubagentCount, currentTodoPhase, t, tn]);
+  }, [waitingForInput, bashRunning, pendingBash, isCompacting, agentRunning, streamState.streamingMessage, pendingToolHeaders.length, agentPhase, activeSubagentCount, currentTodoPhase, t, tn]);
 
   const askOpen = extensionDialog?.method === "ask";
   const hiddenComposerRef = useRef<HTMLDivElement>(null);
@@ -1124,6 +1275,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   const hasStatusHostRow = todoPhases.length > 0 || subagents.length > 0;
   const chatInputElement = (
     <ChatInput
+      queueProgress={queueProgress}
+      onDismissQueueProgress={handleDismissQueueProgress}
       draftIdentityMove={composerIdentityMove}
       ref={composerRef}
       sessionInfoContainer={sessionInfoContainer}
@@ -1135,7 +1288,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       onFollowUp={agentRunning ? handleFollowUp : undefined}
       outbox={!isNew}
       isStreaming={sessionBusy}
-      submissionBlocked={editingEntryId !== null}
+      submissionBlocked={historyCached || editingEntryId !== null}
       model={displayModelValue}
       isAutoModelSelection={isAutoModelSelection}
       modelNames={modelNames}
@@ -1164,7 +1317,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       thinkingLevelMap={currentThinkingLevelMap}
       modelNameOverride={liveModelMeta?.name ?? null}
       retryInfo={retryInfo}
-      activeGoal={activeGoal}
+      goalState={goalState}
+      onGoalAction={handleGoalAction}
       activePlan={activePlan}
       advisorEnabled={advisorEnabled}
       onAdvisorChange={handleAdvisorChange}
@@ -1192,6 +1346,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
          nothing to collapse. */
       onMinimize={isEmptyNew ? undefined : handleMinimize}
       statusText={hasStatusHostRow ? null : composerStatusText}
+      waitingForInput={waitingForInput}
       onOpenProviders={onOpenProviders}
     />
   );
@@ -1203,7 +1358,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     return <WorkspaceState kind="loading" title={t("chatWindow.loadingSession")} />;
   }
 
-  if (error && heldMessages.length === 0 && !(currentHostStatus && !isLinkUp(currentHostStatus))) {
+  if (error && !historyCached && heldMessages.length === 0 && !(currentHostStatus && !isLinkUp(currentHostStatus))) {
     return (
       <WorkspaceState
         kind="error"
@@ -1324,7 +1479,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             {hostBanner}
             <NoticeShelf notices={notices} onDismiss={dismissNotice} align="right" />
             <SkillDiagnosticsNotice snapshot={skillDiagnostics} onDisable={() => setSkillStartupDiagnostics(false)} />
-            <ComposerPanels todoPhases={[]} subagents={[]} onSelectSubagent={setSelectedSubagent} btw={btwPanel} />
+            <ComposerPanels todoPhases={[]} subagents={[]} onSelectSubagent={setSelectedSubagent} btw={btwPanel} waitingForInput={waitingForInput} />
             {/* ChatInput insets itself by CHAT_COLUMN_PADDING; cancel this column's
                 padding so the composer matches its in-session width. */}
             <div style={{ margin: `0 -${CHAT_COLUMN_PADDING}px` }}>{chatInputElement}</div>
@@ -1359,9 +1514,9 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         {/* Hide the Firefox scrollbar on desktop only: ChatMinimap provides the
             position indicator there, but on mobile there is no minimap and
             users need the scrollbar (Chrome's overlay scrollbar still shows). */}
-        <div ref={scrollContainerRef} data-selection-scope="chat" tabIndex={-1} role="log" aria-live={streamState.isStreaming ? "off" : "polite"} aria-busy={streamState.isStreaming || undefined} aria-relevant="additions text" aria-label={t("chatWindow.conversation")} className={`flex-1 overflow-y-auto pt-6` + (isMobile ? "" : " scrollbar-none [&::-webkit-scrollbar]:hidden")} style={{ minHeight: 0 }}>
+        <div ref={scrollContainerRef} data-selection-scope="chat" tabIndex={-1} role="log" aria-live={streamState.isStreaming ? "off" : "polite"} aria-busy={streamState.isStreaming || undefined} aria-relevant="additions text" aria-label={t("chatWindow.conversation")} className={`flex-1 overflow-y-auto pt-6` + (!isMobile && desktopMode === "rail" ? " scrollbar-none [&::-webkit-scrollbar]:hidden" : "")} style={{ minHeight: 0 }}>
           <div style={{ padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
-            <div style={{ maxWidth: isMobile ? CHAT_COLUMN_MAX_WIDTH : CHAT_COLUMN_MAX_WIDTH_DESKTOP, margin: "0 auto" }}>
+            <div style={{ maxWidth: !isMobile && desktopMode === "rail" ? CHAT_COLUMN_MAX_WIDTH_DESKTOP : CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
               <ExtensionStatusBar statuses={extensionStatuses} />
               <ExtensionWidgets widgets={aboveEditorWidgets} />
               {error && (
@@ -1373,6 +1528,21 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 </div>
               )}
 
+            {historyCached && (
+              <div role="status" className="mb-2 text-xs text-text-muted">
+                {t("chatWindow.cachedHistoryNotice")}{" "}
+                <button type="button" className="underline" onClick={retrySession}>{t("chatWindow.retry")}</button>
+              </div>
+            )}
+            {historyWindow && (
+              <div role="note" style={{
+                marginBottom: 8, padding: "7px 10px", border: "1px solid var(--border)",
+                borderRadius: "var(--radius-control)", background: "var(--bg-subtle)",
+                color: "var(--text-muted)", fontSize: 12,
+              }}>
+                {t("chatWindow.historyWindowNotice")}
+              </div>
+            )}
             {conversationMeta.hasCompaction && (
               <div
                 style={{
@@ -1382,12 +1552,14 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 }}
               >
                 <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
-                  {showPreCompactionHistory ? t("chatWindow.fullHistoryVisible") : t("chatWindow.compactedHistoryNotice")}
+                  {showPreCompactionHistory
+                    ? t(historyWindow ? "chatWindow.windowHistoryVisible" : "chatWindow.fullHistoryVisible")
+                    : t("chatWindow.compactedHistoryNotice")}
                 </span>
                 <button
                   type="button"
                   onClick={togglePreCompactionHistory}
-                  disabled={editingEntryId !== null}
+                  disabled={historyCached || editingEntryId !== null}
                   style={{
                     flexShrink: 0, padding: "4px 8px", borderRadius: 6, border: "1px solid var(--border)",
                     background: "var(--bg)", color: "var(--text)", cursor: "pointer", fontSize: 12,
@@ -1399,6 +1571,11 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             )}
             <CommittedTranscript
               messages={messages}
+              rows={transcriptRows}
+              presentation={presentation}
+              expandProcessDetails={expandProcessDetails}
+              revealFolded={searchQuery.trim().length > 0}
+              selectedMessageIndex={selectedMessageIndex}
               entryIds={entryIds}
               conversationMeta={conversationMetaWithLive}
               messageRefs={messageRefs}
@@ -1406,7 +1583,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               sessionBusy={sessionBusy}
               isCompacting={isCompacting}
               externalRunActive={externalRunActive}
-              isNew={isNew}
+              isNew={isNew || historyCached}
               forkingEntryId={forkingEntryId}
               editingEntryId={editingEntryId}
               handleFork={handleFork}
@@ -1417,18 +1594,22 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               sessionId={session?.id ?? sessionIdRef.current ?? undefined}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
               hideToolActivity={hideToolActivity}
-              neverFoldActivity={neverFoldActivity}
-              showToolCallsUnfolded={showToolCallsUnfolded}
               expandThinkingByDefault={expandThinkingByDefault}
               hideThinkingBlock={hideThinkingBlock}
               visibleCount={visibleCount}
               nearBottom={nearBottom}
               sentinelRef={sentinelRef}
               handleLoadMoreClick={handleLoadMoreClick}
+              hasOlder={hasOlder && !historyCached}
+              loadingOlder={loadingOlder}
+              olderHistoryError={olderHistoryError}
+              handleLoadOlder={handleLoadOlder}
             />
             {/* Also while held: a finished reply stays until its saved row
                 replaces it in the same render (useAgentSession-stream). */}
             {streamState.streamingMessage && (
+              <Fragment>
+              {presentation === "focused" && <div style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 650, margin: "4px 0" }}>{t("chatWindow.latestOutput")}</div>}
               <MessageView
                 key={streamState.streamingMessage.timestamp ?? "stream"}
                 message={streamState.streamingMessage as AgentMessage}
@@ -1441,6 +1622,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 hideThinking={hideThinkingBlock}
                 liveTokensPerSecond={streamState.isStreaming ? tokensPerSecond : undefined}
               />
+              </Fragment>
             )}
 
             {toolCallsDefaultCollapsed && pendingToolHeaders.map((tool) => (
@@ -1504,15 +1686,17 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             <ArrowDown size={15} strokeWidth={1.8} aria-hidden="true" />
           </button>
         )}
-        {isMobile ? null : (
+        {!isMobile && desktopMode === "rail" && (
           <div style={{ position: "absolute", top: 0, bottom: 0, right: 0, zIndex: 30, display: "flex", alignItems: "center", pointerEvents: "none" }}>
             <ChatMinimap
               messages={messages}
               scrollContainer={scrollContainerRef}
               messageRefs={messageRefs}
+              onEnsureVisible={ensureOutlineVisible}
             />
           </div>
         )}
+        {(isMobile ? mobileFab : desktopMode === "fab") && <ChatOutlineFab messages={messages} scrollContainer={scrollContainerRef} messageRefs={messageRefs} nearBottom={nearBottom} isMobile={isMobile} onEnsureVisible={ensureOutlineVisible} />}
       </div>
 
       {/* Minimized pill bar - shown when composer is collapsed */}
@@ -1522,6 +1706,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
           isStreaming={sessionBusy}
           isCompacting={isCompacting}
           statusText={composerStatusText}
+          waitingForInput={waitingForInput}
           expandRef={minimizedExpandRef}
           onExpand={handleExpand}
           onAbort={handleAbort}
@@ -1584,6 +1769,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               onSelectSubagent={setSelectedSubagent}
               btw={btwPanel}
               liveStatus={composerStatusText}
+              waitingForInput={waitingForInput}
             />
             <ExtensionWidgets widgets={belowEditorWidgets} />
           </div>
@@ -1935,11 +2121,12 @@ function ExtensionCustomPanel({
 }
 
 /** Slim pill bar replacing the full composer when minimized. */
-const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, expandRef, onExpand, onAbort, onAbortCompaction }: {
+const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, waitingForInput = false, expandRef, onExpand, onAbort, onAbortCompaction }: {
   draftKey?: string;
   isStreaming: boolean;
   isCompacting?: boolean;
   statusText?: string | null;
+  waitingForInput?: boolean;
   expandRef?: Ref<HTMLButtonElement>;
   onExpand: () => void;
   onAbort: () => void;
@@ -1993,7 +2180,7 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
               <Paperclip size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
             )}
             {statusText ? (
-              <span style={{
+              <span title={waitingForInput ? statusText : undefined} style={{
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 7,
@@ -2002,8 +2189,12 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
                 fontSize: 13,
                 color: "var(--text-muted)",
               }}>
-                <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {waitingForInput ? (
+                  <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden="true" />
+                ) : (
+                  <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
+                )}
+                <span className={waitingForInput ? "sr-only" : undefined} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {statusText}
                 </span>
               </span>

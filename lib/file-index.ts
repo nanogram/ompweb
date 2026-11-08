@@ -76,10 +76,14 @@ async function listWithGit(cwd: string): Promise<FileListing | null> {
     // opens them, so subtract what git reports as deleted. That query is
     // auxiliary: a stale-but-complete listing beats throwing away the git
     // listing over it, which would fall back to the depth-capped readdir walk.
+    // Drain both subprocesses before falling back: Promise.all would otherwise
+    // reject as soon as one fails, while the other git -C still holds cwd open
+    // on Windows, even after the directory walk has returned.
     const [listed, deleted] = await Promise.all([
-      execFileAsync("git", ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], gitOptions),
+      execFileAsync("git", ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z"], gitOptions).catch(() => null),
       execFileAsync("git", ["-C", cwd, "ls-files", "--deleted", "-z"], gitOptions).catch(() => null),
     ]);
+    if (!listed) return null;
     const missing = new Set((deleted?.stdout ?? "").split("\0").filter(Boolean));
     const all = listed.stdout.split("\0").filter((file) => file && !missing.has(file));
     if (all.length > GIT_HARD_CAP) {

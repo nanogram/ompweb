@@ -73,7 +73,7 @@ function startGateway(state: AuthGatewayState): Gateway {
   delete env.OMP_PROFILE;
   delete env.PI_PROFILE;
   const target = wrapWindowsScript(bin, ["auth-gateway", "stdio"]);
-  const child = spawn(target.file, target.args, { cwd: homedir(), env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  const child = spawn(target.file, target.args, { cwd: homedir(), env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, windowsVerbatimArguments: target.windowsVerbatimArguments });
   child.stdin.on("error", () => {});
   child.stdout.on("error", () => {});
 

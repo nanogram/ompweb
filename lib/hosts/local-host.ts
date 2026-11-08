@@ -6,7 +6,7 @@ import { comparableProjectPath } from "../comparable-path";
 import { getAgentEnvOverrides } from "../omp/agent-env";
 import { spawnOmpTransport } from "../omp/rpc-process";
 import { readNativeSettings } from "../omp/settings-config";
-import { isReservedLaunchArg, loadProjectRegistry } from "../project-registry";
+import { loadProjectRegistry, resolveProjectLaunchConfig } from "../project-registry";
 import { invalidateSessionEntriesCache, invalidateSessionListCache, invalidateSessionListMeta } from "../session-reader";
 import { PRESET_FULL } from "../tool-presets";
 import type { ProjectLaunchConfig } from "../types";
@@ -41,6 +41,7 @@ const FULL_PRESET_KEY = [...PRESET_FULL].map((n) => n.toLowerCase()).sort().join
 
 /** Extra CLI args for spawning `omp --mode rpc-ui` for a session. */
 export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false, launchConfig?: ProjectLaunchConfig, modelOverride?: string): string[] {
+  launchConfig = resolveProjectLaunchConfig(launchConfig);
   const args: string[] = [];
   if (sessionFile) {
     // An absolute path (or anything containing "/") resolves deterministically:
@@ -69,11 +70,8 @@ export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[],
   }
   if (advisor) args.push("--advisor");
   else if (launchConfig?.advisor) args.push("--advisor");
-  // Defense in depth: the registry is hand-editable, so re-strip reserved
-  // args and dash-leading profiles at the spawn boundary even though the
-  // API validates them on write.
-  if (launchConfig?.profile && !launchConfig.profile.startsWith("-")) args.push("--profile", launchConfig.profile);
-  if (launchConfig?.extraArgs) args.push(...launchConfig.extraArgs.filter((arg) => !isReservedLaunchArg(arg)));
+  if (launchConfig?.profile) args.push("--profile", launchConfig.profile);
+  if (launchConfig?.extraArgs) args.push(...launchConfig.extraArgs);
   return args;
 }
 
@@ -120,7 +118,8 @@ export function launchConfigForCwd(cwd: string): ProjectLaunchConfig | undefined
   try { canonical = realpathSync(cwd); } catch {}
   const key = comparableProjectPath(canonical);
   return loadProjectRegistry().projects.find((project) => {
-    if (project.hidden) return false;
+    // Hiding is presentation-only; a direct session link must still use its
+    // configured profile (or surface its validation error), not the default.
     const projectKey = comparableProjectPath(project.path);
     return projectKey === key || key.startsWith(`${projectKey}-worktrees/`);
   })?.launchConfig;
@@ -136,7 +135,11 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
   async spawnRpc(request) {
     // Callers already resolved request.cwd on this machine (resolveSpawnCwdResult).
     const { cwd } = request;
-    const launchConfig = launchConfigForCwd(cwd);
+    // A missing/deleted session cwd may resolve to the daemon's own directory.
+    // Never select that unrelated workspace's profile just because it is the
+    // fallback launch directory.
+    const configCwd = request.sessionFile ? request.recordedCwd : cwd;
+    const launchConfig = configCwd ? launchConfigForCwd(configCwd) : undefined;
     const transport = spawnOmpTransport({
       cwd,
       // Re-read per spawn so a respawn picks up environment values the user
@@ -154,14 +157,13 @@ export const localHost: Omit<Host, "workspaceOps" | "supportsWorkspaceOp"> = {
   async sessionFileExists(path) {
     return existsSync(path);
   },
-  /** Invalidate session-list metadata plus ONLY this session's parse caches
-   * when the file path is known, else fall back to the full invalidation. */
-  invalidateSessionLists(sessionFile) {
+  /** Observations verify retained history; confirmed mutations retire reads. */
+  invalidateSessionLists(sessionFile, options = {}) {
     if (sessionFile) {
       invalidateSessionListMeta();
-      invalidateSessionEntriesCache(sessionFile);
+      invalidateSessionEntriesCache(sessionFile, options);
     } else {
-      invalidateSessionListCache();
+      invalidateSessionListCache(options);
     }
   },
   autoApproveExtension() {

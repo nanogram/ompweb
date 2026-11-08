@@ -99,6 +99,17 @@ test("a toast without an action keeps the default cursor", () => {
   assert.equal(document.querySelector(".toast-card").style.cursor, "");
 });
 
+test("expandable toast descriptions support Enter and Space without activating the card", () => {
+  const { opened, card } = show("Long description", { clamp: true });
+  const description = card().querySelector("[aria-expanded]");
+  assert.equal(description.getAttribute("tabindex"), "0");
+  for (const [key, expanded] of [["Enter", "true"], [" ", "false"]]) {
+    act(() => description.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+    assert.equal(description.getAttribute("aria-expanded"), expanded);
+    assert.equal(opened.length, 0);
+  }
+});
+
 test("a session notification toast opens its session from a card click; one without a session does not", () => {
   const sessions = [];
   render(React.createElement(ToastProvider, null));

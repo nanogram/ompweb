@@ -42,7 +42,7 @@ export interface Host {
   onStatus(listener: (status: HostStatus) => void): () => void;
   spawnRpc(request: SpawnRequest, sessionId?: string | null, options?: { replaceAdvisor?: boolean; preparing?: boolean; expectedChannel?: string }): Promise<SpawnResult>;
   sessionFileExists(path: string): Promise<boolean>;
-  invalidateSessionLists(sessionFile?: string): void;
+  invalidateSessionLists(sessionFile?: string, options?: { observedChange?: boolean }): void;
   autoApproveExtension(): boolean;
   /** Session and project file operations, run on this host. */
   readonly sessionOps: SessionOps;

@@ -1,12 +1,13 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import { toast } from "@/components/ui/toast";
 import { translate } from "@/lib/i18n";
-import { openEventStream } from "@/lib/event-stream";
+import { openEventStream, type EventStream } from "@/lib/event-stream";
 import { DEFAULT_NOTIFICATION_PREFS, renderNotification, type NotificationEvent, type RenderedNotification } from "@/lib/notification-events";
 import { notificationHistory } from "@/lib/notification-history";
 import { isRecord } from "@/lib/type-guards";
 import {
   ensurePushSubscription,
+  dismissSystemNotification,
   getNotificationDeviceId,
   getNotificationPrefs,
   hasStoredNotificationPrefs,
@@ -41,7 +42,10 @@ export function useNotificationPrefs() {
  * another view covers it).
  */
 export function useNotifications({ sessionId, locale, onOpenSession }: { sessionId: string | null; locale: string; onOpenSession: (sessionId: string) => void }) {
+  const notificationPrefs = useNotificationPrefs();
   const openRef = useRef(onOpenSession);
+  const toastRequestsRef = useRef<Map<string, string | undefined> | null>(null);
+  const dismissedRef = useRef<Map<string, number> | null>(null);
   useEffect(() => {
     openRef.current = onOpenSession;
   }, [onOpenSession]);
@@ -89,18 +93,6 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
     if (prefs.enabled && prefs.locale !== locale) void updateNotificationPrefs({ locale }).catch(() => {});
   }, [locale]);
 
-  // Startup sync for any browser with saved settings: the server may have lost
-  // its store, missed a save (including turning notifications off), or the
-  // browser its subscription. Browsers that never opened the setting stay off
-  // the server's device list.
-  useEffect(() => {
-    if (!hasStoredNotificationPrefs()) return;
-    void (async () => {
-      const pushActive = getNotificationPrefs().enabled && (await ensurePushSubscription().catch(() => false));
-      if (!pushActive) await syncNotificationDevice();
-    })().catch(() => {});
-  }, []);
-
   // The persisted Notifications list: loaded now and whenever the tab comes back, which brings read marks and removals from other devices.
   useEffect(() => {
     void notificationHistory.load();
@@ -115,7 +107,12 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
   // OPEN_SESSION_EVENT, so listeners such as the bell popover see each one.
   useEffect(() => {
     const openSession = (sessionId: string) => window.dispatchEvent(new CustomEvent(OPEN_SESSION_EVENT, { detail: sessionId }));
+    const toastRequests = toastRequestsRef.current ??= new Map<string, string | undefined>();
+    const dismissed = dismissedRef.current ??= new Map<string, number>();
+    const isDismissed = (tag: string, requestId: string) => (dismissed.get(JSON.stringify([tag, requestId])) ?? 0) > Date.now();
     const showToast = (rendered: RenderedNotification, type: NotificationEvent["type"]) => {
+      if (rendered.requestId && isDismissed(rendered.tag, rendered.requestId)) return;
+      toastRequests.set(rendered.tag, rendered.requestId);
       const show = type === "error" ? toast.error : toast.info;
       const target = rendered.sessionId;
       // The whole card opens the session (click, tap, or Enter on the focused card); following it is reading it.
@@ -128,6 +125,7 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
       });
     };
     const deliver = (kind: "toast" | "os", event: NotificationEvent) => {
+      if (event.requestId && isDismissed(`${event.sessionId}:input`, event.requestId)) return;
       // The server has already recorded it.
       notificationHistory.add(event);
       const rendered = renderNotification(event, translate);
@@ -137,8 +135,21 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
       }
       // Permission withdrawn or never granted: the toast is the only way left to tell the user.
       void showSystemNotification(rendered).then((shown) => {
-        if (!shown) showToast(rendered, event.type);
+        if (event.requestId && isDismissed(rendered.tag, event.requestId)) {
+          void dismissSystemNotification(rendered.tag, event.requestId);
+        } else if (!shown) showToast(rendered, event.type);
       });
+    };
+    const dismiss = (tag: string, requestId: string, remember = true) => {
+      const now = Date.now();
+      for (const [key, until] of dismissed) if (until <= now) dismissed.delete(key);
+      dismissed.set(JSON.stringify([tag, requestId]), now + 60 * 60 * 1000);
+      if (toastRequests.get(tag) === requestId) {
+        toastRequests.delete(tag);
+        toast.close(tag);
+      }
+      void notificationHistory.load();
+      void dismissSystemNotification(tag, requestId, remember);
     };
     const onOpen = (raw: Event) => {
       if (raw instanceof CustomEvent && typeof raw.detail === "string" && raw.detail) openRef.current(raw.detail);
@@ -152,14 +163,21 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
       }
       // A push the service worker showed while this tab was open: the server recorded it; fetch the list.
       if (data.type === "omp-notification-shown") void notificationHistory.load();
+      if (data.type === "omp-notification-dismiss" && typeof data.tag === "string" && typeof data.requestId === "string") dismiss(data.tag, data.requestId, false);
     };
     // This tab's own channel: the server delivers here while it is open, on any
     // view (the chat, Settings, ...), and counts the tab as reachable.
-    const stream = openEventStream({ kind: "notifications", clientId: notificationClientId });
-    stream.onmessage = ({ data }) => {
+    let stream: EventStream | undefined;
+    let stopped = false;
+    const receive = ({ data }: { data: string }) => {
       try {
         const frame: unknown = JSON.parse(data);
-        if (!isRecord(frame) || frame.type !== "notification" || (frame.kind !== "toast" && frame.kind !== "os") || !isRecord(frame.event)) return;
+        if (!isRecord(frame)) return;
+        if (frame.type === "notification-dismiss" && typeof frame.tag === "string" && typeof frame.requestId === "string") {
+          dismiss(frame.tag, frame.requestId);
+          return;
+        }
+        if (frame.type !== "notification" || (frame.kind !== "toast" && frame.kind !== "os") || !isRecord(frame.event)) return;
         // Built by our own server's notification hub from a NotificationEvent.
         const event = frame.event as unknown as NotificationEvent;
         deliver(frame.kind, event);
@@ -167,12 +185,31 @@ export function useNotifications({ sessionId, locale, onOpenSession }: { session
         // ignore malformed frames
       }
     };
+    void (async () => {
+      let registered = false;
+      if (hasStoredNotificationPrefs()) {
+        try {
+          const pushActive = getNotificationPrefs().enabled && await ensurePushSubscription();
+          if (!pushActive) await syncNotificationDevice();
+          registered = true;
+        } catch {
+          // Keep the existing presence-based path when device sync is temporarily unavailable.
+        }
+      }
+      if (stopped) return;
+      stream = openEventStream({
+        kind: "notifications", clientId: notificationClientId,
+        ...(registered ? { deviceId: getNotificationDeviceId() } : {}),
+      });
+      stream.onmessage = receive;
+    })();
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     navigator.serviceWorker?.addEventListener("message", onWorkerMessage);
     return () => {
-      stream.close();
+      stopped = true;
+      stream?.close();
       window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
       navigator.serviceWorker?.removeEventListener("message", onWorkerMessage);
     };
-  }, []);
+  }, [notificationPrefs]);
 }

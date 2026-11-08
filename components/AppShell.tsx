@@ -45,6 +45,8 @@ import { useHostRows } from "@/hooks/useHostRows";
 import { LocalDaemonBanner } from "./LocalDaemonBanner";
 import { hostName, hostStatusText } from "./host-status";
 import { clearDraft } from "@/lib/draft-store";
+import { clearLastViewedSession, getLastViewedSession, getRestoreLastChat } from "@/lib/workspace-memory";
+import { recentHistoryCache } from "@/lib/recent-history-cache";
 import { useNotifications } from "@/hooks/useNotifications";
 import {
   APP_UPDATE_COMPLETED_RELOAD_MS,
@@ -65,6 +67,7 @@ import {
 } from "./AppShell-app-update";
 import {
   PanelLoadingFallback,
+  SessionListLoadError,
   RIGHT_PANEL_MIN_WIDTH,
   RIGHT_PANEL_WIDTH_STORAGE_KEY,
   SIDEBAR_DEFAULT_WIDTH,
@@ -124,7 +127,7 @@ type TimerHandle = NodeJS.Timeout;
 export function AppShell({ appName }: { appName: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
+  const [initialNavigation] = useState(() => getInitialNavigation(searchParams, getRestoreLastChat() ? getLastViewedSession() : null));
   const { t, locale } = useI18n();
   const isMobile = useIsMobile();
   const isCompactOverlay = useIsCompactOverlay();
@@ -150,6 +153,7 @@ export function AppShell({ appName }: { appName: string }) {
   );
   const [initialCwdError, setInitialCwdError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [sessionListError, setSessionListError] = useState<string | null>(null);
   const [sessionKey, setSessionKey] = useState(0);
   const [explorerRefreshKey, setExplorerRefreshKey] = useState(0);
   const [explorerRefreshing, setExplorerRefreshing] = useState(false);
@@ -752,10 +756,6 @@ export function AppShell({ appName }: { appName: string }) {
     });
   }, [activeTopPanel, systemPrompt, systemPromptLoading, toggleTopPanel]);
 
-  // /session opens the same information panel as the top-bar control.
-  const openSessionStatsPanel = useCallback(() => {
-    chatInputRef.current?.openContextPanel();
-  }, []);
 
   const handleSidebarToggle = useCallback(() => {
     if (isMobile) {
@@ -1257,7 +1257,7 @@ export function AppShell({ appName }: { appName: string }) {
   // list itself could not be fetched (keep the entry, abort this navigation).
   const fetchSessionForNavigation = useCallback(async (sessionId: string): Promise<SessionInfo | null | "unavailable"> => {
     try {
-      const res = await fetch("/api/sessions");
+      const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
       if (!res.ok) return "unavailable";
       const data = (await res.json()) as { sessions?: SessionInfo[] };
       return data.sessions?.find((s) => s.id === sessionId) ?? null;
@@ -1333,7 +1333,7 @@ export function AppShell({ appName }: { appName: string }) {
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
   const hydrateSelectedSession = useCallback((sessionId: string) => {
-    void fetch("/api/sessions")
+    void fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`)
       .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
       .then((d) => {
         const full = d?.sessions.find((s) => s.id === sessionId);
@@ -1377,7 +1377,7 @@ export function AppShell({ appName }: { appName: string }) {
     if (isCompactOverlay) setRightPanelOpen(false);
     // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
     const sessionUrl = new URL(`/?session=${encodeURIComponent(sessionId)}`, window.location.origin).href;
-    void fetch("/api/sessions")
+    void fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`)
       .then((r) => {
         if (!r.ok) {
           window.location.assign(sessionUrl);
@@ -1459,6 +1459,8 @@ export function AppShell({ appName }: { appName: string }) {
     // The composer for this session can never be reopened, so its draft would
     // otherwise keep the exit guard armed for unreachable content.
     clearDraft(sessionId);
+    clearLastViewedSession(sessionId);
+    void recentHistoryCache.invalidate(sessionId);
     setRefreshKey((k) => k + 1);
     if (selectedSession?.id === sessionId) {
       const cwd = selectedSession.cwd;
@@ -1475,6 +1477,10 @@ export function AppShell({ appName }: { appName: string }) {
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
   }, []);
+  const handleInitialSessionMissing = useCallback((id: string) => {
+    clearLastViewedSession(id);
+    void recentHistoryCache.invalidate(id);
+  }, []);
 
   const handleArchiveRestored = useCallback(async (sessionId: string) => {
     setArchiveBrowserOpen(false);
@@ -1489,7 +1495,7 @@ export function AppShell({ appName }: { appName: string }) {
     const selectRestoredSession = async (attemptsLeft = 5): Promise<void> => {
       if (activeSessionIdRef.current !== sessionAtRestoreStart) return;
       try {
-        const res = await fetch("/api/sessions");
+        const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
         if (res.ok) {
           const data = (await res.json()) as { sessions?: SessionInfo[] };
           const found = data.sessions?.find((s) => s.id === sessionId);
@@ -1854,6 +1860,9 @@ export function AppShell({ appName }: { appName: string }) {
       onSelectSession={handleSelectSession}
       onNewSession={handleNewSession}
       initialSessionId={initialSessionId}
+      initialHostId={initialNavigation.hostId}
+      onInitialSessionMissing={handleInitialSessionMissing}
+      onLoadErrorChange={setSessionListError}
       skipInitialProjectSelection={initialNavigation.requestedCwd !== null}
       onInitialRestoreDone={handleInitialRestoreDone}
       refreshKey={refreshKey}
@@ -2052,6 +2061,7 @@ export function AppShell({ appName }: { appName: string }) {
 
       {/* Center: chat */}
       <main id="main-content" tabIndex={-1} inert={rightPanelIsModal ? true : undefined} style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, minWidth: 0, overflow: "hidden" }}>
+        <SessionListLoadError visible={isMobile && !sidebarOpen && !settingsTab} error={sessionListError} onRetry={() => setRefreshKey((key) => key + 1)} />
         {settingsTab ? (
           <SettingsConfig
             activeTab={settingsTab}
@@ -2596,7 +2606,6 @@ export function AppShell({ appName }: { appName: string }) {
               onSystemPromptChange={handleSystemPromptChange}
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}
               onSessionStatsChange={handleSessionStatsChange}
-              onSessionStatsPanelOpen={openSessionStatsPanel}
               sessionInfoContainer={sessionInfoContainer}
               onGenerationSpeedChange={handleGenerationSpeedChange}
               onOpenProviders={() => setSettingsTab("providers")}

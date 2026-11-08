@@ -1,16 +1,17 @@
 "use client";
 
-import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, forwardRef, memo, KeyboardEvent } from "react";
+import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, useMemo, forwardRef, memo, KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
+import { ChevronDown, CircleHelp, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, Reply, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
 import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
 import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
-import type { ActiveGoal, ActivePlan } from "@/lib/web-mode-state";
+import type { ActivePlan } from "@/lib/web-mode-state";
 import { toast } from "@/components/ui/toast";
 import { ConfirmDialog } from "@/components/ui/field";
 import { useDictation } from "@/hooks/useDictation";
 import { toastBtwError } from "@/hooks/useBtw";
-import type { GenerationSpeedInfo, SessionStatsInfo, SlowModeScope, UsageLimitState } from "@/lib/pi-types";
+import type { GenerationSpeedInfo, GoalModeState, SessionStatsInfo, SlowModeScope, UsageLimitState } from "@/lib/pi-types";
+import { buildQueuePanelItems, type QueueProgressSnapshot } from "@/lib/queue-progress";
 import type { SttAfter } from "@/lib/stt";
 import { formatCompactNumber, formatPercent } from "@/lib/format";
 import { ContextDetailPanel } from "./ComposerPanels";
@@ -40,7 +41,7 @@ import { MAX_UPLOAD_BYTES, MAX_UPLOADS_PER_MESSAGE } from "@/lib/upload-limits";
 import { hostProjectKey, LOCAL_HOST_ID } from "@/lib/project-ordering";
 import {
   BUILTIN_SLASH_COMMAND_DEFS,
-  CLIENT_BUILTIN_COMMAND_NAMES,
+  CLIENT_ONLY_COMMAND_NAMES,
   SLASH_SOURCE_GROUP_LABEL_KEYS,
   SLASH_SOURCE_ORDER,
   SLASH_SOURCES,
@@ -58,7 +59,8 @@ import {
   type ModelOption,
 } from "./ChatInput-model-options";
 import { ModelPickerPanel } from "./ChatInput-model-picker";
-import { ComposerModeStatus, ModelErrorBanner, QueuedActionButton } from "./ChatInput-banners";
+import { ComposerModeStatus, ModelErrorBanner } from "./ChatInput-banners";
+import { QueueProgressPanel, type QueuedEntry } from "./QueueProgressPanel";
 import { CHAT_COLUMN_MAX_WIDTH } from "@/lib/chat-layout";
 import {
   composeMessageWithTextAttachments,
@@ -223,6 +225,8 @@ interface Props {
   retryInfo?: { attempt: number; maxAttempts: number; delayMs?: number; startedAt?: number; errorMessage?: string } | null;
   onAbortRetry?: () => void;
   queuedMessages?: QueuedMessages | null;
+  queueProgress?: QueueProgressSnapshot | null;
+  onDismissQueueProgress?: () => void;
   inputHistory?: string[];
   /** True while the advisor model is actively reviewing the running turn. */
   advisorActive?: boolean;
@@ -257,7 +261,10 @@ interface Props {
   draftIdentityMove?: { from: string; to: string; sourceDraft?: ChatDraft };
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
-  activeGoal?: ActiveGoal | null;
+  /** omp-owned goal mode snapshot (null = no goal, undefined = not reported yet). */
+  goalState?: GoalModeState | null;
+  /** Pause/resume/drop the omp-owned goal. */
+  onGoalAction?: (op: "pause" | "resume" | "drop") => void | Promise<void>;
   activePlan?: ActivePlan | null;
   advisorEnabled?: boolean;
   /** Toggle the per-chat advisor (composer icon + /advisor command). */
@@ -266,6 +273,7 @@ interface Props {
   onMinimize?: () => void;
   /** Active status label attached to the composer's top edge (e.g. "Waiting for model..."). */
   statusText?: string | null;
+  waitingForInput?: boolean;
   /** Open Settings → API Keys & Providers from the model picker footer. */
   onOpenProviders?: () => void;
 }
@@ -276,7 +284,6 @@ export interface ChatInputHandle {
   insertIfEmpty: (text: string) => void;
   prependText: (text: string) => void;
   addFiles: (files: File[]) => void;
-  openContextPanel: () => void;
   /** Retarget captured queue recoveries before a confirmed move can render. */
   retargetPendingRecovery: (from: string, to: string) => void;
 }
@@ -362,7 +369,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onAbortCompaction, isCompacting, compactResult,
   thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap, modelNameOverride,
   toolPreset, onToolPresetChange,
-  retryInfo, queuedMessages, inputHistory = [], onAbortRetry,
+  retryInfo, queuedMessages, queueProgress, onDismissQueueProgress, inputHistory = [], onAbortRetry,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
   onAudioUnlock,
@@ -382,12 +389,14 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   uploadHostId = LOCAL_HOST_ID,
   draftIdentityMove,
   cwd,
-  activeGoal,
+  goalState,
+  onGoalAction,
   activePlan,
   advisorEnabled,
   onAdvisorChange,
   onMinimize,
   statusText,
+  waitingForInput = false,
   onOpenProviders,
 }: Props, ref) {
   const isMobile = useIsMobile();
@@ -421,6 +430,12 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     items[next]?.focus();
   }, []);
   const { t, tn, locale } = useI18n();
+  // Names omp's catalog reports. A web prompt expansion of the same name must
+  // yield to omp's own command (extension/custom/skill/builtin).
+  const ompCommandNames = React.useMemo(
+    () => new Set((slashCommands ?? []).flatMap((command) => [command.name, ...(command.aliases ?? [])])),
+    [slashCommands],
+  );
   const usageLimitLabel = usageLimit
     ? formatUsageLimitLabel(usageLimit, t)
     : undefined;
@@ -629,9 +644,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     insertText: insertTextAtCursor,
     addFiles(files: File[]) {
       processFiles(files);
-    },
-    openContextPanel() {
-      setContextOpen(true);
     },
     retargetPendingRecovery(from, to) {
       const identity = draftRecoveryIdentityRef.current;
@@ -1228,32 +1240,43 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     }
   }, [onBuiltinCommand, clearOnceStored]);
 
-  /** `/btw` asks a side question beside any run: never a prompt, never
-   * queued. Attachments cannot ride along, so refuse and keep the draft
-   * rather than drop them. False when `msg` is not `/btw`. */
+  /** Client actions never enter omp's prompt queue, including during a run. */
   const sendSideQuestion = useCallback((msg: string, overrideText?: string): boolean => {
-    if (!/^\/btw(\s|$)/.test(msg) || !onBuiltinCommand) return false;
-    if (attachedImagesRef.current.length || attachedTextFilesRef.current.length || attachedUploadsRef.current.length) {
-      toast.error(t("btw.attachmentsUnsupported"));
+    const name = /^\/([^\s]+)(?:\s|$)/.exec(msg)?.[1];
+    if (!name || CLIENT_ONLY_COMMAND_NAMES[name] !== true || !onBuiltinCommand || ompCommandNames.has(name)) return false;
+    if (attachedImagesRef.current.length || attachedTextFilesRef.current.length || attachedUploadsRef.current.length
+      || pendingImageCountRef.current || pendingTextFileCountRef.current) {
+      toast.error(t(name === "btw" ? "btw.attachmentsUnsupported" : "chatInput.commandAttachmentsUnsupported"));
       return true;
     }
     runBuiltinCommand(msg, overrideText).catch(toastBtwError);
     return true;
-  }, [onBuiltinCommand, runBuiltinCommand, t]);
+  }, [onBuiltinCommand, ompCommandNames, runBuiltinCommand, t]);
 
   const handleSend = useCallback(async (overrideText?: string) => {
     const raw = overrideText ?? value;
     const msg = raw.trim();
     if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length) return;
+    if (submissionBlockedRef.current || holdingRef.current) return;
+    if (sendSideQuestion(msg, overrideText)) return;
     // `!cmd` runs right away during a run too, as in omp's terminal; it is never queued as text.
     const shellCommand = msg.startsWith("!") && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length;
     if (submissionBlockedRef.current || holdingRef.current || (isStreaming && !shellCommand)) return;
     onAudioUnlock?.();
-    if (sendSideQuestion(msg, overrideText)) return;
     if (rejectsPendingUploads()) return;
+    if (msg.startsWith("/") && (attachedImagesRef.current.length || attachedTextFilesRef.current.length || attachedUploadsRef.current.length)) {
+      const commandName = msg.slice(1).split(/\s+/)[0];
+      if (CLIENT_ONLY_COMMAND_NAMES[commandName] === true && !ompCommandNames.has(commandName)) {
+        toast.error(t("chatInput.commandAttachmentsUnsupported"));
+        return;
+      }
+    }
     const composedMessage = composeMessageWithTextAttachments(msg, attachedTextFilesRef.current);
     if (!attachedImagesRef.current.length && !attachedTextFilesRef.current.length && !attachedUploadsRef.current.length && msg.startsWith("/") && onBuiltinCommand) {
-      const expansion = expandWebSlashCommand(msg);
+      const commandName = msg.slice(1).split(/\s+/)[0];
+      const expansion = ompCommandNames.has(commandName)
+        ? { kind: "not-web" as const }
+        : expandWebSlashCommand(msg);
       if (expansion.kind === "expand" && rejectsOversizedPrompt(expansion.prompt, attachedImagesRef.current)) return;
       if (await runBuiltinCommand(msg, overrideText)) return;
     }
@@ -1293,7 +1316,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       if (key) recoverDraft(key, recovery);
       throw error;
     }
-  }, [value, isStreaming, onBuiltinCommand, onSend, outbox, clearInput, clearOnceStored, onAudioUnlock, rejectsOversizedPrompt, rejectsPendingUploads, runBuiltinCommand, sendSideQuestion]);
+  }, [value, isStreaming, onBuiltinCommand, onSend, outbox, clearInput, clearOnceStored, onAudioUnlock, ompCommandNames, rejectsOversizedPrompt, rejectsPendingUploads, runBuiltinCommand, sendSideQuestion, t]);
   const {
     isRecording,
     isPaused,
@@ -1410,32 +1433,30 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const builtinSlashCommands: SlashCommandPaletteItem[] = React.useMemo(
     () => BUILTIN_SLASH_COMMAND_DEFS
-      // The /advisor command is linked to Settings → Enable Advisor: hidden
-      // from the palette while the advisor is disabled.
-      .filter((def) => def.name !== "advisor" || advisorEnabled)
+      // The catalog wins over every client entry, including client-only names.
+      .filter((def) => !ompCommandNames.has(def.name))
       .map((def) => ({
         name: def.name,
         description: t(def.descriptionKey),
         ...(def.argumentHintKey ? { argumentHint: t(def.argumentHintKey) } : {}),
         source: "builtin" as const,
       })),
-    [t, advisorEnabled],
+    [t, ompCommandNames],
   );
 
-  // Externally reported commands (extension/prompt/skill/ompBuiltin) group
-  // below the client built-ins; any name the web UI intercepts itself —
-  // whether an omp builtin or a user extension — is dropped so each command
-  // appears exactly once and the client interception behavior is unchanged.
+  // Externally reported commands group below the client built-ins. A name the
+  // client always dispatches itself is dropped so it appears exactly once.
   const externalSlashCommands: SlashCommandPaletteItem[] = React.useMemo(
     () => (slashCommands ?? []).flatMap((command): SlashCommandPaletteItem[] => {
-      const source = command.source as string;
-      if (CLIENT_BUILTIN_COMMAND_NAMES.has(command.name)) return [];
-      if (source === "builtin" || source === "ompBuiltin") {
-        return [{ name: command.name, description: command.description, source: "ompBuiltin" }];
-      }
-      return [command];
+      if (CLIENT_ONLY_COMMAND_NAMES[command.name] === true && !ompCommandNames.has(command.name)) return [];
+      return [{
+        name: command.name,
+        description: command.description,
+        ...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+        source: command.source === "builtin" ? "ompBuiltin" : command.source,
+      }];
     }),
-    [slashCommands],
+    [slashCommands, ompCommandNames],
   );
 
   const filteredSlashCommands = (() => {
@@ -1462,7 +1483,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           return modelCollator.compare(a.name, b.name);
         });
     }
-    const commands = [...(isStreaming ? [] : builtinSlashCommands), ...externalSlashCommands];
+    const streamingAvailableBuiltins = isStreaming
+      ? builtinSlashCommands.filter((command) => command.name === "btw")
+      : builtinSlashCommands;
+    const commands = [...streamingAvailableBuiltins, ...externalSlashCommands];
     return [...commands]
       .filter((command) => {
         const name = command.name.toLowerCase();
@@ -1774,17 +1798,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     onAudioUnlock?.();
     if (msg.startsWith("/")) {
       const commandName = msg.slice(1).split(/\s+/)[0];
-      // Same gate as the direct path (useAgentSession refuses /advisor while
-      // disabled): queueing must not become a bypass around the toggle.
-      if (commandName === "advisor" && !advisorEnabled) {
-        toast.error(t("agentSession.advisorDisabled"));
-        return;
-      }
-      // Web commands must be expanded even when queued: the raw slash text
-      // would otherwise reach omp as a literal message (its /goal //plan are
-      // TUI-only). Action commands (compact/...) keep the raw text so omp's
-      // own ACP handlers can run them.
-      const expansion = expandWebSlashCommand(msg);
+      // Catalog commands keep their original text; only web-only names expand.
+      const expansion = ompCommandNames.has(commandName)
+        ? { kind: "not-web" as const }
+        : expandWebSlashCommand(msg);
       if (expansion.kind === "expand") {
         const prompt = composeMessageWithTextAttachments(expansion.prompt, files);
         if (rejectsOversizedPrompt(prompt, attachedImagesRef.current)) return;
@@ -1802,7 +1819,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const composedMessage = composeMessageWithTextAttachments(msg, files);
     if (rejectsOversizedPrompt(composedMessage, attachedImagesRef.current)) return;
     hold(composedMessage);
-  }, [value, handleSend, onSteer, onFollowUp, clearOnceStored, onAudioUnlock, t, advisorEnabled, rejectsOversizedPrompt, rejectsPendingUploads, sendSideQuestion]);
+  }, [value, handleSend, onSteer, onFollowUp, clearOnceStored, onAudioUnlock, t, ompCommandNames, rejectsOversizedPrompt, rejectsPendingUploads, sendSideQuestion]);
   // A typed message or attachment during a run is a queued follow-up — and so
   // is a dictation in progress: the primary button must take the same state it
   // would have if the composer already held text. Keep Stop as the action
@@ -1814,24 +1831,22 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const uploadsBlockSend = uploadingCount + failedUploadCount > 0;
   const imageUploads = attachedUploads.filter((upload) => upload.previewUrl !== null);
   const fileUploads = attachedUploads.filter((upload) => upload.previewUrl === null);
+  const draftCommandName = /^\/([^\s]+)(?:\s|$)/.exec(value.trim())?.[1];
+  const isClientCommandDraft = Boolean(draftCommandName && CLIENT_ONLY_COMMAND_NAMES[draftCommandName] && !ompCommandNames.has(draftCommandName));
+  const isBtwDraft = isClientCommandDraft && draftCommandName === "btw";
   const primaryActionQueuesMessage =
     isStreaming
     && (Boolean(value.trim()) || hasAttachments || dictationCapturing)
-    && Boolean(onFollowUp);
+    && (Boolean(onFollowUp) || isClientCommandDraft);
   // The button follows the same Settings choice as Enter: soft keyboards have no
   // Enter to submit with, so this button is how touch devices steer.
   const primaryActionMode = primaryActionQueuesMessage && onSteer && getSubmitDuringRunBehavior() === "steer" ? "steer" : "followup";
 
-  // ── Queued follow-up bar ────────────────────────────────────────────────
-  // Texts are mirrored locally; mutations wait for native acknowledgement.
-  const queuedEntries = [
-    ...(queuedMessages?.followUp ?? []).map((text) => ({ kind: "follow-up" as const, text })),
-    ...(queuedMessages?.steering ?? []).map((text) => ({ kind: "steer" as const, text })),
-  ];
-  const firstQueued = queuedEntries[0] ?? null;
-  const queuedCount = queuedEntries.length;
+  // ── Queue panel ─────────────────────────────────────────────────────────
+  // The server ledger's batch, with omp's snapshot deciding what is editable;
+  // mutations wait for native acknowledgement.
+  const queuePanelItems = useMemo(() => buildQueuePanelItems(queueProgress ?? null, queuedMessages ?? null), [queueProgress, queuedMessages]);
 
-  const [queueExpanded, setQueueExpanded] = useState(false);
   const [queueActionPending, setQueueActionPending] = useState(false);
   const queueActionPendingRef = useRef(false);
   // Invalidate confirmation if delivery or navigation changes the queue.
@@ -1839,7 +1854,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     && queuedDeleteTarget?.queue === queuedMessages ? queuedDeleteTarget : null;
 
   const handleQueueAction = useCallback(async (
-    entry: { kind: "follow-up" | "steer"; text: string },
+    entry: QueuedEntry,
     action: "edit" | "delete" | "steer",
   ) => {
     if (queueActionPendingRef.current || (action === "steer" && submissionBlockedRef.current)) return;
@@ -1868,24 +1883,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     }
   }, [onRemoveQueuedMessage, onPromoteQueuedToSteer]);
 
-  const handleItemDelete = useCallback((entry: { kind: "follow-up" | "steer"; text: string }) => {
+  const handleItemDelete = useCallback((entry: QueuedEntry) => {
     setQueuedDeleteTarget({ ...entry, draftKey, queue: queuedMessages });
   }, [draftKey, queuedMessages]);
-
-  const handleQueuedEdit = useCallback(() => {
-    if (!firstQueued) return;
-    void handleQueueAction(firstQueued, "edit");
-  }, [firstQueued, handleQueueAction]);
-
-  const handleQueuedDelete = useCallback(() => {
-    if (!firstQueued) return;
-    handleItemDelete(firstQueued);
-  }, [firstQueued, handleItemDelete]);
-
-  const handleQueuedSteer = useCallback(() => {
-    if (!firstQueued) return;
-    void handleQueueAction(firstQueued, "steer");
-  }, [firstQueued, handleQueueAction]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = filteredSlashCommands.length - 1;
@@ -2382,7 +2382,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       />
       <div style={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
         <ModelErrorBanner error={modelError} />
-        <ComposerModeStatus goal={activeGoal} plan={activePlan} />
+        <ComposerModeStatus goal={goalState} plan={activePlan} onGoalAction={onGoalAction} />
         {/* Retry banner */}
         {retryInfo && (() => {
           const remainingSec = (retryInfo.delayMs !== undefined && retryInfo.startedAt !== undefined)
@@ -2921,221 +2921,29 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               </div>
             );
           })()}
-        {/* Queued prompts panel / bar — attached to composer's top edge.
-            When 1 item: compact single row. When multiple items: compact row with expand toggle, or full list when expanded. */}
-        {queuedCount > 0 && (
-          <div
-            aria-label={t("chatInput.queuedPrompts")}
-            style={{
-              border: "1px solid var(--border)",
-              borderBottom: "none",
-              borderRadius: "var(--radius-card) var(--radius-card) 0 0",
-              background: "var(--bg-panel)",
-              overflow: "hidden",
-            }}
-          >
-            {queuedCount === 1 ? (
-              <div style={{
-                padding: "5px 8px 5px 12px",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                minWidth: 0,
-              }}>
-                <span style={{
-                  flexShrink: 0,
-                  fontSize: 10,
-                  fontWeight: 600,
-                  letterSpacing: "0.06em",
-                  textTransform: "uppercase",
-                  color: "var(--text-muted)",
-                }}>
-                  {firstQueued?.kind === "steer" ? t("chatInput.queuedSteer") : t("chatInput.queuedFollowUp")}
-                </span>
-                <span
-                  title={firstQueued?.text}
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    fontSize: 12,
-                    color: "var(--text-muted)",
-                  }}
-                >
-                  {firstQueued?.text}
-                </span>
-                <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedEdit} title={t("chatInput.queuedEditTitle")}>
-                  {t("chatInput.queuedEdit")}
-                </QueuedActionButton>
-                <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={handleQueuedDelete} title={t("chatInput.queuedDeleteTitle")}>
-                  {t("chatInput.queuedDelete")}
-                </QueuedActionButton>
-                {firstQueued?.kind === "follow-up" && (
-                  <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={handleQueuedSteer} title={t("chatInput.queuedSteerTitle")} accent>
-                    {t("chatInput.queuedSteerAction")}
-                  </QueuedActionButton>
-                )}
-              </div>
-            ) : (
-              <div>
-                <div style={{
-                  padding: "5px 8px 5px 12px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 8,
-                  borderBottom: queueExpanded ? "1px solid var(--border)" : "none",
-                }}>
-                  <button
-                    type="button"
-                    onClick={() => setQueueExpanded((prev) => !prev)}
-                    aria-expanded={queueExpanded}
-                    title={queueExpanded ? t("chatInput.collapseQueued") : t("chatInput.expandQueued")}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      background: "none",
-                      border: "none",
-                      padding: 0,
-                      cursor: "pointer",
-                      color: "var(--text-muted)",
-                      fontSize: 11,
-                      fontWeight: 600,
-                      letterSpacing: "0.04em",
-                      textTransform: "uppercase",
-                      minWidth: 0,
-                      flex: 1,
-                      textAlign: "left",
-                    }}
-                  >
-                    <ChevronDown
-                      size={13}
-                      strokeWidth={2}
-                      style={{
-                        transform: queueExpanded ? "rotate(0deg)" : "rotate(-90deg)",
-                        transition: "transform var(--dur-fast) var(--ease-out-warm)",
-                        flexShrink: 0,
-                      }}
-                      aria-hidden
-                    />
-                    <span>{t("chatInput.queuedPrompts")}</span>
-                    <span style={{ color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 10 }}>({queuedCount})</span>
-                    {!queueExpanded && firstQueued && (
-                      <span
-                        style={{
-                          marginLeft: 4,
-                          color: "var(--text-dim)",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          fontSize: 11,
-                          fontWeight: 400,
-                          textTransform: "none",
-                        }}
-                      >
-                        {firstQueued.kind === "steer" ? `[${t("chatInput.queuedSteer")}] ` : ""}{firstQueued.text}
-                      </span>
-                    )}
-                  </button>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
-                    <button
-                      type="button"
-                      onClick={() => setQueueExpanded((prev) => !prev)}
-                      style={{
-                        background: "none",
-                        border: "none",
-                        padding: "2px 6px",
-                        cursor: "pointer",
-                        color: "var(--text-dim)",
-                        fontSize: 11,
-                      }}
-                    >
-                      {queueExpanded ? t("chatInput.collapseQueued") : t("chatInput.expandQueued")}
-                    </button>
-                  </div>
-                </div>
-                {queueExpanded && (
-                  <div style={{
-                    maxHeight: 180,
-                    overflowY: "auto",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 1,
-                    background: "var(--bg-subtle)",
-                    padding: "4px 0",
-                  }}>
-                    {queuedEntries.map((entry, idx) => (
-                      <div
-                        key={`${entry.kind}:${idx}:${entry.text}`}
-                        style={{
-                          padding: "4px 8px 4px 12px",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 8,
-                          background: "var(--bg-panel)",
-                          fontSize: 12,
-                        }}
-                      >
-                        <span style={{
-                          flexShrink: 0,
-                          fontSize: 9.5,
-                          fontWeight: 600,
-                          letterSpacing: "0.05em",
-                          textTransform: "uppercase",
-                          padding: "1px 4px",
-                          borderRadius: 4,
-                          background: entry.kind === "steer" ? "color-mix(in srgb, var(--accent) 15%, transparent)" : "var(--bg)",
-                          border: `1px solid ${entry.kind === "steer" ? "var(--accent)" : "var(--border)"}`,
-                          color: entry.kind === "steer" ? "var(--accent)" : "var(--text-muted)",
-                        }}>
-                          {entry.kind === "steer" ? t("chatInput.queuedSteer") : t("chatInput.queuedFollowUp")}
-                        </span>
-                        <span
-                          title={entry.text}
-                          style={{
-                            flex: 1,
-                            minWidth: 0,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            color: "var(--text)",
-                            fontFamily: "var(--font-mono)",
-                            fontSize: 11.5,
-                          }}
-                        >
-                          {entry.text}
-                        </span>
-                        <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={() => void handleQueueAction(entry, "edit")} title={t("chatInput.queuedEditTitle")}>
-                          {t("chatInput.queuedEdit")}
-                        </QueuedActionButton>
-                        <QueuedActionButton disabled={queueActionPending || !onRemoveQueuedMessage} onClick={() => handleItemDelete(entry)} title={t("chatInput.queuedDeleteTitle")}>
-                          {t("chatInput.queuedDelete")}
-                        </QueuedActionButton>
-                        {entry.kind === "follow-up" && (
-                          <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={() => void handleQueueAction(entry, "steer")} title={t("chatInput.queuedSteerTitle")} accent>
-                            {t("chatInput.queuedSteerAction")}
-                          </QueuedActionButton>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+        {/* Queue panel — attached to composer's top edge. */}
+        {queuePanelItems.length > 0 && (
+          <QueueProgressPanel
+            items={queuePanelItems}
+            actionPending={queueActionPending}
+            canRemove={Boolean(onRemoveQueuedMessage)}
+            canPromote={Boolean(onPromoteQueuedToSteer)}
+            promoteBlocked={submissionBlocked}
+            onAction={handleQueueAction}
+            onDelete={handleItemDelete}
+            onDismiss={onDismissQueueProgress}
+          />
         )}
         {/* Live agent status bar — attached to composer's top edge */}
         {statusText && (
           <div
             role="status"
             aria-live="polite"
+            title={waitingForInput ? statusText : undefined}
             style={{
               border: `1px solid ${bashMode ? "var(--tool-bg)" : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
               borderBottom: "none",
-              borderRadius: queuedCount > 0 ? 0 : "var(--radius-card) var(--radius-card) 0 0",
+              borderRadius: queuePanelItems.length > 0 ? 0 : "var(--radius-card) var(--radius-card) 0 0",
               background: "var(--bg-panel)",
               padding: "6px 14px",
               display: "flex",
@@ -3145,11 +2953,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               color: "var(--text-muted)",
             }}
           >
-            <span
-              aria-hidden
-              className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent"
-            />
-            <span>{statusText}</span>
+            {waitingForInput ? (
+              <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden="true" />
+            ) : (
+              <span
+                aria-hidden
+                className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent"
+              />
+            )}
+            <span className={waitingForInput ? "sr-only" : undefined}>{statusText}</span>
           </div>
         )}
           <div
@@ -3159,7 +2971,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
               flexDirection: "column",
               background: "var(--bg)",
               border: `1px solid ${bashMode ? "var(--tool-bg)" : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
-              borderRadius: (queuedCount > 0 || Boolean(statusText)) ? "0 0 var(--radius-card) var(--radius-card)" : "var(--radius-card)",
+              borderRadius: (queuePanelItems.length > 0 || Boolean(statusText)) ? "0 0 var(--radius-card) var(--radius-card)" : "var(--radius-card)",
               padding: "12px 12px 10px",
               boxShadow: "var(--shadow-card)",
             } as React.CSSProperties}
@@ -3891,7 +3703,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   else sendQueued(primaryActionMode);
                 }}
                 disabled={submissionBlocked || isTranscribing}
-                title={t(primaryActionMode === "steer" ? "chatInput.steerNowTitle" : "chatInput.queueMessage")}
+                title={isBtwDraft ? t("btw.panelTitle") : isClientCommandDraft ? t("chatInput.send") : t(primaryActionMode === "steer" ? "chatInput.steerNowTitle" : "chatInput.queueMessage")}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   background: "var(--accent-strong)",
@@ -3904,10 +3716,22 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   transition: "background var(--dur-fast) var(--ease-out-warm)",
                 }}
               >
-                {primaryActionMode === "steer"
-                  ? <CornerDownRight size={13} strokeWidth={2} aria-hidden="true" />
-                  : <ListChecks size={13} strokeWidth={2} aria-hidden="true" />}
-                {t(primaryActionMode === "steer" ? "chatInput.steer" : "chatInput.queue")}
+                {isBtwDraft ? (
+                  <>
+                    <Reply size={13} strokeWidth={2} aria-hidden="true" />
+                    {t("btw.ask")}
+                  </>
+                ) : isClientCommandDraft ? t("chatInput.send") : primaryActionMode === "steer" ? (
+                  <>
+                    <CornerDownRight size={13} strokeWidth={2} aria-hidden="true" />
+                    {t("chatInput.steer")}
+                  </>
+                ) : (
+                  <>
+                    <ListChecks size={13} strokeWidth={2} aria-hidden="true" />
+                    {t("chatInput.queue")}
+                  </>
+                )}
               </button>
             ) : isStreaming ? (
               <button

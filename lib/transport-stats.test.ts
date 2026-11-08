@@ -76,3 +76,20 @@ test("commands forwarded to omp without awaiting its reply count as transport on
   const rows = diagnosticStats(["host_tool_result", "host_uri_result", "extension_ui_response"].map((type) => ({ ...ok, type })));
   assert.deepEqual(rows.map((row) => [row.metric, row.count]), [["transportMs", 3]]);
 });
+
+test("queue-ledger dismissals retain transport latency without inflating native command timings", () => {
+  for (const transport of ["sse", "ws"]) {
+    const base = { metric: "action", transport, outcome: "ok", sentAt: 0, recvAt: 1_002, offset: 1_000 };
+    const rows = diagnosticStats([
+      { ...base, type: "get_state", repliedAt: 1_005, gotAt: 10 },
+      { ...base, type: "dismiss_queue_progress", repliedAt: 6_002, gotAt: 5_020 },
+    ]);
+    assert.deepEqual(rows.map((row) => [row.metric, row.count, row.max]), [
+      ["upMs", 2, 2],
+      ["transportMs", 2, 20],
+      ["ompMs", 1, 3],
+      ["serverMs", 1, 3],
+      ["totalMs", 1, 10],
+    ]);
+  }
+});
