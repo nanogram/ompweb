@@ -1,4 +1,5 @@
 import type { SkillDiagnosticsSnapshot } from "./skill-diagnostics";
+import type { QueueProgressSnapshot } from "./queue-progress";
 
 // Local mirrors of the omp shapes used by omp-web. omp's SDK packages are
 // Bun-only, so these types are hand-maintained against
@@ -63,6 +64,31 @@ export interface QueuedMessages {
   followUp: string[];
 }
 
+/** Native omp goal mode; unknown statuses from newer runtimes are preserved. */
+export type GoalStatus = "active" | "paused" | "completed" | "dropped" | (string & {});
+
+export interface Goal {
+  id: string;
+  objective: string;
+  status: GoalStatus;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface GoalModeState {
+  enabled: boolean;
+  mode: string;
+  goal: Goal | null;
+}
+
+/** Drop may return null state while goal_updated still carries the dropped goal. */
+export interface GoalCommandResponse {
+  goal: Goal | null;
+  state: GoalModeState | null;
+}
+
 /** Mirror of omp's RpcSessionState (the raw `get_state` payload). */
 export interface RpcSessionState {
   model?: OmpModel;
@@ -102,6 +128,8 @@ export interface RpcSessionState {
   tokensPerSecond?: number | null;
   /** Structured skill resolution diagnostics; absent on older OMP builds. */
   skillDiagnostics?: SkillDiagnosticsSnapshot;
+  /** Absent on omp builds without native goal support. */
+  goal?: GoalModeState | null;
 }
 
 /**
@@ -126,6 +154,7 @@ export interface WebSessionState {
   messageCount: number;
   queuedMessageCount: number;
   queuedMessages: QueuedMessages;
+  queueProgress?: QueueProgressSnapshot;
   contextUsage: ContextUsage | null;
   systemPrompt: string;
   thinkingLevel: string;
@@ -139,6 +168,7 @@ export interface WebSessionState {
   tokensPerSecond?: number | null;
   /** Parsed public diagnostics DTO; absent means unsupported or malformed. */
   skillDiagnostics?: SkillDiagnosticsSnapshot;
+  goal?: GoalModeState | null;
   todoPhases: TodoPhase[];
   extensionStatuses: Array<{ key: string; text: string }>;
   extensionWidgets: Array<{ key: string; lines: string[]; placement: "aboveEditor" | "belowEditor" }>;

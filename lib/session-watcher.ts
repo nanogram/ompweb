@@ -1,7 +1,6 @@
 import { watch, type FSWatcher } from "fs";
 import { join } from "path";
 import {
-  getAgentDir,
   invalidateSessionEntriesCache,
   invalidateSessionListCache,
   invalidateSessionListMeta,
@@ -9,6 +8,7 @@ import {
   resolveSessionIdByPath,
 } from "./session-reader";
 import { invalidateLocalSessionLists } from "./hosts/session-index";
+import { getSessionsDir } from "./omp/paths";
 
 // omp owns the writes to a session's JSONL. ompweb streams RPC events only for
 // the sessions it spawned itself, so a session started outside the web UI — by
@@ -100,7 +100,7 @@ function scheduleRetry(): void {
 
 function ensureWatcher(): void {
   if (watcher || retryTimer) return;
-  const sessionsDir = join(getAgentDir(), "sessions");
+  const sessionsDir = getSessionsDir();
   try {
     watcher = watch(sessionsDir, { recursive: true, persistent: false }, (_event, filename) => {
       if (!filename) {

@@ -8,6 +8,13 @@ if (process.argv.includes("--version")) {
 const sessionId = process.env.OMP_MULTI_SESSION_ID;
 const sessionFile = process.env.OMP_MULTI_SESSION_FILE;
 const record = (entry) => fs.appendFileSync(process.env.OMP_MULTI_LOG, `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
+process.once("exit", () => record({ type: "exit" }));
+// A test failure can kill a Windows launcher before its native child sees EOF.
+// Only this isolated run owns the marker; teardown can release every fixture first.
+const shutdown = setInterval(() => {
+  if (fs.existsSync(process.env.OMP_MULTI_SHUTDOWN_FILE)) process.exit(0);
+}, 25);
+shutdown.unref();
 let chunkNumber = 0;
 const out = (frame) => {
   const data = Buffer.from(JSON.stringify(frame));
@@ -46,7 +53,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const reply = (data = {}) => out({ type: "response", id: command.id, command: command.type, success: true, data });
   switch (command.type) {
     case "negotiate_protocol": return reply({ protocolVersion: 2 });
-    case "get_state": return reply({ sessionId, sessionFile, cwd: process.cwd(), isStreaming: streaming, isSettled: !streaming, isCompacting: false, queuedMessages: [], messages });
+    case "get_state": return reply({ sessionId, sessionFile, cwd: process.cwd(), isStreaming: streaming, isSettled: !streaming, isCompacting: false,
+      queuedMessageCount: 0, queuedMessages: { steering: [], followUp: [] }, messages });
     case "get_subagents": return reply({ subagents: [] });
     case "get_btw_history": return reply({ records: [] });
     case "abort":

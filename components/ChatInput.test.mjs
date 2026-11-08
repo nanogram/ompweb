@@ -194,7 +194,19 @@ test("renders goal, planning, and advisor indicators at the composer", () => {
       model: { provider: "test", modelId: "model" },
       modelList: [{ provider: "test", modelId: "model", id: "model", name: "Test model" }],
       modelNames: {},
-      activeGoal: { objective: "Ship the active goal bar", startedAt: 0 },
+      goalState: {
+        enabled: true,
+        mode: "active",
+        goal: {
+          id: "goal-1",
+          objective: "Ship the active goal bar",
+          status: "active",
+          tokensUsed: 42,
+          timeUsedSeconds: 60,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+      },
       activePlan: { objective: "Plan the implementation" },
       advisorEnabled: true,
       onAdvisorChange() {},
@@ -274,7 +286,7 @@ test("keeps editing and deletion but hides Steer for a single queued steer", () 
   assert.doesNotMatch(html, />(Steer|chatInput\.queuedSteerAction)</);
 });
 
-test("renders multiple queued prompts with count and expand action", () => {
+test("a collapsed queue summary previews native steering priority without exposing follow-up edits", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
       async onSend() { return { status: "accepted" }; },
@@ -287,9 +299,18 @@ test("renders multiple queued prompts with count and expand action", () => {
     }),
   );
 
-  assert.match(html, /\(3\)/);
-  assert.match(html, />(Show all queued prompts|Show all|chatInput\.expandQueued)</);
-  assert.match(html, /First task/);
+  const dom = new JSDOM(html);
+  try {
+    const summary = dom.window.document.querySelector("[data-queue-progress]");
+    assert.ok(summary, "the multi-item queue exposes its progress summary");
+    const toggle = summary.closest("button");
+    assert.equal(toggle.getAttribute("aria-expanded"), "false");
+    assert.ok(toggle.textContent.includes("Priority steer"), "omp drains steering before follow-ups");
+    assert.equal(dom.window.document.querySelectorAll("[data-queue-item]").length, 0, "pending items remain behind the expansion control");
+    assert.ok(toggle.parentElement.querySelectorAll("button").length > 1, "the summary also exposes the explicit expand action");
+  } finally {
+    dom.window.close();
+  }
 });
 
 

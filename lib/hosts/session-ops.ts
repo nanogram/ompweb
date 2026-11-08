@@ -586,7 +586,7 @@ export const sessionOps: SessionOps = {
       const next = upsertProject(loadProjectRegistry(), projectRoot, new Date().toISOString(), launchConfig);
       saveProjectRegistry(next);
       const entry = next.projects.find((p) => comparableProjectPath(p.path) === comparableProjectPath(projectRoot))!;
-      return ok({ path: entry.path, addedAt: entry.addedAt, launchConfig: entry.launchConfig });
+      return ok({ path: entry.path, addedAt: entry.addedAt, alias: entry.alias, sortOrder: entry.sortOrder, pinOrder: entry.pinOrder, launchConfig: entry.launchConfig });
     } catch (error) {
       if (error instanceof ProjectPathError) return fail(400, error.code, error.message);
       throw error;

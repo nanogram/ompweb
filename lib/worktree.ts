@@ -1,4 +1,5 @@
 import { execFile } from "child_process";
+import { createHash } from "crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { basename, dirname, join, resolve } from "path";
 import { promisify } from "util";
@@ -174,12 +175,14 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
       }
     }
     const out = await git(cwd, [
-      "rev-parse", "--path-format=absolute",
+      "rev-parse",
       "--git-common-dir", "--git-dir", "--show-toplevel",
       "--abbrev-ref", "HEAD",
     ]);
     const [commonDirRaw, gitDirRaw, toplevelRaw, ref] = out.split("\n").map((l) => l.trim());
-    const [commonDir, gitDir, toplevel] = [commonDirRaw, gitDirRaw, toplevelRaw].map((p) => realPathOrSelf(toNativePath(p)));
+    // Git can return git-directory paths relative to this checkout. Resolve
+    // them here instead of using --path-format (unavailable before Git 2.31).
+    const [commonDir, gitDir, toplevel] = [commonDirRaw, gitDirRaw, toplevelRaw].map((p) => realPathOrSelf(resolve(cwd, toNativePath(p))));
     // git prints resolved (symlink-free) paths; normalize cwd the same way
     const realCwd = realPathOrSelf(cwd);
     // For a linked worktree, --git-dir differs from --git-common-dir.
@@ -218,8 +221,8 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
 
 /** Main repo root (parent of the shared .git dir), or throws for non-git dirs */
 async function getRepoRoot(cwd: string): Promise<string> {
-  const commonDir = await git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  return realPathOrSelf(dirname(toNativePath(commonDir)));
+  const commonDir = await git(cwd, ["rev-parse", "--git-common-dir"]);
+  return realPathOrSelf(dirname(resolve(cwd, toNativePath(commonDir))));
 }
 
 export async function listWorktrees(cwd: string): Promise<WorktreeInfo[]> {
@@ -294,9 +297,15 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
 
   const repoRoot = await getRepoRoot(cwd);
   const baseDir = `${resolve(repoRoot)}-worktrees`;
-  const worktreePath = join(baseDir, dirName);
+  let worktreePath = join(baseDir, dirName);
   if (existsSync(worktreePath)) {
-    throw new Error(`Directory already exists: ${worktreePath}`);
+    const worktrees = await listWorktrees(cwd);
+    if (findWorktreeByPath(worktrees, worktreePath)?.branch === trimmed) throw new Error(`Directory already exists: ${worktreePath}`);
+    // Sanitizing is not injective (a/b and a-b). Keep existing paths stable,
+    // and disambiguate only the newly created checkout.
+    const suffix = createHash("sha256").update(trimmed).digest("hex").slice(0, 8);
+    worktreePath = join(baseDir, `${dirName}-${suffix}`);
+    if (existsSync(worktreePath)) throw new Error(`Worktree directory already exists: ${worktreePath}`);
   }
   mkdirSync(baseDir, { recursive: true });
   if (lstatSync(baseDir).isSymbolicLink() || !samePath(realPathOrSelf(baseDir), baseDir)) throw new Error("Worktree directory must not be a symbolic link");

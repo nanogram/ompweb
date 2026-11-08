@@ -752,10 +752,6 @@ export function AppShell({ appName }: { appName: string }) {
     });
   }, [activeTopPanel, systemPrompt, systemPromptLoading, toggleTopPanel]);
 
-  // /session opens the same information panel as the top-bar control.
-  const openSessionStatsPanel = useCallback(() => {
-    chatInputRef.current?.openContextPanel();
-  }, []);
 
   const handleSidebarToggle = useCallback(() => {
     if (isMobile) {
@@ -1257,7 +1253,7 @@ export function AppShell({ appName }: { appName: string }) {
   // list itself could not be fetched (keep the entry, abort this navigation).
   const fetchSessionForNavigation = useCallback(async (sessionId: string): Promise<SessionInfo | null | "unavailable"> => {
     try {
-      const res = await fetch("/api/sessions");
+      const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
       if (!res.ok) return "unavailable";
       const data = (await res.json()) as { sessions?: SessionInfo[] };
       return data.sessions?.find((s) => s.id === sessionId) ?? null;
@@ -1333,7 +1329,7 @@ export function AppShell({ appName }: { appName: string }) {
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
   const hydrateSelectedSession = useCallback((sessionId: string) => {
-    void fetch("/api/sessions")
+    void fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`)
       .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
       .then((d) => {
         const full = d?.sessions.find((s) => s.id === sessionId);
@@ -1377,7 +1373,7 @@ export function AppShell({ appName }: { appName: string }) {
     if (isCompactOverlay) setRightPanelOpen(false);
     // A full load (not router navigation) so an expired sign-in reaches proxy.ts and the login page.
     const sessionUrl = new URL(`/?session=${encodeURIComponent(sessionId)}`, window.location.origin).href;
-    void fetch("/api/sessions")
+    void fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`)
       .then((r) => {
         if (!r.ok) {
           window.location.assign(sessionUrl);
@@ -1489,7 +1485,7 @@ export function AppShell({ appName }: { appName: string }) {
     const selectRestoredSession = async (attemptsLeft = 5): Promise<void> => {
       if (activeSessionIdRef.current !== sessionAtRestoreStart) return;
       try {
-        const res = await fetch("/api/sessions");
+        const res = await fetch(`/api/sessions?id=${encodeURIComponent(sessionId)}`);
         if (res.ok) {
           const data = (await res.json()) as { sessions?: SessionInfo[] };
           const found = data.sessions?.find((s) => s.id === sessionId);
@@ -2596,7 +2592,6 @@ export function AppShell({ appName }: { appName: string }) {
               onSystemPromptChange={handleSystemPromptChange}
               onSystemPromptLoaderChange={handleSystemPromptLoaderChange}
               onSessionStatsChange={handleSessionStatsChange}
-              onSessionStatsPanelOpen={openSessionStatsPanel}
               sessionInfoContainer={sessionInfoContainer}
               onGenerationSpeedChange={handleGenerationSpeedChange}
               onOpenProviders={() => setSettingsTab("providers")}

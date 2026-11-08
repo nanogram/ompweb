@@ -36,7 +36,9 @@ export function clientEnv(root: string, worker: string) {
     if (safeDirectories > 0) env.GIT_CONFIG_COUNT = String(safeDirectories);
     const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] }).trim();
     if (!git("rev-parse", "--show-prefix") && !git("tag", "--points-at", "HEAD")) {
-      [commitHash, commitDate] = git("log", "-1", "--no-show-signature", "--format=%H%n%cs").split("\n");
+      const [hash, date] = git("log", "-1", "--no-show-signature", "--format=%H%n%ci").split("\n");
+      commitHash = hash;
+      commitDate = date.slice(0, 10);
     }
   } catch {
     // Source archives and installed packages need not have Git metadata or Git installed.

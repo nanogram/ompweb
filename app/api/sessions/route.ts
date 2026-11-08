@@ -14,11 +14,17 @@ const SESSION_LIST_HEADERS = {
 
 export async function GET(req: Request) {
   try {
+    const filterId = new URL(req.url).searchParams.get("id");
     const sessions = await listSessionsAllHosts();
     const runningSessions = getRunningRpcSessions();
     const runningSessionIds = runningSessions.map((s) => s.id);
-    const body = { sessions, runningSessionIds, runningSessions };
+    // Filter only the session rows: navigation still needs the complete running
+    // set (including host identity), just like the full sidebar response.
+    const body = { sessions: filterId === null ? sessions : sessions.filter((session) => session.id === filterId), runningSessionIds, runningSessions };
     const bodyJson = JSON.stringify(body);
+    if (filterId !== null) {
+      return new Response(bodyJson, { headers: { "Content-Type": "application/json", ...SESSION_LIST_HEADERS } });
+    }
     const etag = `"${createHash("sha1").update(bodyJson).digest("hex").slice(0, 16)}"`;
     if (req.headers.get("if-none-match") === etag) {
       return new Response(null, { status: 304, headers: { ETag: etag, ...SESSION_LIST_HEADERS } });

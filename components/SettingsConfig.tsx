@@ -20,6 +20,8 @@ import { useFontSize, type FontSizePreference } from "@/hooks/useFontSize";
 import { useUiScale, type UiScalePreference } from "@/hooks/useUiScale";
 import { useTouchTargets, type TouchTargetsPreference } from "@/hooks/useTouchTargets";
 import { useRecentRunsLimit, type RecentRunsLimitPreset } from "@/hooks/useRecentRunsLimit";
+import { useChatMinimapPreference, type DesktopMinimapMode } from "@/hooks/useChatMinimapPreference";
+import { useTranscriptPreference } from "@/hooks/useTranscriptPreference";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 import { useNotificationPrefs } from "@/hooks/useNotifications";
 import { NOTIFICATION_TYPES, renderNotification, type NotificationType } from "@/lib/notification-events";
@@ -165,6 +167,10 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   { id: "hide-tool-activity", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.hideToolActivity", descKey: "settingsConfig.hideToolActivityDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Hide tool activity while working", fallbackDesc: "Fold a running turn's tool calls into one Process details row, the same way a finished turn folds them. Expand the row to see each call and its result.", scope: "UI" },
   { id: "show-tool-calls-unfolded", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.showToolCallsUnfolded", descKey: "settingsConfig.showToolCallsUnfoldedDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Show tool calls outside Process details", fallbackDesc: "Keep each tool call's row visible in the transcript instead of folding it into Process details. Whether the row opens is still set by \"Keep tool calls collapsed\".", scope: "UI" },
   { id: "never-fold-activity", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.neverFoldActivity", descKey: "settingsConfig.neverFoldActivityDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Never fold tool activity", fallbackDesc: "Show thinking, tool calls and notices as their own rows in every turn instead of folding them into Process details. Overrides \"Hide tool activity while working\".", scope: "UI" },
+  { id: "chat-outline-desktop", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.chatOutlineDesktop", descKey: "settingsConfig.chatOutlineDesktopDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Desktop Chat Outline", fallbackDesc: "Choose how the conversation outline appears on desktop displays", scope: "UI" },
+  { id: "chat-outline-mobile", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.chatOutlineMobile", descKey: "settingsConfig.chatOutlineMobileDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Mobile Chat Outline Button", fallbackDesc: "Show a floating button on mobile to view the outline and jump between turns", scope: "UI" },
+  { id: "transcript-presentation", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.transcriptPresentation", descKey: "settingsConfig.transcriptPresentationDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Transcript presentation", fallbackDesc: "Focused mode folds completed progress before the final reply. Live, incomplete and failed output stays visible; search reveals folded content.", scope: "UI" },
+  { id: "expand-process-details", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.expandProcessDetailsByDefault", descKey: "settingsConfig.expandProcessDetailsByDefaultDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Expand Process details by default", fallbackDesc: "Open transcript process details automatically in either presentation", scope: "UI" },
   { id: "open-url-automatically", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.openUrlAutomatically", descKey: "settingsConfig.openUrlAutomaticallyDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Open agent links without asking", fallbackDesc: "Links the agent opens from the session you are viewing open in a new tab right away. Links from other sessions always ask first. Your browser may still block pop-ups.", scope: "UI" },
   { id: "scope-native-select-all", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.scopeNativeSelectAll", descKey: "settingsConfig.scopeNativeSelectAllDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Scope native Select All (experimental)", fallbackDesc: "Limit whole-page selections from browser or touch menus to the active message, chat, or file. May also narrow deliberate whole-page selections. Turn off if selection handles or menus misbehave. Keyboard shortcuts are unaffected.", scope: "UI" },
   { id: "tts-autoplay", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.ttsAutoplay", descKey: "settingsConfig.ttsAutoplayDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Auto-read assistant responses", fallbackDesc: "Automatically read aloud new assistant replies when completed.", scope: "UI" },
@@ -291,6 +297,8 @@ function SearchResultsList({ results, query, onSelect }: { results: SearchResult
 function AutoResumeSessionsSetting() {
   const { t } = useI18n();
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   useEffect(() => {
     let alive = true;
     fetch("/api/web-settings")
@@ -300,8 +308,11 @@ function AutoResumeSessionsSetting() {
     return () => { alive = false; };
   }, []);
   const change = async (next: boolean) => {
+    if (enabled === null || savingRef.current) return;
+    savingRef.current = true;
     const previous = enabled;
     setEnabled(next);
+    setSaving(true);
     try {
       const res = await fetch("/api/web-settings", {
         method: "PUT",
@@ -312,11 +323,14 @@ function AutoResumeSessionsSetting() {
     } catch (error) {
       setEnabled(previous);
       toast.error(t("settingsConfig.autoResumeSessionsSaveFailed"), error instanceof Error ? error.message : String(error));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   };
   return (
     <NativeSetting searchId="auto-resume-sessions" label={t("settingsConfig.autoResumeSessions")} description={t("settingsConfig.autoResumeSessionsDesc")}>
-      <ToggleSwitch checked={enabled === true} disabled={enabled === null} onChange={(next) => void change(next)} />
+      <ToggleSwitch checked={enabled === true} disabled={enabled === null || saving} onChange={(next) => void change(next)} />
     </NativeSetting>
   );
 }
@@ -326,6 +340,8 @@ function AutoResumeSessionsSetting() {
 function AgentToolsSetting() {
   const { t } = useI18n();
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   useEffect(() => {
     let alive = true;
     fetch("/api/web-settings")
@@ -335,8 +351,11 @@ function AgentToolsSetting() {
     return () => { alive = false; };
   }, []);
   const change = async (next: boolean) => {
+    if (enabled === null || savingRef.current) return;
+    savingRef.current = true;
     const previous = enabled;
     setEnabled(next);
+    setSaving(true);
     try {
       const res = await fetch("/api/web-settings", {
         method: "PUT",
@@ -347,11 +366,14 @@ function AgentToolsSetting() {
     } catch (error) {
       setEnabled(previous);
       toast.error(t("settingsConfig.agentToolsSaveFailed"), error instanceof Error ? error.message : String(error));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
     }
   };
   return (
     <NativeSetting searchId="agent-tools-cross-session" label={t("settingsConfig.agentTools")} description={t("settingsConfig.agentToolsDesc")}>
-      <ToggleSwitch checked={enabled === true} disabled={enabled === null} onChange={(next) => void change(next)} />
+      <ToggleSwitch checked={enabled === true} disabled={enabled === null || saving} onChange={(next) => void change(next)} />
     </NativeSetting>
   );
 }
@@ -900,6 +922,8 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const { fontSize, setFontSize } = useFontSize();
   const { uiScale, setUiScale } = useUiScale();
   const { touchTargets, setTouchTargets } = useTouchTargets();
+  const { desktopMode, mobileFab, setDesktopMode, setMobileFab } = useChatMinimapPreference();
+  const { presentation, expandProcessDetails, setPresentation, setExpandProcessDetails } = useTranscriptPreference();
   const {
     preset: recentRunsPreset,
     customValue: recentRunsCustomValue,
@@ -1290,6 +1314,25 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                   </NativeSetting>
                   <NativeSetting searchId="never-fold-activity" label={t("settingsConfig.neverFoldActivity")} description={t("settingsConfig.neverFoldActivityDesc")} scope="UI">
                     <ToggleSwitch checked={neverFoldActivity} onChange={onNeverFoldActivityChange} />
+                  </NativeSetting>
+                  <NativeSetting searchId="chat-outline-desktop" label={t("settingsConfig.chatOutlineDesktop")} description={t("settingsConfig.chatOutlineDesktopDesc")} scope="UI">
+                    <select style={nativeSelectStyle} value={desktopMode} onChange={(event) => setDesktopMode(event.target.value as DesktopMinimapMode)}>
+                      <option value="rail" style={nativeOptionStyle}>{t("settingsConfig.chatOutlineDesktopRail")}</option>
+                      <option value="fab" style={nativeOptionStyle}>{t("settingsConfig.chatOutlineDesktopFab")}</option>
+                      <option value="off" style={nativeOptionStyle}>{t("settingsConfig.chatOutlineDesktopOff")}</option>
+                    </select>
+                  </NativeSetting>
+                  <NativeSetting searchId="chat-outline-mobile" label={t("settingsConfig.chatOutlineMobile")} description={t("settingsConfig.chatOutlineMobileDesc")} scope="UI">
+                    <ToggleSwitch checked={mobileFab} onChange={setMobileFab} />
+                  </NativeSetting>
+                  <NativeSetting searchId="transcript-presentation" label={t("settingsConfig.transcriptPresentation")} description={t("settingsConfig.transcriptPresentationDesc")} scope="UI">
+                    <select style={nativeSelectStyle} value={presentation} onChange={(event) => setPresentation(event.target.value === "focused" ? "focused" : "classic")}>
+                      <option value="classic" style={nativeOptionStyle}>{t("settingsConfig.transcriptClassic")}</option>
+                      <option value="focused" style={nativeOptionStyle}>{t("settingsConfig.transcriptFocused")}</option>
+                    </select>
+                  </NativeSetting>
+                  <NativeSetting searchId="expand-process-details" label={t("settingsConfig.expandProcessDetailsByDefault")} description={t("settingsConfig.expandProcessDetailsByDefaultDesc")} scope="UI">
+                    <ToggleSwitch checked={expandProcessDetails} onChange={setExpandProcessDetails} />
                   </NativeSetting>
                   <NativeSetting searchId="scope-native-select-all" label={t("settingsConfig.scopeNativeSelectAll")} description={t("settingsConfig.scopeNativeSelectAllDesc")} scope="UI">
                     <ToggleSwitch checked={scopeNativeSelectAll} onChange={onScopeNativeSelectAllChange} />

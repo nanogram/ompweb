@@ -60,7 +60,7 @@ interface PendingCommand {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   timer?: NodeJS.Timeout;
-  onReply?: (success: boolean, id: string) => void;
+  onReply?: (success: boolean, id: string, data: unknown) => void;
 }
 
 export interface RpcProcessOptions {
@@ -125,6 +125,7 @@ export class RpcProcess {
   readonly transport: RpcTransport;
   private readonly exitedPromise: Promise<void>;
   private readonly pending = new Map<string, PendingCommand>();
+  private readonly pendingFrameWrites = new Set<(error: Error) => void>();
   private readonly frameListeners = new Set<(frame: RpcFrame) => void>();
   private readyPromise: Promise<RpcFrame>;
   private readonly resolveReady: (frame: RpcFrame) => void;
@@ -201,6 +202,8 @@ export class RpcProcess {
         entry.reject(exitError);
       }
       this.pending.clear();
+      for (const reject of this.pendingFrameWrites) reject(exitError);
+      this.pendingFrameWrites.clear();
       exitDeferred.resolve();
       options.onExit?.({ code, signal, stderrTail: this.stderrTail });
     });
@@ -336,7 +339,7 @@ export class RpcProcess {
    * keeps the event loop alive on its own. `onReply` runs synchronously when
    * the response is read, before any frame after it is dispatched; it is told whether the command succeeded and its
    * wire id (what omp's `prompt_result` names). */
-  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, onReply?: (success: boolean, id: string) => void): Promise<T> {
+  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, onReply?: (success: boolean, id: string, data: unknown) => void): Promise<T> {
     if (this.exited) {
       return Promise.reject(new Error("omp RPC process has exited"));
     }
@@ -384,6 +387,20 @@ export class RpcProcess {
     this.writeFrame(frame, () => {});
   }
 
+  /** Resolves after the transport accepted the write, not a native dialog acknowledgement. */
+  sendFrameAsync(frame: { type: string; [key: string]: unknown }): Promise<void> {
+    if (this.exited) return Promise.reject(new Error("omp RPC process has exited"));
+    if (this.heldOverflow) return Promise.reject(this.heldOverflow);
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    this.pendingFrameWrites.add(reject);
+    this.writeFrame(frame, (error) => {
+      this.pendingFrameWrites.delete(reject);
+      if (error) reject(error);
+      else resolve();
+    });
+    return promise;
+  }
+
   private writeFrame(frame: RpcFrame, callback: (error?: Error | null) => void): void {
     let line: string;
     try {
@@ -394,19 +411,24 @@ export class RpcProcess {
     }
     // Commands are serialized so two of them never interleave on the pipe and a
     // failed write cannot reorder the responses callers are awaiting.
-    this.writeQueue = this.writeQueue.then(
-      () => new Promise<void>((resolve) => {
-        if (this.exited) {
-          callback(new Error("RPC process is not running"));
-          resolve();
-          return;
-        }
+    this.writeQueue = this.writeQueue.then(() => {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      if (this.exited) {
+        callback(new Error("RPC process is not running"));
+        resolve();
+        return promise;
+      }
+      try {
         this.transport.write(line, (error) => {
           callback(error ?? null);
           resolve();
         });
-      }),
-    );
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+        resolve();
+      }
+      return promise;
+    });
   }
 
   private handleResponse(response: RpcResponseFrame): void {
@@ -421,7 +443,14 @@ export class RpcProcess {
     }
     this.pending.delete(id);
     if (entry.timer) clearTimeout(entry.timer);
-    entry.onReply?.(response.success === true, id);
+    try {
+      entry.onReply?.(response.success === true, id, response.data);
+    } catch (error) {
+      // The correlation has been consumed: a callback failure must settle its
+      // caller too, rather than leave an untimed promise waiting forever.
+      entry.reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
     if (response.success) {
       entry.resolve(response.data);
     } else {

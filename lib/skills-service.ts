@@ -313,9 +313,7 @@ async function discoverSkillsViaCli(cwd: string, ompBin: string | null): Promise
   const missKey = `${versionFingerprint(ompBin) ?? ompBin}\0${cwdPath}`;
   const now = Date.now();
   if ((skillsCliMisses.get(missKey) ?? 0) > now) return undefined;
-  // Windows .cmd/.bat launchers need cmd.exe, as in the version probe. The
-  // directory goes in as the process cwd, never as an argument: cmd.exe would
-  // interpret `&` and friends in a directory name.
+  // Use the shared Windows launcher quoting, with the directory kept as cwd.
   const target = wrapWindowsScript(ompBin, ["skill", "list", "--json"]);
   try {
     const { stdout } = await execFileAsync(target.file, target.args, {
@@ -323,6 +321,7 @@ async function discoverSkillsViaCli(cwd: string, ompBin: string | null): Promise
       timeout: SKILLS_CLI_TIMEOUT_MS,
       maxBuffer: 16 * 1024 * 1024,
       windowsHide: true,
+      windowsVerbatimArguments: target.windowsVerbatimArguments,
       // Otherwise this child inherits the server's full environment,
       // including omp-web's own secrets.
       env: createChildProcessEnvironment(),

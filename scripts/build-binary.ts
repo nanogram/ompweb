@@ -6,6 +6,7 @@ import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { bundledPackageDirs, writeLicenses } from "./licenses";
+import { buildUsageWorker } from "./build-usage-worker";
 
 const root = path.join(import.meta.dir, "..");
 const { values } = parseArgs({ args: Bun.argv.slice(2), options: { target: { type: "string" } } });
@@ -43,6 +44,13 @@ const result = await Bun.build({
 for (const log of result.logs) console.log(log);
 if (!result.success) process.exit(1);
 
+// Workers execute a real file: copying only usage-worker.ts would leave its
+// DB/parser/YAML imports missing from compiled installs. Ship one complete
+// Bun-targeted module and account for its bundled dependency licenses below.
+const workerResult = await buildUsageWorker(root, path.join(out, "lib"));
+for (const log of workerResult.logs) console.log(log);
+if (!workerResult.success) process.exit(1);
+
 // The static root (server/binary.ts): the client, the public files, the extension the daemon hands omp, the KaTeX CSS
 // and fonts (where the server resolves the katex package), and the licenses of what ships.
 const copy = (from: string, to: string) => cpSync(from, path.join(out, to), { recursive: true });
@@ -51,7 +59,11 @@ for (const file of new Bun.Glob("app/fonts/*-{OFL.txt,LICENSE.*}").scanSync(root
 const katex = path.dirname(Bun.resolveSync("katex/package.json", root));
 for (const file of ["package.json", "LICENSE", "dist/katex.min.css", "dist/fonts"]) copy(path.join(katex, file), `node_modules/katex/${file}`);
 const clientPackages = (JSON.parse(readFileSync(clientPackagesFile, "utf8")) as string[]).map((dir) => path.resolve(root, dir));
-writeLicenses(out, [...new Set([...bundledPackageDirs(result.metafile!, process.cwd()), ...clientPackages])].sort(), bunLicense);
+writeLicenses(out, [...new Set([
+  ...bundledPackageDirs(result.metafile!, process.cwd()),
+  ...bundledPackageDirs(workerResult.metafile!, process.cwd()),
+  ...clientPackages,
+])].sort(), bunLicense);
 
 // Bun.Archive writes every entry as 0644 (the binary would lose its execute bit) and makes no zip: the system tools do.
 // On Windows that is its own bsdtar, which makes zips: a GNU tar from Git Bash on PATH makes none.

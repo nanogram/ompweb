@@ -24,20 +24,13 @@ though the server now runs on Bun: live work goes through the installed `omp`
 child. See `DESIGN.md` for the full porting contract.
 
 ```
-Browser              Bun server (server/app.ts)          omp child process
-  │                        │                                    │
-  ├─ GET /api/sessions ────▶ reads ~/.omp/agent/sessions/       │
-  ├─ GET /api/sessions/[id] reads .jsonl file directly          │
-  ├─ SharedWorker ── GET /api/events ──▶ ONE multiplexed SSE per browser │
-  │   (all tabs)     POST /api/events ─▶ subscribe running/session/file  │
-  │                        │                                    │
-  ├─ send message ─────────▶ POST /api/agent/[id]               │
-  │                        │   startRpcSession() ── spawn ─────▶│ omp --mode rpc-ui
-  │                        │   sendCommand({type:"prompt"}) ───▶│ (NDJSON stdio)
-  │                        │                                    │
-  ├─ session subscription ─▶ event-stream-hub onEvent()            │
-  │                        │   onFrame() ◀── event frames ──────│
-  │◀── event: s<n> data: {...} ──│                               │
+Browser              Bun web server           Owning host daemon          omp
+  │                        │                          │                     │
+  ├─ GET session history ─▶ host.sessionOps ──────────▶ read/cache JSONL     │
+  ├─ shared browser link ─▶ event-stream-hub           │                     │
+  ├─ persisted message ───▶ message-outbox             │                     │
+  │                        └─ session wrapper/transport ─▶ shared channel ───▶ RPC
+  │◀── ordered snapshots and live events ◀─────────────┴─────────────────────┘
 ```
 
 The launcher (`bin/omp-web.js`) and the host daemon (`bin/omp-web-host.js`)
@@ -48,14 +41,13 @@ process. Nothing in the daemon or tray may use a Bun API. The compiled binary
 (`server/binary.ts`) is the exception: one Bun program that runs the server in
 its own process (no launcher), `ompweb host` and `ompweb hash-password`.
 
-**Session browsing** (read-only): pure-Node parsing of omp session `.jsonl`
-files via `lib/session-reader.ts` — no child process involved.  
-**Sending a message**: `startRpcSession()` in `lib/rpc-manager.ts` asks the
-session's `Host` (`lib/hosts/host.ts`; `localHost` in `lib/hosts/local-host.ts`)
-to spawn `omp --mode rpc-ui` (one process per active session) and runs
-`lib/omp/rpc-process.ts` over the returned transport. Every machine-local
-action of a session wrapper (spawn, session-file checks, list invalidation)
-goes through that host.
+**Session browsing** (read-only): the owning daemon parses omp session `.jsonl`
+files through `host.sessionOps` and `lib/session-reader.ts`; the web server
+does not substitute its own files for an unavailable host.
+**Sending a message**: the durable outbox owns accepted existing-chat sends.
+`startRpcSession()` in `lib/rpc-manager.ts` joins or starts the session through
+its host transport. The host owns one native process per active conversation;
+browser navigation does not own or cancel that process or its accepted sends.
 
 Shared foundations in `lib/omp/`:
 
@@ -102,6 +94,9 @@ app/api/
   transport-metrics/route.ts      GET { now } (the SSE clock probe) | POST { samples } → <agent dir>/omp-web/transport-metrics.jsonl
   hosts/route.ts                  GET hosts (this machine first) | POST { label } → token once + login command | PATCH { id, label?, allowAgentStart? } (`local`: label only, empty resets to "This machine") | DELETE ?id= revoke (registry first, then close the link); 503 if hosts.json is unreadable
   hosts/link/route.ts             GET WebSocket upgrade (the `ompweb host` daemon; bearer checked before the upgrade, skipped by the `proxy.ts` gate) | POST 426 for pre-WebSocket daemons
+  app-info/route.ts                GET native-client capability handshake
+  sessions/messages/search/route.ts GET bounded local user/assistant substring search
+  notifications/answer/route.ts    POST {sessionId, requestId, response}; live dialogs only, never spawns omp
   notifications/devices/route.ts  GET VAPID key + subscribed | PUT { deviceId, prefs, subscription? }
   notifications/presence/route.ts POST { clientId, deviceId, visible, sessionId, seq }
   notifications/test/route.ts     POST { deviceId } send a test push (502 on push-service refusal)
@@ -185,6 +180,11 @@ lib/
   notification-client.ts  browser: device id, prefs store, service worker + push subscription
   rpc-manager.ts       session registry + startRpcSession over RpcProcess (spawn via a Host)
   session-reader.ts    session .jsonl parsing + path cache + buildSessionContext
+  queue-progress.ts    bounded finished display ledger over OMP's authoritative pending queue
+  goal-state.ts        defensive native goal snapshots and command/event reconciliation
+  chat-transcript-plan.ts shared Classic/Focused rows used by rendering, outline and search
+  session-message-search.ts bounded cursor-paged canonical user/assistant text scan
+  usage-report-worker.ts coalescing worker requests; usage-worker.ts worker entry; build-usage-worker.ts bundles release dependencies
   session-search.ts    shared fuzzy/phrase query scorer for sidebar search (title weights ≫ transcript)
   session-content-search.ts  server: per-file transcript text cache (size+mtime) + searchSessions()
   session-search-matches.ts  shared types/constants of the sidebar's per-session search hits
@@ -751,6 +751,19 @@ omp emits no `prompt_done` / `prompt_error` / `compaction_start` /
 errors surface as failed RPC responses plus `notice` events.
 New frame types (`turn_start/end`, `notice`, `todo_reminder`, ...) must be
 handled or safely ignored.
+
+### Native goals and transcript preferences
+- `/goal` uses native `goal` commands and `goal_updated`/`get_state` state, never a
+  sessionStorage simulation. Runtime command catalogs take precedence over web
+  prompt expansions; goal mutations obey cross-client history-edit leases.
+- `useTranscriptPreference` keeps Classic as the default. Focused mode folds only
+  completed progress; errors, incomplete turns and live output stay reachable.
+  Rendering, outline and search share `chat-transcript-plan.ts`; a jump reveals
+  lazy/folded rows before scrolling. `useChatMinimapPreference` controls desktop
+  rail/FAB/off and the independent mobile FAB.
+- Queue progress never replaces native queue authority. The server retains at
+  most 100 finished display entries and 256 KiB of their UTF-16 text; active and
+  pending entries are never trimmed. Epoch/sequence checks reject stale snapshots.
 
 ### Queued messages are omp-owned
 The queue panel renders omp's snapshot only: `get_state.queuedMessages` on
@@ -1615,12 +1628,22 @@ during the wait.
   leak it); else if a visible tab with an open stream exists, `whenActive:
   "toast"` devices get a toast on their active tabs only; else push (subscribed
   devices) or in-page `showNotification` (tabs with an open stream).
+  Without a presence row, a registered device's declared open notification
+  stream remains deliverable; an unknown device claim grants no routing.
 - The server decides before pushing: iOS revokes push permission for pushes
   that display nothing, so `public/sw.js` always shows what it receives.
 - Notifications have their own `notifications` channel (`clientId` = the
   tab's notification client id), opened by `useNotifications` in `AppShell`,
   so a tab stays reachable on every view, Settings included. A tab on
   Settings is visible, so it also counts as active.
+- `/api/app-info` advertises notification answer/dismiss support and optional
+  presence. Heartbeat overrides belong to one event connection, not global state.
+- `/api/notifications/answer` uses `answerExtensionUiRequest`, also used by chat:
+  validate the response, await transport-write success, then clear pending UI.
+  Duplicate/stale answers never repeat a response; session aliases remain scoped
+  to the same live wrapper. Settlement publishes dismissal, including expiry and
+  cancellation. Connected Apple clients retract through their stream; do not send
+  silent Apple pushes to retract offline notifications.
 - Prefs and push subscriptions are per device, in `localStorage` and mirrored to
   the SQLite notification store in omp-web's data dir
   (`lib/notification-store.ts`, server-only; mode 0600 because it also holds

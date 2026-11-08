@@ -31,8 +31,8 @@ export const UNKNOWN_CONNECTION_CODE = "unknown_connection";
 
 export type EventStreamChannel =
   | { kind: "running" }
-  /** Notifications the server routes to the tab with this notification client id. */
-  | { kind: "notifications"; clientId: string }
+  /** Device is optional for legacy streams, but declared devices must be registered. */
+  | { kind: "notifications"; clientId: string; deviceId?: string }
   | { kind: "session"; sessionId: string }
   | { kind: "file"; path: string; hostId?: string; sessionId: string | null }
   /** Host tool calls (open_url, notify, open_file) from sessions no tab is watching. */
@@ -90,6 +90,7 @@ export const NO_OMP_REPLY_COMMANDS: ReadonlySet<string> = new Set([
   "predict_word", "predict_word_feedback", "get_btw_history", "btw_cancel",
   "host_tool_result", "host_uri_result", "extension_ui_response",
   "outbox_add", "outbox_remove", "outbox_scope",
+  "dismiss_queue_progress",
 ]);
 
 const REPEATABLE_COMMANDS = ["predict_word", "predict_word_feedback", "set_host_tools", "set_host_uri_schemes", "outbox_add", "outbox_remove", "outbox_scope"];
@@ -128,8 +129,13 @@ export function parseEventStreamChannel(value: unknown): EventStreamChannel | nu
   switch (channel.kind) {
     case "running":
       return { kind: "running" };
-    case "notifications":
-      return isValidNotificationId(channel.clientId) ? { kind: "notifications", clientId: channel.clientId } : null;
+    case "notifications": {
+      if (!isValidNotificationId(channel.clientId)) return null;
+      if (channel.deviceId === undefined) return { kind: "notifications", clientId: channel.clientId };
+      return isValidNotificationId(channel.deviceId)
+        ? { kind: "notifications", clientId: channel.clientId, deviceId: channel.deviceId }
+        : null;
+    }
     case "host-tools":
       return { kind: "host-tools" };
     case "hosts":

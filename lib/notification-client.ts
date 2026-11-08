@@ -195,6 +195,25 @@ async function subscribeForPush(): Promise<boolean> {
 /** Window event (detail: session id) asking the app to open a notification's session. */
 export const OPEN_SESSION_EVENT = "omp-open-session";
 
+/** Desktop notifications created without a worker still need cross-tab retraction. */
+const pageNotifications = new Map<string, Notification>();
+
+export async function dismissSystemNotification(tag: string, requestId: string, remember = true): Promise<void> {
+  const page = pageNotifications.get(tag);
+  if (page?.data?.requestId === requestId) {
+    page.close();
+    pageNotifications.delete(tag);
+  }
+  try {
+    const registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : undefined;
+    if (remember) registration?.active?.postMessage({ type: "omp-notification-dismiss", tag, requestId });
+    const shown = await registration?.getNotifications({ tag }) ?? [];
+    for (const notification of shown) if (notification.data?.requestId === requestId) notification.close();
+  } catch {
+    // A stopped worker must not break retraction of a page notification.
+  }
+}
+
 /**
  * Show a system notification the same way the service worker shows pushes.
  * Returns false when the browser does not allow it, so the caller can fall back.
@@ -206,16 +225,24 @@ export async function showSystemNotification(notification: RenderedNotification)
     icon: "/icon-192.png",
     badge: "/badge-96.png",
     tag: notification.tag,
-    data: { url: notification.url, sessionId: notification.sessionId },
+    data: {
+      url: notification.url, sessionId: notification.sessionId,
+      requestId: notification.requestId, dialog: notification.dialog, responses: notification.responses,
+    },
   };
   try {
     const registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : undefined;
     if (registration) {
-      await registration.showNotification(notification.title, options);
+      await registration.showNotification(notification.title, { ...options, ...(notification.actions ? { actions: notification.actions } : {}) });
       return true;
     }
     // No worker: Chrome on Android throws here, desktop browsers show it.
     const fallback = new Notification(notification.title, options);
+    pageNotifications.get(notification.tag)?.close();
+    pageNotifications.set(notification.tag, fallback);
+    fallback.onclose = () => {
+      if (pageNotifications.get(notification.tag) === fallback) pageNotifications.delete(notification.tag);
+    };
     fallback.onclick = () => {
       fallback.close();
       window.focus();

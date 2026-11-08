@@ -60,7 +60,7 @@ afterEach(() => {
 });
 
 /** A composer with an image and a text file attached through the picker path. */
-async function renderWithAttachments({ queued = true, queueCallbacks = true, ...props } = {}) {
+async function renderWithAttachments({ queued = true, queueCallbacks = true, attachments = true, ...props } = {}) {
   const calls = [];
   // Images are the last argument of every queue callback, which resolves
   // false when omp refused the message.
@@ -81,17 +81,19 @@ async function renderWithAttachments({ queued = true, queueCallbacks = true, ...
     ...props,
   };
   const view = render(React.createElement(ChatInput, inputProps));
-  await act(async () => {
-    ref.current.addFiles([
-      new File([Buffer.from(PNG, "base64")], "dot.png", { type: "image/png" }),
-      new File(["hello"], "notes.txt", { type: "text/plain" }),
-    ]);
-  });
-  await waitFor(() => {
-    const draft = getDraft(KEY);
-    assert.equal(draft?.images.length, 1, "the image is attached");
-    assert.equal(draft?.files.length, 1);
-  });
+  if (attachments) {
+    await act(async () => {
+      ref.current.addFiles([
+        new File([Buffer.from(PNG, "base64")], "dot.png", { type: "image/png" }),
+        new File(["hello"], "notes.txt", { type: "text/plain" }),
+      ]);
+    });
+    await waitFor(() => {
+      const draft = getDraft(KEY);
+      assert.equal(draft?.images.length, 1, "the image is attached");
+      assert.equal(draft?.files.length, 1);
+    });
+  }
   return {
     calls,
     ref,
@@ -160,12 +162,89 @@ test("a queued web slash command is expanded and keeps the attachments", async (
   window.HTMLElement.prototype.scrollIntoView = () => {};
   const user = userEvent.setup();
   const calls = await renderRunningWithAttachments();
-  await user.type(screen.getByRole("textbox"), "/goal ship it");
+  await user.type(screen.getByRole("textbox"), "/plan ship it");
   await user.keyboard("{Enter}");
   await waitFor(() => assert.equal(calls.length, 1));
   delete window.HTMLElement.prototype.scrollIntoView;
   assert.equal(calls[0].name, "onFollowUp", "a slash command is held like any follow-up; the server sends it as a prompt");
-  assertQueuedWithAttachments(calls[0], expandWebSlashCommand("/goal ship it").prompt);
+  assertQueuedWithAttachments(calls[0], expandWebSlashCommand("/plan ship it").prompt);
+});
+
+test("a queued /goal runs the native goal RPC instead of entering the prompt queue", async () => {
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  const user = userEvent.setup();
+  const builtins = [];
+  const calls = await renderRunningWithAttachments({
+    attachments: false,
+    onBuiltinCommand: async (message) => {
+      builtins.push(message);
+      return { handled: true };
+    },
+  });
+  await user.type(screen.getByRole("textbox"), "/goal ship it");
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.deepEqual(builtins, ["/goal ship it"]));
+  delete window.HTMLElement.prototype.scrollIntoView;
+  assert.equal(calls.length, 0, "no prompt is queued");
+  await waitFor(() => assert.equal(getDraft(KEY), null));
+});
+
+test("a queued /goal with attachments is refused and keeps the draft", async () => {
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  const user = userEvent.setup();
+  const builtins = [];
+  const calls = await renderRunningWithAttachments({
+    onBuiltinCommand: async (message) => {
+      builtins.push(message);
+      return { handled: true };
+    },
+  });
+  await user.type(screen.getByRole("textbox"), "/goal ship it");
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.equal(screen.getByRole("textbox").value, "/goal ship it"));
+  delete window.HTMLElement.prototype.scrollIntoView;
+  assert.deepEqual(builtins, [], "no goal RPC with attachments");
+  assert.equal(calls.length, 0, "no prompt is queued");
+  assert.equal(getDraft(KEY)?.images.length, 1);
+  assert.equal(getDraft(KEY)?.files.length, 1);
+});
+
+test("an idle /goal with attachments is refused and keeps the draft", async () => {
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  const user = userEvent.setup();
+  const builtins = [];
+  const calls = await renderRunningWithAttachments({
+    isStreaming: false,
+    onBuiltinCommand: async (message) => {
+      builtins.push(message);
+      return { handled: true };
+    },
+  });
+  await user.type(screen.getByRole("textbox"), "/goal ship it");
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.equal(screen.getByRole("textbox").value, "/goal ship it"));
+  delete window.HTMLElement.prototype.scrollIntoView;
+  assert.deepEqual(builtins, [], "no goal RPC with attachments");
+  assert.equal(calls.length, 0, "no prompt is sent");
+  assert.equal(getDraft(KEY)?.images.length, 1);
+  assert.equal(getDraft(KEY)?.files.length, 1);
+});
+
+test("a catalog-owned /goal is forwarded to onSend", async () => {
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  const user = userEvent.setup();
+  const calls = await renderRunningWithAttachments({
+    attachments: false,
+    isStreaming: false,
+    slashCommands: [{ name: "goal", source: "extension", description: "extension goal" }],
+    onBuiltinCommand: async () => ({ handled: false }),
+  });
+  await user.type(screen.getByRole("textbox"), "/goal ship it");
+  await user.keyboard("{Enter}");
+  await waitFor(() => assert.equal(calls.length, 1));
+  delete window.HTMLElement.prototype.scrollIntoView;
+  assert.equal(calls[0].name, "onSend");
+  assert.equal(calls[0].message, "/goal ship it");
 });
 
 test("a queued message stays in the composer until the outbox has it, and stays whole when refused", async () => {
@@ -577,7 +656,7 @@ test("recovered images past the attachment cap all stay in the composer", async 
 // Keep the real useDictation hook: only browser capture and the STT job API
 // are controlled. Polls expose status; only the owner's claim returns text
 // and the send intent, matching the server job boundary.
-function installPendingDictation({ holdUpload = false, holdClaim = false, after = "send" } = {}) {
+function installPendingDictation({ holdUpload = false, holdClaim = false, after = "send", text = "transcribed words" } = {}) {
   const uploads = [];
   const polls = [];
   const claims = [];
@@ -647,7 +726,7 @@ function installPendingDictation({ holdUpload = false, holdClaim = false, after 
       await claimReady;
       return response({
         status: "done",
-        text: "transcribed words",
+        text,
         after: claim.owner === uploads[0]?.owner ? after : undefined,
       });
     }

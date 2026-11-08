@@ -3,7 +3,8 @@ import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-const { ChatMinimap, extractPreviewText, getBarWidth, getTooltipTopPx, railIndexForPointer, railOverflows } = await import("./ChatMinimap.tsx");
+const { ChatMinimap, getBarWidth, getTooltipTopPx, railIndexForPointer, railOverflows } = await import("./ChatMinimap.tsx");
+const { extractPreviewText } = await import("../hooks/useChatOutline.ts");
 
 test("extractPreviewText extracts clean text from user string content", () => {
   const preview = extractPreviewText({
@@ -55,6 +56,7 @@ test("renders minimal context navigation rail with interactive buttons for user 
       messages,
       scrollContainer,
       messageRefs,
+      onEnsureVisible() {},
     })
   );
 
@@ -73,6 +75,7 @@ test("renders nothing when messages list is empty", () => {
       messages: [],
       scrollContainer,
       messageRefs,
+      onEnsureVisible() {},
     })
   );
 
@@ -93,6 +96,7 @@ test("falls back to assistant messages when no user prompts exist", () => {
       messages,
       scrollContainer,
       messageRefs,
+      onEnsureVisible() {},
     })
   );
 
@@ -118,6 +122,7 @@ test("rail rows do not shrink below the row height (#251)", () => {
       messages,
       scrollContainer: { current: null },
       messageRefs: { current: [] },
+      onEnsureVisible() {},
     })
   );
   assert.match(html, /flex-shrink:0/);
@@ -142,6 +147,7 @@ test("rail is always scrollable, even with few rows on a short viewport (#251 fo
       messages,
       scrollContainer: { current: null },
       messageRefs: { current: [] },
+      onEnsureVisible() {},
     })
   );
   assert.match(html, /overflow-y:auto/);

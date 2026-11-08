@@ -6,6 +6,8 @@ import { isLinkUp } from "./hosts/host";
 import { HostOpError } from "./hosts/link-protocol";
 import type { WorkspaceFileEvent } from "./workspace-types";
 import { attachNotificationClient } from "./notification-hub";
+import { getDevice } from "./notification-store";
+import { isValidNotificationId } from "./notification-events";
 import { getExitedRpcSessions, getRpcSession, getRunningRpcSessions, subscribeHostToolCalls, subscribeRunningSessions, type AgentSessionWrapper } from "./rpc-manager";
 import { onOutboxChange, outboxEntries, outboxSettledIds } from "./message-outbox";
 import { subscribeSessionFileChanges } from "./session-watcher";
@@ -27,6 +29,16 @@ import { isRecord } from "./type-guards";
 
 // Heartbeat keeps the socket alive through reverse proxies that drop silent connections.
 const HEARTBEAT_MS = 30_000;
+export const MIN_HEARTBEAT_SECONDS = 15;
+export const MAX_HEARTBEAT_SECONDS = 110;
+
+/** Invalid or out-of-range values retain the default; no exponent/fraction syntax. */
+export function parseHeartbeatSeconds(value: string | null | undefined): number {
+  if (typeof value !== "string" || !/^\d{1,4}$/.test(value.trim())) return HEARTBEAT_MS / 1000;
+  const seconds = Number(value.trim());
+  return seconds >= MIN_HEARTBEAT_SECONDS && seconds <= MAX_HEARTBEAT_SECONDS ? seconds : HEARTBEAT_MS / 1000;
+}
+
 const encoder = new TextEncoder();
 
 export type SubscribeResult =
@@ -85,11 +97,12 @@ export interface FrameSink {
 }
 
 class SseSink implements FrameSink {
-  readonly heartbeatMs = HEARTBEAT_MS;
+  readonly heartbeatMs: number;
   readonly stream: ReadableStream<Uint8Array>;
   private controller!: ReadableStreamDefaultController<Uint8Array>;
 
-  constructor(onPull: () => void, onCancel: () => void) {
+  constructor(onPull: () => void, onCancel: () => void, heartbeatMs = HEARTBEAT_MS) {
+    this.heartbeatMs = heartbeatMs;
     this.stream = new ReadableStream<Uint8Array>({
       start: (controller) => { this.controller = controller; },
       // A slow consumer resumed reading: deliver coalesced updates now rather
@@ -149,13 +162,13 @@ export class EventStreamConnection {
   private readonly subscriptions = new Map<string, Subscription>();
   private readonly signal: AbortSignal | undefined;
 
-  constructor(signal?: AbortSignal, sink?: FrameSink) {
+  constructor(signal?: AbortSignal, sink?: FrameSink | { heartbeatMs?: number }) {
     this.signal = signal;
-    if (sink) {
+    if (sink && "write" in sink) {
       this.sink = sink;
       this.stream = null;
     } else {
-      const sse = new SseSink(() => this.resume(), () => this.close());
+      const sse = new SseSink(() => this.resume(), () => this.close(), sink?.heartbeatMs ?? HEARTBEAT_MS);
       this.sink = sse;
       this.stream = sse.stream;
     }
@@ -184,6 +197,10 @@ export class EventStreamConnection {
 
   get isClosed(): boolean {
     return this.closed;
+  }
+
+  get heartbeatMs(): number {
+    return this.sink.heartbeatMs;
   }
 
   get subscriptionCount(): number {
@@ -350,7 +367,7 @@ async function openChannel(channel: EventStreamChannel, handle: SubscriptionHand
     case "running":
       return openRunningChannel(handle);
     case "notifications":
-      return openNotificationsChannel(channel.clientId, handle);
+      return openNotificationsChannel(channel.clientId, channel.deviceId, handle);
     case "session":
       return openSessionChannel(channel.sessionId, handle);
     case "file":
@@ -395,9 +412,18 @@ function openRunningChannel(handle: SubscriptionHandle): SubscribeResult {
 
 // The notifications the server routes to one tab (`clientId`). The tab counts
 // as reachable for toasts and in-page system notifications while this is open.
-function openNotificationsChannel(clientId: string, handle: SubscriptionHandle): SubscribeResult {
+function openNotificationsChannel(clientId: string, deviceId: string | undefined, handle: SubscriptionHandle): SubscribeResult {
+  if (!isValidNotificationId(clientId) || (deviceId !== undefined && !isValidNotificationId(deviceId))) {
+    return { ok: false, status: 400, error: "Invalid notification device or client id", code: "invalid_notification_id" };
+  }
+  if (deviceId !== undefined && !getDevice(deviceId)) {
+    return { ok: false, status: 404, error: "Register the notification device first", code: "unknown_notification_device" };
+  }
+  const detach = attachNotificationClient(clientId, (message) => handle.send(
+    message.kind === "dismiss" ? { type: "notification-dismiss", ...message } : { type: "notification", ...message },
+  ), deviceId);
   handle.open();
-  handle.setDetach(attachNotificationClient(clientId, (message) => handle.send({ type: "notification", ...message })));
+  handle.setDetach(detach);
   return SUBSCRIBED;
 }
 

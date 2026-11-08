@@ -11,11 +11,11 @@ import type { AgentMessage, AssistantContentBlock, AssistantMessage, CustomMessa
  * Rows are appended in transcript order; a row is either:
  * - { kind: "message", index } — one message rendered standalone (messages
  *   before the first anchor, or a turn with nothing to fold)
- * - { kind: "group", userIndex, endIndex, segments } — one anchored turn. Like
- *   the omp TUI, agent text is never hidden: the turn renders as its anchor
- *   followed by `segments` in order, where each run of activity (thinking,
- *   tool calls, notices) between two pieces of text folds into one collapsed
- *   row. A turn stays one row so the render-window math is unchanged.
+ * - { kind: "group", userIndex, endIndex, segments } — one anchored turn.
+ *   The default classic presentation keeps all agent replies visible and
+ *   folds activity (thinking, tools, notices) between them. The optional
+ *   focused presentation also folds completed progress before a final reply.
+ *   A group stays one row, including when its contents expand.
  */
 
 /** A folded activity entry: the listed blocks of an assistant message, or a whole non-assistant message. */
@@ -27,9 +27,11 @@ export type TranscriptSegment =
   | { kind: "text"; index: number; blocks: AssistantContentBlock[]; last: boolean }
   | { kind: "activity"; pieces: ActivityPiece[]; stepCount: number; toolCallCount: number };
 
+export type TranscriptPresentation = "classic" | "focused";
+
 export type TranscriptRow =
   | { kind: "message"; index: number }
-  | { kind: "group"; userIndex: number; endIndex: number; segments: TranscriptSegment[] };
+  | { kind: "group"; userIndex: number; endIndex: number; segments: TranscriptSegment[]; finalReplyIndex?: number };
 
 export interface PlanOptions {
   /** Mirrors omp's `hideThinkingBlock`: drop thinking blocks entirely. */
@@ -40,6 +42,10 @@ export interface PlanOptions {
   showToolCalls?: boolean;
   /** "Never fold tool activity": every turn becomes standalone rows, with no Process details. */
   neverFold?: boolean;
+  /** Opt-in: collect a completed turn's progress before its final reply. */
+  presentation?: TranscriptPresentation;
+  /** The latest turn is still owned by a running process. */
+  running?: boolean;
 }
 
 // A user message normally anchors a turn. When compaction fires mid-turn, pi
@@ -51,6 +57,24 @@ export interface PlanOptions {
 export function isGroupAnchor(message: AgentMessage): boolean {
   if (message.role === "user") return true;
   return message.role === "custom" && (message as CustomMessage).customType === "compaction";
+}
+
+/** Only an explicit successful stop can be presented as a final answer.
+ * Unknown, truncated, cancelled and error output must not disappear in a fold. */
+export function completedTurnReplyIndex(messages: AgentMessage[], start: number, end: number): number | null {
+  for (let index = start + 1; index < end; index++) {
+    const message = messages[index];
+    if (message.role === "assistant" && (message.errorMessage?.trim() || message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length")) return null;
+  }
+  for (let index = end - 1; index > start; index--) {
+    const message = messages[index];
+    if (isPassiveToolContext(message) || (message.role === "custom" && message.customType === "xdev-mount-notice")) continue;
+    if (message.role !== "assistant" || message.stopReason !== "stop" || message.errorMessage?.trim()) return null;
+    const blocks = getDisplayableAssistantBlocks(message);
+    if (blocks.some((block) => block.type === "toolCall")) return null;
+    return blocks.some(isReplyBlock) ? index : null;
+  }
+  return null;
 }
 
 /** Split one anchored turn into text and folded-activity segments. */
@@ -115,7 +139,7 @@ export function planTurnSegments(
     flushOther();
     // A provider error must stay visible: when the message ended in activity,
     // it gets its own (empty) text segment to carry the error.
-    if (assistant.errorMessage?.trim() && segments.at(-1) !== lastText) {
+    if ((assistant.errorMessage?.trim() || assistant.stopReason === "error" || assistant.stopReason === "aborted") && segments.at(-1) !== lastText) {
       lastText = { kind: "text", index: idx, blocks: [], last: false };
       segments.push(lastText);
       activity = null;
@@ -256,9 +280,37 @@ export function planTranscriptRows(messages: AgentMessage[], options: PlanOption
     let endIdx = userIdx + 1;
     while (endIdx < messages.length && !isGroupAnchor(messages[endIdx])) endIdx += 1;
     // "Never fold" plans standalone rows, so the render window counts every message.
-    const segments = options.neverFold ? [] : planTurnSegments(messages, userIdx, endIdx, options);
-    if (segments.some((segment) => segment.kind === "activity")) {
-      rows.push({ kind: "group", userIndex: userIdx, endIndex: endIdx, segments });
+    let segments = options.neverFold ? [] : planTurnSegments(messages, userIdx, endIdx, options);
+    const focused = options.presentation === "focused" && !options.neverFold;
+    const finalIndex = focused && !(options.running && endIdx === messages.length) ? completedTurnReplyIndex(messages, userIdx, endIdx) : null;
+    if (finalIndex !== null) {
+      // Preserve ordering for expanded thinking/tool preferences: those remain
+      // outside the aggregate fold, at their original position in the turn.
+      const progress: ActivityPiece[] = [];
+      let toolCallCount = 0;
+      const flushProgress = (): TranscriptSegment[] => {
+        if (progress.length === 0) return [];
+        const segment: TranscriptSegment = { kind: "activity", pieces: progress.splice(0), stepCount: 0, toolCallCount };
+        segment.stepCount = new Set(segment.pieces.map((piece) => piece.index)).size;
+        toolCallCount = 0;
+        return [segment];
+      };
+      const focusedSegments: TranscriptSegment[] = [];
+      for (const segment of segments) {
+        if (segment.kind === "activity") {
+          progress.push(...segment.pieces);
+          toolCallCount += segment.toolCallCount;
+        } else if (segment.index !== finalIndex && segment.blocks.every(isReplyBlock)) {
+          progress.push({ index: segment.index, blocks: segment.blocks });
+        } else {
+          focusedSegments.push(...flushProgress(), segment);
+        }
+      }
+      focusedSegments.push(...flushProgress());
+      segments = focusedSegments;
+    }
+    if (focused || segments.some((segment) => segment.kind === "activity")) {
+      rows.push({ kind: "group", userIndex: userIdx, endIndex: endIdx, segments, ...(finalIndex === null ? {} : { finalReplyIndex: finalIndex }) });
     } else {
       // Nothing to fold: render the anchor and the rest as standalone messages.
       // Tool results render under their tool call, as in the fold, so they get no row.
@@ -269,4 +321,12 @@ export function planTranscriptRows(messages: AgentMessage[], options: PlanOption
     idx = endIdx;
   }
   return rows;
+}
+
+/** Navigation and rendering share these exact descriptors, including flat
+ * preference rows. No second planner may guess the lazy-window size. */
+export function transcriptRowIndex(rows: TranscriptRow[], messageIndex: number): number {
+  return rows.findIndex((row) => row.kind === "message"
+    ? row.index === messageIndex
+    : messageIndex >= row.userIndex && messageIndex < row.endIndex);
 }

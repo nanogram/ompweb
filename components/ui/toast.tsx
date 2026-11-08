@@ -14,6 +14,7 @@ import { Toast } from "@base-ui/react/toast";
 import { AlertCircle, Check, Info, X } from "lucide-react";
 import { useRef, useState } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useI18n } from "@/lib/i18n";
 import type React from "react";
 
 type ToastKind = "success" | "error" | "info";
@@ -114,15 +115,28 @@ export function clampDescriptionStyle(expanded: boolean): React.CSSProperties {
  */
 export function ClampedDescription({ children }: { children: React.ReactNode }) {
   const [expanded, setExpanded] = useState(false);
+  const { t } = useI18n();
   return (
-    <span
-      onClick={() => setExpanded((v) => !v)}
-      aria-expanded={expanded}
-      title={expanded ? undefined : "Click to expand"}
-      style={clampDescriptionStyle(expanded)}
-    >
-      {children}
-    </span>
+    // summary has native disclosure semantics without button/[role=button]:
+    // Base UI intentionally excludes those elements from swipe initiation.
+    <details open={expanded}>
+      <summary
+        className="ui-focus-ring"
+        tabIndex={0}
+        onKeyDown={(event) => {
+          if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          setExpanded((value) => !value);
+        }}
+        onClick={(event) => { event.preventDefault(); setExpanded((v) => !v); }}
+        aria-expanded={expanded}
+        title={expanded ? undefined : t("toast.clickToExpand")}
+        style={{ listStyle: "none", ...clampDescriptionStyle(expanded) }}
+      >
+        {children}
+      </summary>
+    </details>
   );
 }
 
@@ -196,6 +210,7 @@ export function createSwipeTracker(startX: number): SwipeTracker {
 }
 
 function Toaster() {
+  const { t: translate } = useI18n();
   const { toasts } = Toast.useToastManager<ToastData>();
   const isMobile = useIsMobile();
   const clickGuard = useDragClickGuard();
@@ -275,7 +290,7 @@ function Toaster() {
             // The card is focusable (base-ui gives it tabIndex 0): Enter on it
             // runs the action, which has no separate button.
             onKeyDown={t.data?.onClick ? (event) => {
-              if (event.key !== "Enter" || event.target !== event.currentTarget) return;
+              if ((event.key !== "Enter" && event.key !== " ") || event.target !== event.currentTarget) return;
               event.preventDefault();
               manager.close(t.id);
               t.data?.onClick?.();
@@ -310,7 +325,7 @@ function Toaster() {
             </Toast.Content>
             <Toast.Close
               className="toast-close-button"
-              aria-label="Dismiss"
+              aria-label={translate("toast.dismiss")}
               style={dismissButtonStyle}
             >
               <X size={12} strokeWidth={2} aria-hidden />

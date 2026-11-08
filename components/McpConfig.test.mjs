@@ -40,3 +40,34 @@ test("MCP management cannot mutate configuration without a selected session", as
   assert.equal((await screen.findByRole("switch", { name: "Enable demo" })).disabled, true);
   assert.equal(screen.getByRole("button", { name: "Reload MCP" }).disabled, true);
 });
+
+test("an externally removed selection clears the editor, but refreshing an add draft keeps it", async (t) => {
+  let servers = [{ name: "alpha", config: { type: "stdio", command: "alpha-cmd", args: [] } }];
+  t.mock.method(globalThis, "fetch", async () => Response.json({ servers, path: "/fixture/.omp/mcp.json" }));
+  render(createElement(McpConfig, { cwd: "/fixture" }));
+  const user = userEvent.setup();
+  await user.click(await screen.findByText("alpha"));
+  assert.equal(screen.getByDisplayValue("alpha").tagName, "INPUT");
+  servers = [];
+  await user.click(screen.getByRole("button", { name: "Refresh live MCP status" }));
+  await waitFor(() => assert.equal(document.querySelector("input.mcp-config-input").value, ""));
+  assert.equal(document.querySelector("textarea.mcp-config-input").value.includes("alpha-cmd"), false);
+  await user.type(document.querySelector("input.mcp-config-input"), "draft");
+  await user.click(screen.getByRole("button", { name: "Refresh live MCP status" }));
+  await waitFor(() => assert.equal(screen.getByRole("button", { name: "Refresh live MCP status" }).disabled, false));
+  assert.equal(document.querySelector("input.mcp-config-input").value, "draft");
+});
+
+test("the keyed workspace lifetime discards the old workspace's editor", async (t) => {
+  t.mock.method(globalThis, "fetch", async (url) => {
+    const cwd = new URL(String(url), "http://fixture").searchParams.get("cwd");
+    const name = cwd === "/a" ? "alpha" : "beta";
+    return Response.json({ servers: [{ name, config: { type: "stdio", command: `${name}-cmd` } }] });
+  });
+  const view = render(createElement(McpConfig, { key: "/a", cwd: "/a" }));
+  await userEvent.setup().click(await screen.findByText("alpha"));
+  view.rerender(createElement(McpConfig, { key: "/b", cwd: "/b" }));
+  await screen.findByText("beta");
+  assert.equal(document.querySelector("input.mcp-config-input").value, "");
+  assert.equal(document.querySelector("textarea.mcp-config-input").value.includes("alpha-cmd"), false);
+});

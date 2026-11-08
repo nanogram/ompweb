@@ -6,6 +6,9 @@ self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim(
 
 self.addEventListener("message", (event) => {
   if (event.data?.type === "omp-outbox-capability") event.ports[0]?.postMessage({ type: "omp-outbox-capability", version: 1 });
+  if (event.data?.type === "omp-notification-dismiss" && typeof event.data.tag === "string" && typeof event.data.requestId === "string") {
+    event.waitUntil(retractNotification(event.data.tag, event.data.requestId));
+  }
 });
 
 self.addEventListener("push", (event) => {
@@ -15,6 +18,14 @@ self.addEventListener("push", (event) => {
   } catch {
     // Unreadable payload: still show something (iOS revokes silent pushes).
   }
+  if (!data || typeof data !== "object") data = {};
+  if (data.type === "dismiss") {
+    if (typeof data.tag === "string" && data.tag && typeof data.requestId === "string" && data.requestId) {
+      event.waitUntil(retractNotification(data.tag, data.requestId));
+    }
+    return;
+  }
+  const requestId = typeof data.requestId === "string" ? data.requestId : "";
   const shown = {
     type: data.type === "error" ? "error" : "info",
     title: data.title || "omp web",
@@ -24,14 +35,21 @@ self.addEventListener("push", (event) => {
   };
   event.waitUntil(
     (async () => {
+      if (requestId && await notificationRetracted(shown.tag, requestId)) return;
       await self.registration.showNotification(shown.title, {
         body: shown.body,
         icon: "/icon-192.png",
         badge: "/badge-96.png",
         tag: shown.tag || undefined,
         renotify: Boolean(shown.tag),
-        data: { url: data.url || "/", sessionId: shown.sessionId },
+        data: { url: data.url || "/", sessionId: shown.sessionId, requestId, dialog: data.dialog, responses: data.responses },
+        ...(Array.isArray(data.actions) ? { actions: data.actions } : {}),
       });
+      // Push delivery and dismiss pushes are unordered, including during showNotification.
+      if (requestId && await notificationRetracted(shown.tag, requestId)) {
+        await retractNotification(shown.tag, requestId);
+        return;
+      }
       // Open tabs list it in their Notifications tab, like a notification the page showed itself.
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const client of windows) client.postMessage({ type: "omp-notification-shown", notification: shown });
@@ -41,9 +59,27 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const { url = "/", sessionId = "" } = event.notification.data || {};
+  const { url = "/", sessionId = "", requestId = "", responses, dialog } = event.notification.data || {};
   event.waitUntil(
     (async () => {
+      if (event.action && sessionId && requestId && responses && Object.hasOwn(responses, event.action)) {
+        try {
+          if (!dialog?.expiresAt || dialog.expiresAt > Date.now()) {
+            const response = await fetch("/api/notifications/answer", {
+              method: "POST", credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ sessionId, requestId, response: responses[event.action] }),
+            });
+            const result = response.ok ? await response.json() : null;
+            if (["answered", "alreadySettled", "sessionGone"].includes(result?.status)) {
+              await retractNotification(event.notification.tag, requestId);
+              return;
+            }
+          }
+        } catch {
+          // Offline or expired login: open the real dialog rather than losing the action.
+        }
+      }
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       const client = windows.find((candidate) => candidate.focused) || windows.find((candidate) => candidate.visibilityState === "visible") || windows[0];
       if (client) {
@@ -66,6 +102,49 @@ self.addEventListener("notificationclick", (event) => {
     })(),
   );
 });
+
+// Remember retractions across worker restarts for the server's one-hour push TTL.
+async function notificationState() {
+  const open = indexedDB.open("omp-web-notification-state", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("retractions", { keyPath: "id" });
+  return done(open);
+}
+
+async function notificationRetracted(tag, requestId) {
+  const db = await notificationState();
+  try {
+    const entry = await done(db.transaction("retractions").objectStore("retractions").get(JSON.stringify([tag, requestId])));
+    return Boolean(entry && entry.until > Date.now());
+  } finally {
+    db.close();
+  }
+}
+
+async function retractNotification(tag, requestId) {
+  const db = await notificationState();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("retractions", "readwrite");
+      tx.oncomplete = resolve;
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error("Could not remember notification retraction"));
+      const store = tx.objectStore("retractions");
+      const entries = store.getAll();
+      entries.onsuccess = () => {
+        const now = Date.now();
+        for (const entry of entries.result) if (entry.until <= now) store.delete(entry.id);
+        store.put({ id: JSON.stringify([tag, requestId]), until: now + 60 * 60 * 1000 });
+      };
+    });
+  } finally {
+    db.close();
+  }
+  for (const notification of await self.registration.getNotifications({ tag })) {
+    if (notification.data?.requestId === requestId) notification.close();
+  }
+  for (const client of await self.clients.matchAll({ type: "window", includeUncontrolled: true })) {
+    client.postMessage({ type: "omp-notification-dismiss", tag, requestId });
+  }
+}
 
 // Background Sync (docs/specs/2026-11-04-message-outbox-design.md O2): the browser fires it once online, even with no
 // tab open. The event-stream worker's IndexedDB outbox (lib/event-stream-worker.ts) is sent like the worker sends it.

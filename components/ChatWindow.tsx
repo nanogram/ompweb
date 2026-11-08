@@ -1,11 +1,11 @@
 "use client";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { ArrowDown, ChevronDown, ChevronUp, Layers, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
-import { collectToolResults, isGroupAnchor, planTranscriptRows, type ActivityPiece, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { collectToolResults, isGroupAnchor, planTranscriptRows, transcriptRowIndex, type ActivityPiece, type TranscriptPresentation, type TranscriptRow } from "@/lib/chat-transcript-plan";
 import { isReplyBlock } from "@/lib/message-display";
 import { resolveForkTargets } from "@/lib/chat-fork";
 import { HeldMessageView, MessageView } from "./MessageView";
@@ -13,6 +13,10 @@ import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ExtensionDialog } from "./ExtensionDialog";
 import { SubagentTranscriptDialog } from "./SubagentTranscriptDialog";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
+import { ChatOutlineFab } from "./ChatOutlineFab";
+import { AssistantOutputStep } from "./TranscriptOutput";
+import { useChatMinimapPreference } from "@/hooks/useChatMinimapPreference";
+import { useTranscriptPreference } from "@/hooks/useTranscriptPreference";
 import { ComposerPanels } from "./ComposerPanels";
 import { SkillDiagnosticsNotice } from "./SkillDiagnostics";
 import { BtwHistoryDialog, type BtwPanelProps } from "./BtwPanel";
@@ -79,7 +83,6 @@ interface Props {
   onSystemPromptChange?: (prompt: string | null) => void;
   onSystemPromptLoaderChange?: (loader: (() => Promise<void>) | null) => void;
   onSessionStatsChange?: (stats: SessionStatsInfo | null) => void;
-  onSessionStatsPanelOpen?: () => void;
   onProviderUsageContextChange?: (context: ProviderUsageContext | null) => void;
   onOpenFile?: (filePath: string, name: string, source: WorkspaceFileSource) => void;
   /** Handles the open_url host tool; returns the result text for the agent. */
@@ -216,9 +219,11 @@ export function OmpRuntimeVersion() {
   );
 }
 
-function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messageCount: number; toolCallCount: number; children: () => ReactNode }) {
+export function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = false, forceExpanded = false, children }: { messageCount: number; toolCallCount: number; defaultExpanded?: boolean; forceExpanded?: boolean; children: () => ReactNode }) {
   const { t, tn } = useI18n();
-  const [expanded, setExpanded] = useState(false);
+  const [userExpanded, setExpanded] = useState(defaultExpanded);
+  const expanded = forceExpanded || userExpanded;
+  const contentId = useId();
   const parts = [t("chatWindow.processDetails"), tn("chatWindow.messageCount", messageCount)];
   if (toolCallCount > 0) parts.push(tn("chatWindow.toolCallCount", toolCallCount));
 
@@ -227,6 +232,8 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messag
       <button
         type="button"
         aria-expanded={expanded}
+        aria-controls={contentId}
+        disabled={forceExpanded}
         onClick={() => setExpanded((v) => !v)}
         className="process-details-toggle"
         title={expanded ? t("chatWindow.collapseProcessDetails") : t("chatWindow.expandProcessDetails")}
@@ -251,11 +258,9 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, children }: { messag
           {parts.join(" · ")}
         </span>
       </button>
-      {expanded && (
-        <div style={{ marginTop: 3 }}>
-          {children()}
-        </div>
-      )}
+      <div id={contentId} hidden={!expanded} style={{ marginTop: expanded ? 3 : 0 }}>
+        {expanded && children()}
+      </div>
     </div>
   );
 }
@@ -270,7 +275,7 @@ export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityP
     return renderMessage(piece.index, {
       attachRef: false,
       keyPrefix: `activity-${pieceIdx}`,
-      messageOverride: { ...withAssistantBlocks(msg, piece.blocks, { omitUsage: true }), errorMessage: undefined },
+      messageOverride: { ...withAssistantBlocks(msg, piece.blocks, { omitUsage: true }), errorMessage: undefined, stopReason: undefined },
       showTimestamp: false,
       sourceBlockIndices: piece.blocks.map((block) => msg.content.indexOf(block)),
     });
@@ -280,6 +285,11 @@ export function renderActivityPieces(messages: AgentMessage[], pieces: ActivityP
 interface CommittedTranscriptProps {
   messages: AgentMessage[];
   entryIds: string[];
+  rows: TranscriptRow[];
+  presentation: TranscriptPresentation;
+  expandProcessDetails: boolean;
+  revealFolded: boolean;
+  selectedMessageIndex: number | null;
   conversationMeta: { toolResultsMap: Map<string, ToolResultMessage>; lastAnchorIdx: number; visibleRefIndexByMessage: Map<number, number> };
   messageRefs: React.RefObject<(HTMLDivElement | null)[]>;
   isStreaming: boolean;
@@ -302,8 +312,6 @@ interface CommittedTranscriptProps {
   toolCallsDefaultCollapsed: boolean;
   /** Fold a running turn's tool calls; off restores the flat live tail. */
   hideToolActivity: boolean;
-  neverFoldActivity: boolean;
-  showToolCallsUnfolded: boolean;
   expandThinkingByDefault: boolean;
   hideThinkingBlock: boolean;
   visibleCount: number;
@@ -322,10 +330,10 @@ interface CommittedTranscriptProps {
  * change `streamingMessage`, rendered separately) do not re-run the O(history)
  * grouping/splitting work at display-frame cadence.
  */
-const CommittedTranscript = memo(function CommittedTranscript({
-  messages, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
+export const CommittedTranscript = memo(function CommittedTranscript({
+  messages, rows, presentation, expandProcessDetails, revealFolded, selectedMessageIndex, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
   handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
-  toolCallsDefaultCollapsed, hideToolActivity, neverFoldActivity, showToolCallsUnfolded, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
+  toolCallsDefaultCollapsed, hideToolActivity, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
@@ -388,7 +396,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
         sourceBlockIndices={options.sourceBlockIndices}
       />
     );
-    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
+    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return <div key={`${keyPrefix}-${idx}`} data-message-index={idx}>{view}</div>;
     return (
       <div key={`${keyPrefix}-${idx}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
         {view}
@@ -396,16 +404,6 @@ const CommittedTranscript = memo(function CommittedTranscript({
     );
   };
 
-  // Rows are plain descriptors; element creation below only happens for the
-  // visible window. Invisible history never allocates React elements, so long
-  // sessions pay element cost proportional to the visible window instead of
-  // the whole transcript.
-  // Expanded-by-default thinking, and tool calls when asked, stay out of the
-  // fold: folding on commit would hide the block the preference just opened.
-  const rows = useMemo<TranscriptRow[]>(
-    () => planTranscriptRows(messages, { hideThinking: hideThinkingBlock, showThinking: expandThinkingByDefault, showToolCalls: showToolCallsUnfolded, neverFold: neverFoldActivity }),
-    [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity],
-  );
   const rendersFlat = (row: TranscriptRow): boolean => {
     if (row.kind !== "group") return false;
     // With "Hide tool activity while working" on (the default) the running turn
@@ -457,19 +455,23 @@ const CommittedTranscript = memo(function CommittedTranscript({
     rendered.push(renderMessage(userIdx));
     // A message split across segments keeps its navigation ref on the first one.
     const attached = new Set<number>();
+    const lastOutput = segments.findLastIndex((segment) => segment.kind === "text" && segment.blocks.some(isReplyBlock));
     segments.forEach((segment, segmentIdx) => {
       if (segment.kind === "text") {
         const msg = messages[segment.index] as AssistantMessage;
         const override = withAssistantBlocks(msg, segment.blocks, { omitUsage: !segment.last });
-        if (!segment.last) override.errorMessage = undefined;
-        rendered.push(renderMessage(segment.index, {
+        if (!segment.last) { override.errorMessage = undefined; override.stopReason = undefined; }
+        const message = renderMessage(segment.index, {
           attachRef: !attached.has(segment.index),
           keyPrefix: `text-${segmentIdx}`,
           messageOverride: override,
           ...(segment.last ? {} : { showTimestamp: false }),
           // Thinking can ride in a text segment; deferred text loads by source index.
           sourceBlockIndices: segment.blocks.map((block) => msg.content.indexOf(block)),
-        }));
+        });
+        rendered.push(presentation === "focused"
+          ? <AssistantOutputStep key={`output-${userIdx}-${segmentIdx}`} final={row.finalReplyIndex === segment.index && segmentIdx === lastOutput} latest={row.finalReplyIndex === undefined && segmentIdx === lastOutput}>{message}</AssistantOutputStep>
+          : message);
         attached.add(segment.index);
         return;
       }
@@ -483,7 +485,7 @@ const CommittedTranscript = memo(function CommittedTranscript({
           key={`activity-${userIdx}-${segmentIdx}`}
           ref={refIdx === undefined ? undefined : (el) => { messageRefs.current[refIdx] = el; }}
         >
-          <ProcessDetailsGroup messageCount={segment.stepCount} toolCallCount={segment.toolCallCount}>
+          <ProcessDetailsGroup key={`${expandProcessDetails}:${row.finalReplyIndex === undefined ? "activity" : entryIds[row.finalReplyIndex] ?? row.finalReplyIndex}`} messageCount={segment.stepCount} toolCallCount={segment.toolCallCount} defaultExpanded={expandProcessDetails} forceExpanded={revealFolded || segment.pieces.some((piece) => piece.index === selectedMessageIndex)}>
             {() => renderActivityPieces(messages, segment.pieces, renderMessage)}
           </ProcessDetailsGroup>
         </div>,
@@ -507,8 +509,10 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
   const { t, tn } = useI18n();
+  const { desktopMode, mobileFab } = useChatMinimapPreference();
+  const { presentation, expandProcessDetails } = useTranscriptPreference();
   const fileSource = useMemo<WorkspaceFileSource>(() => ({
     hostId: session?.hostId ?? newSessionHostId ?? "local",
     cwd: session?.cwd ?? newSessionCwd, sessionId: session?.id ?? null,
@@ -566,7 +570,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     notices, dismissNotice, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
     skillDiagnostics, setSkillStartupDiagnostics,
     isAutoModelSelection,
-    agentPhase, activeGoal, activePlan,
+    agentPhase, activePlan,
     liveToolResults,
     subagents, subagentEvents, subagentTranscriptVersions, activeSubagentCount, currentTodoPhase, todoPhases,
     isNew, hostStatus: frameHostStatus,
@@ -579,9 +583,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     handleThinkingLevelChange, handleFastModeChange, handleSlowModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, loadSlashCommands,
     handleToolPresetChange,
     btw, askBtw,
+    goalState, handleGoalAction, queueProgress, handleDismissQueueProgress,
   } = useAgentSession({
     session, newSessionCwd, newSessionHostId, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
-    modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
+    modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange,
     onOpenFile: onOpenWorkspaceFile, onOpenUrl,
   });
   useEffect(() => {
@@ -737,15 +742,53 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   // The empty new-session screen has its own scroller, so the conversation's
   // scroller mounts after the first send without a remount or a load.
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !sessionBusy;
-  // Widen the lazy render window until it includes the message's transcript row.
+  // One exact plan drives the renderer, search expansion, rail and outline.
+  const transcriptRows = useMemo(() => planTranscriptRows(messages, {
+    hideThinking: hideThinkingBlock,
+    showThinking: expandThinkingByDefault,
+    showToolCalls: showToolCallsUnfolded,
+    neverFold: neverFoldActivity,
+    presentation,
+    running: sessionBusy || externalRunActive || streamState.isStreaming,
+  }), [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity, presentation, sessionBusy, externalRunActive, streamState.isStreaming]);
+  const [selectedMessageIndex, setSelectedMessageIndex] = useState<number | null>(null);
+  const [pendingOutlineJump, setPendingOutlineJump] = useState<{ messageIndex: number; smooth: boolean } | null>(null);
+  useEffect(() => {
+    setSelectedMessageIndex(null);
+    setPendingOutlineJump(null);
+  }, [sessionKeyForPaging]);
   const revealMessage = useCallback((messageIndex: number) => {
-    const rows = planTranscriptRows(messages, { hideThinking: hideThinkingBlock, showThinking: expandThinkingByDefault, showToolCalls: showToolCallsUnfolded, neverFold: neverFoldActivity });
-    const rowIndex = rows.findIndex((row) => (row.kind === "message" ? row.index === messageIndex : messageIndex >= row.userIndex && messageIndex < row.endIndex));
-    const needed = rows.length - Math.max(0, rowIndex);
+    const rowIndex = transcriptRowIndex(transcriptRows, messageIndex);
+    if (rowIndex < 0) return true;
+    const needed = transcriptRows.length - rowIndex;
     if (needed <= visibleCount) return true;
     setVisibleCount(needed);
     return false;
-  }, [messages, hideThinkingBlock, expandThinkingByDefault, showToolCallsUnfolded, neverFoldActivity, visibleCount]);
+  }, [transcriptRows, visibleCount]);
+  const ensureOutlineVisible = useCallback((messageIndex: number, smooth = true) => {
+    holdScrollPosition();
+    setNearBottom(false);
+    setSelectedMessageIndex(messageIndex);
+    const alreadyVisible = revealMessage(messageIndex);
+    // A newly mounted lazy page must jump instantly, as search does, so its
+    // sentinel cannot prepend another page mid-animation.
+    setPendingOutlineJump({ messageIndex, smooth: smooth && alreadyVisible });
+  }, [holdScrollPosition, revealMessage]);
+  useEffect(() => {
+    if (!pendingOutlineJump || loading || isEmptyNew) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const frame = requestAnimationFrame(() => {
+      const target = container.querySelector<HTMLElement>(`[data-message-index="${pendingOutlineJump.messageIndex}"]`);
+      if (!target) return;
+      // Run after lazy-page viewport restoration, never race it.
+      holdScrollPosition();
+      const top = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 16;
+      container.scrollTo({ top: Math.max(0, top), behavior: pendingOutlineJump.smooth ? "smooth" : "auto" });
+      setPendingOutlineJump(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [pendingOutlineJump, visibleCount, transcriptRows, loading, isEmptyNew, scrollContainerRef, holdScrollPosition]);
   useChatSearchHighlights({
     container: scrollContainerRef,
     query: searchQuery,
@@ -818,7 +861,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         // scrollTop = 0 — auto-loading then races the initial scroll-to-bottom
         // (the capture happens before the scroll, and the restore pins the
         // viewport to the top of the last page until every page is loaded).
-        if (entries[0]?.isIntersecting && container.scrollTop > 0) {
+        if (!pendingOutlineJump && entries[0]?.isIntersecting && container.scrollTop > 0) {
           // Save distance from top before prepending to restore scroll later
           prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
           loadMoreModeRef.current = "auto";
@@ -832,11 +875,12 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [visibleCount, messages.length, scrollContainerRef]);
+  }, [visibleCount, messages.length, scrollContainerRef, pendingOutlineJump]);
 
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
   useEffect(() => {
+    if (pendingOutlineJump) { prevScrollDistanceRef.current = null; return; }
     if (prevScrollDistanceRef.current == null) return;
     const container = scrollContainerRef.current;
     if (!container) return;
@@ -860,7 +904,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     }
     loadMoreModeRef.current = "auto";
     prevScrollDistanceRef.current = null;
-  }, [visibleCount, scrollContainerRef]);
+  }, [visibleCount, scrollContainerRef, pendingOutlineJump]);
 
   const handleLoadMoreClick = useCallback(() => {
     const container = scrollContainerRef.current;
@@ -1124,6 +1168,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   const hasStatusHostRow = todoPhases.length > 0 || subagents.length > 0;
   const chatInputElement = (
     <ChatInput
+      queueProgress={queueProgress}
+      onDismissQueueProgress={handleDismissQueueProgress}
       draftIdentityMove={composerIdentityMove}
       ref={composerRef}
       sessionInfoContainer={sessionInfoContainer}
@@ -1164,7 +1210,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       thinkingLevelMap={currentThinkingLevelMap}
       modelNameOverride={liveModelMeta?.name ?? null}
       retryInfo={retryInfo}
-      activeGoal={activeGoal}
+      goalState={goalState}
+      onGoalAction={handleGoalAction}
       activePlan={activePlan}
       advisorEnabled={advisorEnabled}
       onAdvisorChange={handleAdvisorChange}
@@ -1359,9 +1406,9 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
         {/* Hide the Firefox scrollbar on desktop only: ChatMinimap provides the
             position indicator there, but on mobile there is no minimap and
             users need the scrollbar (Chrome's overlay scrollbar still shows). */}
-        <div ref={scrollContainerRef} data-selection-scope="chat" tabIndex={-1} role="log" aria-live={streamState.isStreaming ? "off" : "polite"} aria-busy={streamState.isStreaming || undefined} aria-relevant="additions text" aria-label={t("chatWindow.conversation")} className={`flex-1 overflow-y-auto pt-6` + (isMobile ? "" : " scrollbar-none [&::-webkit-scrollbar]:hidden")} style={{ minHeight: 0 }}>
+        <div ref={scrollContainerRef} data-selection-scope="chat" tabIndex={-1} role="log" aria-live={streamState.isStreaming ? "off" : "polite"} aria-busy={streamState.isStreaming || undefined} aria-relevant="additions text" aria-label={t("chatWindow.conversation")} className={`flex-1 overflow-y-auto pt-6` + (!isMobile && desktopMode === "rail" ? " scrollbar-none [&::-webkit-scrollbar]:hidden" : "")} style={{ minHeight: 0 }}>
           <div style={{ padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
-            <div style={{ maxWidth: isMobile ? CHAT_COLUMN_MAX_WIDTH : CHAT_COLUMN_MAX_WIDTH_DESKTOP, margin: "0 auto" }}>
+            <div style={{ maxWidth: !isMobile && desktopMode === "rail" ? CHAT_COLUMN_MAX_WIDTH_DESKTOP : CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
               <ExtensionStatusBar statuses={extensionStatuses} />
               <ExtensionWidgets widgets={aboveEditorWidgets} />
               {error && (
@@ -1399,6 +1446,11 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             )}
             <CommittedTranscript
               messages={messages}
+              rows={transcriptRows}
+              presentation={presentation}
+              expandProcessDetails={expandProcessDetails}
+              revealFolded={searchQuery.trim().length > 0}
+              selectedMessageIndex={selectedMessageIndex}
               entryIds={entryIds}
               conversationMeta={conversationMetaWithLive}
               messageRefs={messageRefs}
@@ -1417,8 +1469,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               sessionId={session?.id ?? sessionIdRef.current ?? undefined}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
               hideToolActivity={hideToolActivity}
-              neverFoldActivity={neverFoldActivity}
-              showToolCallsUnfolded={showToolCallsUnfolded}
               expandThinkingByDefault={expandThinkingByDefault}
               hideThinkingBlock={hideThinkingBlock}
               visibleCount={visibleCount}
@@ -1429,6 +1479,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             {/* Also while held: a finished reply stays until its saved row
                 replaces it in the same render (useAgentSession-stream). */}
             {streamState.streamingMessage && (
+              <Fragment>
+              {presentation === "focused" && <div style={{ color: "var(--text-muted)", fontSize: 10, fontWeight: 650, margin: "4px 0" }}>{t("chatWindow.latestOutput")}</div>}
               <MessageView
                 key={streamState.streamingMessage.timestamp ?? "stream"}
                 message={streamState.streamingMessage as AgentMessage}
@@ -1441,6 +1493,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
                 hideThinking={hideThinkingBlock}
                 liveTokensPerSecond={streamState.isStreaming ? tokensPerSecond : undefined}
               />
+              </Fragment>
             )}
 
             {toolCallsDefaultCollapsed && pendingToolHeaders.map((tool) => (
@@ -1504,15 +1557,17 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
             <ArrowDown size={15} strokeWidth={1.8} aria-hidden="true" />
           </button>
         )}
-        {isMobile ? null : (
+        {!isMobile && desktopMode === "rail" && (
           <div style={{ position: "absolute", top: 0, bottom: 0, right: 0, zIndex: 30, display: "flex", alignItems: "center", pointerEvents: "none" }}>
             <ChatMinimap
               messages={messages}
               scrollContainer={scrollContainerRef}
               messageRefs={messageRefs}
+              onEnsureVisible={ensureOutlineVisible}
             />
           </div>
         )}
+        {(isMobile ? mobileFab : desktopMode === "fab") && <ChatOutlineFab messages={messages} scrollContainer={scrollContainerRef} messageRefs={messageRefs} nearBottom={nearBottom} isMobile={isMobile} onEnsureVisible={ensureOutlineVisible} />}
       </div>
 
       {/* Minimized pill bar - shown when composer is collapsed */}

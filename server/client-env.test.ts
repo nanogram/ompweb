@@ -82,9 +82,19 @@ test("signature display cannot replace the commit hash or date", { skip: !Bun.wh
   git("config", "gpg.ssh.allowedSignersFile", signers);
   git("config", "log.showSignature", "true");
   git("add", "package.json");
-  execFileSync("git", ["-C", root, "commit", "-S", "-m", "signed"], {
-    env: { ...process.env, GIT_AUTHOR_DATE: "2026-11-03T20:00:00-05:00", GIT_COMMITTER_DATE: "2026-11-04T01:00:00Z" },
-  });
+  try {
+    execFileSync("git", ["-C", root, "commit", "-S", "-m", "signed"], {
+      env: { ...process.env, GIT_AUTHOR_DATE: "2026-11-03T20:00:00-05:00", GIT_COMMITTER_DATE: "2026-11-04T01:00:00Z" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    if (error && typeof error === "object" && "stderr" in error &&
+        String(error.stderr).includes("unsupported value for gpg.format: ssh")) {
+      t.skip("Git does not support SSH signing");
+      return;
+    }
+    throw error;
+  }
   const env = clientEnv(root, "worker");
   assert.equal(env.OMP_WEB_PUBLIC_COMMIT_HASH, git("rev-parse", "HEAD"));
   assert.equal(env.OMP_WEB_PUBLIC_COMMIT_DATE, "2026-11-04");

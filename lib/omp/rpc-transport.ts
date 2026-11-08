@@ -53,6 +53,7 @@ export function spawnLocalRpcTransport(options: {
     env: options.env,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: target.windowsVerbatimArguments,
     // On POSIX, omp launches grandchildren (LSP servers, extension subprocesses). Run the
     // child in its own process group so killTree() can SIGTERM/SIGKILL the whole
     // tree — otherwise a crashed omp would orphan its LSP children as zombies.

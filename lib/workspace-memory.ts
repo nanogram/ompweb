@@ -30,7 +30,7 @@ function readEntries(storage: StorageLike): Record<string, string> {
 }
 
 export function workspaceKeyOf(session: Pick<SessionInfo, "cwd" | "projectRoot" | "projectKey">): string {
-  return session.projectKey ?? session.projectRoot ?? session.cwd;
+  return session.projectKey || session.projectRoot || session.cwd || "";
 }
 
 export function getLastOpenSession(workspace: string, storage: StorageLike | null = browserStorage()): string | null {

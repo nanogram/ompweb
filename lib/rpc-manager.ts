@@ -21,13 +21,16 @@ import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterrup
 import { RESUME_PROMPT } from "./hosts/host-resume";
 import { samePath } from "./paths";
 import { isRecord } from "./type-guards";
-import { BLOCKING_UI_METHODS, createNotificationDetector } from "./notification-events";
-import { publishNotification } from "./notification-hub";
+import { readGoalModeState } from "./goal-state";
+import { BLOCKING_UI_METHODS, createNotificationDetector, type ExtensionUiResponse } from "./notification-events";
+import { publishNotification, publishNotificationDismiss } from "./notification-hub";
 import { parseSkillDiagnosticsSnapshot, type SkillDiagnosticsSnapshot } from "./skill-diagnostics";
 import { eventWithToolResultImageUrls } from "./media-cache";
+import { QueueProgressLedger, queuedTextOfUserMessage, readQueueSnapshot, runOutcomeOfAgentEnd } from "./queue-progress";
 import type {
   BashResultInfo,
   OmpModel,
+  QueuedMessages,
   RpcAvailableSlashCommand,
   RpcSessionState,
   SessionStatsInfo,
@@ -129,7 +132,7 @@ export class WebRpcError extends Error {
 }
 
 /** Shape check for an ask-dialog `answers` payload; omp validates the content. */
-function isAskAnswers(value: unknown): boolean {
+export function isAskAnswers(value: unknown): boolean {
   return Array.isArray(value) && value.every((answer: unknown) =>
     isRecord(answer)
     && typeof answer.id === "string"
@@ -169,6 +172,7 @@ const PASSTHROUGH_COMMANDS = new Set([
   "btw",
   "btw_cancel",
   "get_btw_history",
+  "goal",
 ]);
 
 // Outlasts omp's cold prediction-daemon start (up to 3 × 30s start rounds plus a
@@ -401,6 +405,10 @@ export class AgentSessionWrapper {
   private uiExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Dialogs omp-web itself raised (confirmFromServer): answered here, never forwarded to omp. */
   private serverUiRequests = new Map<string, (confirmed: boolean) => void>();
+  private readonly uiAnswersInFlight = new Map<string, Promise<"answered" | "alreadySettled">>();
+  /** The input notification may predate a native session-file move. */
+  private readonly uiNotificationSessions = new Map<string, string>();
+  private queueProgress = new QueueProgressLedger({ epoch: randomUUID(), createId: randomUUID });
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
   private promptRunning = false;
@@ -411,7 +419,7 @@ export class AgentSessionWrapper {
   private frameGaps = 0;
   private confirmedMessageCommandGeneration = 0;
   private pendingMessageCommands = 0;
-  private nativeQueuedMessages: unknown = { steering: [], followUp: [] };
+  private nativeQueuedMessages: QueuedMessages = { steering: [], followUp: [] };
   private readonly startedEmpty: boolean;
   private messageReplacement: MessageReplacementWatch | null = null;
   private historyEditInFlight = false;
@@ -467,6 +475,8 @@ export class AgentSessionWrapper {
    *  concurrent callers can never both enter (the waiter/promptRunning
    *  bookkeeping alone is not an atomic gate). */
   private mcpListInFlight = false;
+  /** Only consume an orphan output while no later message dispatch can own it. */
+  private mcpOrphanGeneration: number | null = null;
   private _alive = true;
   /** Host tools the web UI registered via set_host_tools (agent-callable). */
   private hostToolNames: Set<string> = new Set();
@@ -483,7 +493,7 @@ export class AgentSessionWrapper {
   /** Own host calls no tab has seen yet (see parkHostTool), with their deadlines. */
   private parkedHostTools = new Map<string, ReturnType<typeof setTimeout>>();
   /** Listeners omp-web attaches itself (waitForTurnEnd), not tabs: a parked host call waits for a tab. */
-  private readonly internalListeners = new WeakSet<EventListener>();
+  private readonly internalListeners = new Set<EventListener>();
   /** URI schemes the web UI registered via set_host_uri_schemes. */
   private hostUriSchemes: Map<string, { writable?: boolean }> = new Map();
   private registeredHostUriSchemes: Array<{ scheme?: unknown; writable?: unknown; [key: string]: unknown }> | null = null;
@@ -606,13 +616,13 @@ export class AgentSessionWrapper {
     }
   }
 
-  /** Any event observer is attached, including internal work that protects the session lifetime. */
+  /** Browser subscribers only: internal waiters must not impersonate a UI. */
   hasSubscribers(): boolean {
     return this.listeners.length > 0;
   }
 
   private hasBrowserSubscribers(): boolean {
-    return this.listeners.some((listener) => !this.internalListeners.has(listener));
+    return this.listeners.length > 0;
   }
 
   /**
@@ -751,8 +761,7 @@ export class AgentSessionWrapper {
         this.recoveringUpdates = false;
         for (const id of [...this.pendingUiRequests.keys()]) {
           if (this.serverUiRequests.has(id)) continue;
-          this.forgetPendingUiRequest(id);
-          this.emit({ type: "extension_ui_request", id: `cancel:${id}`, method: "cancel", targetId: id });
+          this.settlePendingUiRequest(id);
         }
       }
       void this.reconcileAfterGap();
@@ -817,8 +826,8 @@ export class AgentSessionWrapper {
     try {
       if (!this.hostOwnedLifecycle) {
         const ready = await this.proc.waitReady(READY_TIMEOUT_MS);
-        await this.proc.negotiateProtocol(ready);
-        await this.proc.sendCommand({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
+        await this.proc.negotiateProtocol(ready, GET_STATE_TIMEOUT_MS);
+        await this.proc.sendCommand({ type: "set_subagent_subscription", level: "events" }, GET_STATE_TIMEOUT_MS).catch(() => {});
         await this.proc.sendCommand({ type: "set_ask_dialog", enabled: true }, GET_STATE_TIMEOUT_MS).catch(() => {});
         await this.enableDeltaUpdates(this.proc);
       }
@@ -944,8 +953,8 @@ export class AgentSessionWrapper {
     return this._adopted;
   }
 
-  private applyIdentity(state: RpcSessionState): void {
-    if (state.queuedMessages !== undefined) this.nativeQueuedMessages = state.queuedMessages;
+  private applyIdentity(state: RpcSessionState): QueuedMessages | null {
+    const queue = readQueueSnapshot(state.queuedMessages);
     const oldId = this._sessionId;
     const identityChanged = Boolean(oldId) && (state.sessionId !== oldId || (state.sessionFile && state.sessionFile !== this._sessionFile));
     // omp >= 18.5 moves a session it does not own onto a new file on its first
@@ -953,6 +962,7 @@ export class AgentSessionWrapper {
     // live stream and run state must survive; only the id changes.
     const moved = identityChanged && this.sessionMovePending;
     if (identityChanged && !moved) {
+      this.clearPendingUiRequests();
       this.resetStream();
       this.promptRunning = false;
       this.awaitingAgentStart = false;
@@ -960,7 +970,10 @@ export class AgentSessionWrapper {
       this.continuationGraceUntil = 0;
       // A different conversation now: the old one's ids must not suppress its notifications.
       this.movedFromIds.length = 0;
+      this.publishQueueProgress(this.queueProgress.reset());
+      this.nativeQueuedMessages = { steering: [], followUp: [] };
     }
+    if (queue) this.nativeQueuedMessages = queue;
     this._sessionId = state.sessionId;
     this._sessionFile = state.sessionFile ?? "";
     this._sessionName = state.sessionName;
@@ -980,6 +993,7 @@ export class AgentSessionWrapper {
         this.invalidateSessionLists();
       }
     }
+    return queue;
   }
 
   /** Whether omp answered `generate_title` with "Unknown command" (cached per child). */
@@ -1165,6 +1179,13 @@ export class AgentSessionWrapper {
       : frame;
     if (event.type === PEER_MESSAGE_FRAME) {
       this.peerMessageCommands += 1;
+      this.mcpOrphanGeneration = null;
+      if (this.mcpListWaiter) {
+        const waiter = this.mcpListWaiter;
+        clearTimeout(waiter.timer);
+        this.mcpListWaiter = null;
+        waiter.reject(new WebRpcError("Another command interrupted MCP management. Try again after it finishes.", "session_busy"));
+      }
       return;
     }
     if (this.hostOwnedLifecycle && (event.type === "host_tool_call" || event.type === "host_uri_request") && typeof event.id === "string") {
@@ -1180,6 +1201,8 @@ export class AgentSessionWrapper {
       }
     }
     let refreshSessionList = false;
+    if (event.type === "agent_start" || event.type === "agent_end"
+      || event.type === "prompt_result" || event.type === "prompt_error") this.mcpOrphanGeneration = null;
 
     switch (event.type) {
       case "command_output": {
@@ -1192,6 +1215,11 @@ export class AgentSessionWrapper {
           waiter.resolve(event.text);
           notifyRunningChange();
           return;
+        }
+        if (this.mcpOrphanGeneration !== null) {
+          const ownsOutput = this.mcpOrphanGeneration === this.messageCommandGeneration;
+          this.mcpOrphanGeneration = null;
+          if (ownsOutput) return;
         }
         // The output of a background `/rename` (see autoTitle) is not chat content.
         if (Date.now() < this.quietRenameUntil && typeof event.text === "string" && RENAME_OUTPUT_RE.test(event.text)) {
@@ -1239,9 +1267,12 @@ export class AgentSessionWrapper {
           this.continuationGraceUntil = Date.now() + NON_TERMINAL_CONTINUATION_GRACE_MS;
         }
         break;
-      case "queue_update":
-        this.nativeQueuedMessages = event;
+      case "queue_update": {
+        const queue = readQueueSnapshot(event);
+        if (!queue) return;
+        this.nativeQueuedMessages = queue;
         break;
+      }
       case "session_settled":
         this.unsettled = false;
         this.deliveredCallbacks.clear();
@@ -1261,6 +1292,9 @@ export class AgentSessionWrapper {
         // event.result.estimatedTokensAfter for the banner.
         patchEstimatedTokensAfter(event.result);
         this.invalidateSessionLists();
+        break;
+      case "manual_compaction_end":
+        patchEstimatedTokensAfter(event.result);
         break;
       case "notice":
         if (event.source === "session-persistence") void this.followSessionMove();
@@ -1283,6 +1317,7 @@ export class AgentSessionWrapper {
         // versions omit `command` on that second response, so the active run
         // is also a terminal-failure signal. Otherwise this frame would be
         // ignored and the UI would stop with no explanation.
+        if (event.success === false && event.command === "get_state") return;
         if (event.success === false) {
           const promptFailure =
             event.command === "prompt" ||
@@ -1303,6 +1338,7 @@ export class AgentSessionWrapper {
           const promptError = { type: "prompt_error", errorMessage: detail, error: event.error, command: event.command };
           this.publishNotifications(promptError);
           this.emit(promptError);
+          this.publishQueueProgress(this.queueProgress.observeRunEnd("failed", Date.now()));
           notifyRunningChange();
           return;
         }
@@ -1428,7 +1464,37 @@ export class AgentSessionWrapper {
 
     this.publishNotifications(event);
     this.emit(event);
+    this.trackQueueProgress(event);
     notifyRunningChange({ refreshSessionList });
+  }
+
+  private trackQueueProgress(event: UnsequencedAgentEvent): void {
+    const now = Date.now();
+    switch (event.type) {
+      case "queue_update": {
+        const queue = readQueueSnapshot(event);
+        if (queue) this.publishQueueProgress(this.queueProgress.observeQueue(queue, now));
+        break;
+      }
+      case "turn_start":
+        this.queueProgress.observeTurnStart();
+        break;
+      case "message_start": {
+        const text = queuedTextOfUserMessage(event.message);
+        if (text !== null) this.publishQueueProgress(this.queueProgress.observeUserMessage(text, now));
+        break;
+      }
+      case "agent_end":
+        if (event.isTerminal !== false) this.publishQueueProgress(this.queueProgress.observeRunEnd(runOutcomeOfAgentEnd(event), now));
+        break;
+      case "prompt_error":
+        this.publishQueueProgress(this.queueProgress.observeRunEnd("failed", now));
+        break;
+    }
+  }
+
+  private publishQueueProgress(changed: boolean): void {
+    if (changed) this.emit({ type: "queue_progress", ...this.queueProgress.snapshot() });
   }
 
   /** Forget a pending dialog and its expiry timer. */
@@ -1441,20 +1507,85 @@ export class AgentSessionWrapper {
     }
   }
 
+  /** Every terminal path retracts notifications and closes the dialog in all tabs. */
+  private settlePendingUiRequest(id: string, confirmed = false, emitCancel = true): boolean {
+    if (!this.pendingUiRequests.has(id)) return false;
+    this.forgetPendingUiRequest(id);
+    const serverRequest = this.serverUiRequests.get(id);
+    this.serverUiRequests.delete(id);
+    this.uiAnswersInFlight.delete(id);
+    const originalSession = this.uiNotificationSessions.get(id);
+    this.uiNotificationSessions.delete(id);
+    for (const sessionId of new Set([originalSession, this._sessionId, ...this.movedFromIds])) {
+      if (sessionId) publishNotificationDismiss(sessionId, id);
+    }
+    if (emitCancel) this.emit({ type: "extension_ui_request", id: `cancel:${id}`, method: "cancel", targetId: id });
+    serverRequest?.(confirmed);
+    notifyRunningChange();
+    return true;
+  }
+
+  /** Validation and dispatch are shared by in-app and notification answers. */
+  async answerExtensionUiRequest(id: string, response: ExtensionUiResponse): Promise<"answered" | "alreadySettled"> {
+    const pending = this.pendingUiRequests.get(id);
+    if (!pending) return "alreadySettled";
+    if (typeof pending.expiresAt === "number" && pending.expiresAt <= Date.now()) {
+      this.settlePendingUiRequest(id);
+      return "alreadySettled";
+    }
+    const inFlight = this.uiAnswersInFlight.get(id);
+    if (inFlight) {
+      await inFlight;
+      return "alreadySettled";
+    }
+    if (!isRecord(response) || Object.keys(response).length !== 1) {
+      throw new WebRpcError("Invalid dialog response", "invalid_dialog_response");
+    }
+    const cancelled = "cancelled" in response && response.cancelled === true;
+    const value = "value" in response ? response.value : undefined;
+    if (pending.method === "ask") {
+      if (!cancelled && !isAskAnswers("answers" in response ? response.answers : undefined)) {
+        throw new WebRpcError("Invalid ask dialog answers", "invalid_ask_answers");
+      }
+    } else if (!cancelled) {
+      if (pending.method === "confirm") {
+        if (!("confirmed" in response) || typeof response.confirmed !== "boolean") {
+          throw new WebRpcError("This dialog requires confirmation", "invalid_dialog_response");
+        }
+      } else if (typeof value !== "string"
+        || (pending.method === "select" && Array.isArray(pending.options)
+          && !pending.options.some((option) => (typeof option === "string" ? option : isRecord(option) ? option.label : undefined) === value))) {
+        throw new WebRpcError("Invalid dialog value", "invalid_dialog_response");
+      }
+    }
+    const operation = (async (): Promise<"answered" | "alreadySettled"> => {
+      if (!this.serverUiRequests.has(id)) {
+        if (!this.isAlive()) throw new Error("Session is no longer running");
+        if (this.hostDown() || this.oldChildExiting) throw this.hostOfflineError("refused");
+        await this.proc.sendFrameAsync({ type: "extension_ui_response", id, ...response });
+      }
+      // Expiry/cancel/exit can win while a native transport write is pending.
+      if (this.pendingUiRequests.get(id) !== pending) return "alreadySettled";
+      this.settlePendingUiRequest(id, "confirmed" in response && response.confirmed === true);
+      return "answered";
+    })();
+    this.uiAnswersInFlight.set(id, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.uiAnswersInFlight.get(id) === operation) this.uiAnswersInFlight.delete(id);
+    }
+  }
+
   private clearPendingUiRequests(): void {
     this.dropServerUiRequests();
-    for (const timer of this.uiExpiryTimers.values()) clearTimeout(timer);
-    this.uiExpiryTimers.clear();
-    this.pendingUiRequests.clear();
+    for (const id of [...this.pendingUiRequests.keys()]) this.settlePendingUiRequest(id);
   }
 
   /** Settle every server dialog as declined and close it in attached tabs. */
   private dropServerUiRequests(): void {
-    for (const [id, resolve] of this.serverUiRequests) {
-      this.serverUiRequests.delete(id);
-      this.forgetPendingUiRequest(id);
-      this.emit({ type: "extension_ui_request", id: `cancel:${id}`, method: "cancel", targetId: id });
-      resolve(false);
+    for (const id of [...this.serverUiRequests.keys()]) {
+      this.settlePendingUiRequest(id);
     }
   }
 
@@ -1476,28 +1607,34 @@ export class AgentSessionWrapper {
     const method = event.method as string;
     const id = event.id as string;
     if (method === "cancel") {
-      this.forgetPendingUiRequest(event.targetId as string);
+      this.settlePendingUiRequest(event.targetId as string, false, false);
       return false;
-    }
-    // Only the “Allow tool: <name>” confirmation is covered. Other extension
-    // prompts, including login/editor confirmations, remain interactive.
-    if (method === "confirm" && typeof event.title === "string" && /^allow tool\s*:/i.test(event.title) && this.host.autoApproveExtension()) {
-      this.forgetPendingUiRequest(id);
-      this.proc.sendFrame({ type: "extension_ui_response", id, confirmed: true });
-      return true;
     }
     // Blocking dialogs stay pending until the client answers (replayed to
     // newly-attached SSE listeners so dialogs survive reconnects).
     if (BLOCKING_UI_METHODS.has(method)) {
-      this.forgetPendingUiRequest(id);
+      this.settlePendingUiRequest(id);
       const timeout = typeof event.timeout === "number" ? event.timeout : undefined;
       if (timeout && timeout > 0) {
         event.expiresAt = Date.now() + timeout;
-        const timer = setTimeout(() => this.forgetPendingUiRequest(id), timeout);
+        const timer = setTimeout(() => this.settlePendingUiRequest(id), timeout);
         timer.unref?.();
         this.uiExpiryTimers.set(id, timer);
       }
       this.pendingUiRequests.set(id, event);
+      this.uiNotificationSessions.set(id, this._sessionId);
+      if (!this.serverUiRequests.has(id) && method === "confirm" && typeof event.title === "string"
+        && /^allow tool\s*:/i.test(event.title) && this.host.autoApproveExtension()) {
+        void this.answerExtensionUiRequest(id, { confirmed: true }).catch(() => {
+          // A rejected write is still answerable; expose it instead of silently losing the dialog.
+          if (this.pendingUiRequests.get(id) === event) {
+            this.publishNotifications(event);
+            this.emit(event);
+            notifyRunningChange();
+          }
+        });
+        return true;
+      }
       return false;
     }
     if (method === "setStatus") {
@@ -1726,6 +1863,13 @@ export class AgentSessionWrapper {
         // notifyRunningChange apply to their listener sets.
       }
     }
+    for (const listener of this.internalListeners) {
+      try {
+        listener(event as AgentEvent);
+      } catch {
+        // A server waiter must not starve other observers.
+      }
+    }
     for (const tap of globalThis.__ompFrameTaps ?? []) {
       try {
         tap(this, event as AgentEvent);
@@ -1811,7 +1955,10 @@ export class AgentSessionWrapper {
 
   /** `internal`: omp-web's own listener (waitForTurnEnd), never handed a parked host call. */
   onEvent(listener: EventListener, { internal = false }: { internal?: boolean } = {}): () => void {
-    if (internal) this.internalListeners.add(listener);
+    if (internal) {
+      this.internalListeners.add(listener);
+      return () => { this.internalListeners.delete(listener); };
+    }
     this.listeners.push(listener);
     this.reportInterest();
     this.noteActivity();
@@ -1828,7 +1975,7 @@ export class AgentSessionWrapper {
     for (const [id, event] of this.pendingUiRequests) {
       const expiresAt = event.expiresAt as number | undefined;
       if (expiresAt !== undefined && expiresAt <= now) {
-        this.forgetPendingUiRequest(id);
+        this.settlePendingUiRequest(id);
         continue;
       }
       listener({ ...event, web: { streamId: this.streamId, sequence: ++this.streamSequence } });
@@ -1994,6 +2141,7 @@ export class AgentSessionWrapper {
     waiter.timer = setTimeout(() => {
         if (this.mcpListWaiter !== waiter) return;
         this.mcpListWaiter = null;
+        this.mcpOrphanGeneration = this.messageCommandGeneration;
         rejectOutput(new WebRpcError("Timed out while loading MCP servers", "mcp_list_timeout"));
       }, MCP_LIST_TIMEOUT_MS);
     // Don't pin the event loop if the caller never awaits (route aborted): the
@@ -2053,8 +2201,9 @@ export class AgentSessionWrapper {
     const wasRunning = this.isRunning();
 
     // Reconcile process-side flags with authoritative child state.
-    this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile });
+    const queue = this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile });
     this.streamSequence += 1;
+    if (queue) this.publishQueueProgress(this.queueProgress.observeQueue(queue, Date.now()));
 
     const awaitingExpired = !this.awaitingAgentStart || Date.now() >= this.awaitingAgentStartDeadline;
     const hasPendingWork =
@@ -2082,6 +2231,7 @@ export class AgentSessionWrapper {
       notifyRunningChange();
     }
     const skillDiagnostics = parseSkillDiagnosticsSnapshot(state.skillDiagnostics);
+    const goal = state.goal === undefined ? undefined : state.goal === null ? null : readGoalModeState(state.goal) ?? undefined;
     return {
       sessionId: state.sessionId,
       sessionFile: state.sessionFile ?? "",
@@ -2107,7 +2257,8 @@ export class AgentSessionWrapper {
         : undefined,
       messageCount: state.messageCount,
       queuedMessageCount: state.queuedMessageCount,
-      queuedMessages: state.queuedMessages ?? { steering: [], followUp: [] },
+      queuedMessages: this.nativeQueuedMessages,
+      queueProgress: this.queueProgress.snapshot(),
       tokensPerSecond: state.tokensPerSecond ?? null,
       contextUsage: state.contextUsage ?? null,
       systemPrompt: state.systemPrompt?.join("\n\n") ?? "",
@@ -2123,6 +2274,7 @@ export class AgentSessionWrapper {
       slowModeScope: state.slowModeScope,
       usageLimit: state.usageLimit,
       ...(skillDiagnostics ? { skillDiagnostics } : {}),
+      ...(goal !== undefined ? { goal } : {}),
       todoPhases: state.todoPhases ?? [],
       extensionStatuses: Array.from(this.extensionStatuses, ([key, text]) => ({ key, text })),
       extensionWidgets: Array.from(this.extensionWidgets.values()),
@@ -2312,6 +2464,9 @@ export class AgentSessionWrapper {
       this.extensionStatuses.clear();
       this.extensionWidgets.clear();
       this.clearPendingUiRequests();
+      this.queueProgress = new QueueProgressLedger({ epoch: randomUUID(), createId: randomUUID });
+      this.nativeQueuedMessages = { steering: [], followUp: [] };
+      this.publishQueueProgress(true);
       this.promptRunning = false;
       this.promptDispatchPendingCount = 0;
       this.awaitingAgentStart = false;
@@ -2353,8 +2508,8 @@ export class AgentSessionWrapper {
           await this.adopt([...(spawned.pending ?? []), ...(spawned.streaming ? [spawned.streaming] : [])]);
         } else {
           const ready = await proc.waitReady(READY_TIMEOUT_MS);
-          await proc.negotiateProtocol(ready);
-          await proc.sendCommand({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
+          await proc.negotiateProtocol(ready, GET_STATE_TIMEOUT_MS);
+          await proc.sendCommand({ type: "set_subagent_subscription", level: "events" }, GET_STATE_TIMEOUT_MS).catch(() => {});
           await proc.sendCommand({ type: "set_ask_dialog", enabled: true }, GET_STATE_TIMEOUT_MS).catch(() => {});
           await this.enableDeltaUpdates(proc);
         }
@@ -2474,6 +2629,7 @@ export class AgentSessionWrapper {
         this.startedEmpty && !this.adopted && this.messageCommandGeneration === 0 ? [] : undefined)
       : null;
     if (message) {
+      this.mcpOrphanGeneration = null;
       this.messageCommandGeneration += 1;
       this.pendingMessageCommands += 1;
       if (origin) nativeWrites().add(origin);
@@ -2504,6 +2660,11 @@ export class AgentSessionWrapper {
 
 
   async send(command: Record<string, unknown>): Promise<unknown> {
+    // Display-only state never needs a reachable child, even during MCP work/restart.
+    if (command.type === "dismiss_queue_progress") {
+      this.publishQueueProgress(this.queueProgress.dismissFinished());
+      return null;
+    }
     if (this.restarting) throw new WebRpcError(RESTARTING_MESSAGE, "session_restarting");
     if (this.mcpListInFlight) throw new WebRpcError("MCP management is in progress. Try again when it finishes.", "session_busy");
     if (!this.isAlive()) throw new Error("Session is no longer running");
@@ -2511,10 +2672,14 @@ export class AgentSessionWrapper {
     if (typeof command.type === "string" && command.type.startsWith("abort")) {
       console.info("[omp-web] cancellation-command", JSON.stringify({ sessionId: this._sessionId, type: command.type, at: new Date().toISOString() }));
     }
-    const mutatesHistory = HISTORY_MUTATING_COMMANDS.has(command.type as string);
+    const mutatesHistory = HISTORY_MUTATING_COMMANDS.has(command.type as string)
+      || (command.type === "goal" && command.op !== "get");
     if (mutatesHistory && this.historyEditInFlight) {
       throw new WebRpcError("Wait for the history edit to finish", "session_busy");
     }
+    // Local slash commands may never emit agent_start/prompt_result. Any later
+    // explicit command ends orphan ownership before it can produce output.
+    if (command.type !== "get_state") this.mcpOrphanGeneration = null;
     if (mutatesHistory) this.historyMutationPendingCount += 1;
     try {
       return await this.withPendingCommand(() => this.dispatchCommand(command));
@@ -2625,6 +2790,10 @@ export class AgentSessionWrapper {
         // Queue mutations are synchronous control operations, like get_state.
         // Expiry must not abort unrelated work or replay a possibly applied mutation.
         const result = await this.proc.sendCommand(command as { type: string }, GET_STATE_TIMEOUT_MS);
+        if (type === "remove_queued_message" && isRecord(result) && result.removed === true
+          && typeof command.message === "string" && (command.queue === "steering" || command.queue === "followUp")) {
+          this.publishQueueProgress(this.queueProgress.observeRemoval(command.message, command.queue, Date.now()));
+        }
         return result ?? null;
       }
 
@@ -2634,6 +2803,7 @@ export class AgentSessionWrapper {
       case "abort_and_restore_queue": {
         this.responseObserved = false;
         this.responseRunActive = false;
+        const queueBoundary = this.queueProgress.boundary();
         const result = await this.withFinalRunningNotification(async () => {
           const response: unknown = await this.proc.sendCommand({ type });
           // If the prompt was aborted before the agent loop started, no
@@ -2650,13 +2820,19 @@ export class AgentSessionWrapper {
           this.clearLiveSnapshots();
           return response;
         });
+        this.publishQueueProgress(this.queueProgress.observeAbort({ restoreQueue: type === "abort_and_restore_queue", boundary: queueBoundary }, Date.now()));
         return type === "abort" ? null : result ?? null;
       }
 
       case "get_state": {
         try {
-          const state = await this.proc.sendCommand<RpcSessionState>({ type: "get_state" }, GET_STATE_TIMEOUT_MS);
-          return this.buildWebState(state);
+          let snapshot: WebSessionState | undefined;
+          const state = await this.proc.sendCommand<RpcSessionState>({ type: "get_state" }, GET_STATE_TIMEOUT_MS, (success, _id, data) => {
+            // Observe the queue in stdout order: later queue_update frames must
+            // not be overwritten by this response's delayed promise continuation.
+            if (success && isRecord(data)) snapshot = this.buildWebState(data as unknown as RpcSessionState);
+          });
+          return snapshot ?? this.buildWebState(state);
         } catch (error) {
           if (error instanceof RpcCommandTimeoutError) {
             // This is only an observer poll. A busy event loop or delayed RPC
@@ -2796,25 +2972,10 @@ export class AgentSessionWrapper {
       }
 
       case "extension_ui_response": {
-        const { id, ...rest } = command as { id: string; [key: string]: unknown };
-        const pendingAsk = this.pendingUiRequests.get(id)?.method === "ask";
-        // A pending ask accepts only its answers or a cancel; anything else would
-        // drop it from reconnect replay while omp rejects the payload.
-        if (("answers" in rest || pendingAsk) && !isAskAnswers(rest.answers) && !(pendingAsk && rest.cancelled === true)) {
-          throw new WebRpcError("Invalid ask dialog answers", "invalid_ask_answers");
-        }
-        const wasPending = this.pendingUiRequests.has(id);
-        this.forgetPendingUiRequest(id);
-        const serverRequest = this.serverUiRequests.get(id);
-        if (serverRequest) {
-          this.serverUiRequests.delete(id);
-          serverRequest(rest.confirmed === true);
-        } else {
-          this.proc.sendFrame({ type: "extension_ui_response", id, ...rest });
-        }
-        // omp sends no cancel for an answered dialog; other tabs on this
-        // session would keep showing it, so settle it for them here.
-        if (wasPending) this.emit({ type: "extension_ui_request", id: `cancel:${id}`, method: "cancel", targetId: id });
+        const { id, ...response } = command;
+        delete response.type;
+        if (typeof id !== "string") throw new WebRpcError("Dialog id is required", "invalid_dialog_response");
+        await this.answerExtensionUiRequest(id, response as ExtensionUiResponse);
         return null;
       }
 

@@ -51,7 +51,7 @@ import {
   hostsCameOnline,
 } from "./SessionSidebar-helpers";
 import { OmpWebTitle, SIDEBAR_BUTTON_TRANSITION, SidebarIconButton, SidebarPortalMenu } from "./SessionSidebar-chrome";
-import { HostGroup, ProjectRow } from "./SessionSidebar-rows";
+import { HostGroup, ProjectRow, SessionTreeItem } from "./SessionSidebar-rows";
 
 /** Deadline for one /api/sessions fetch. A wedged-but-listening server never
  * answers; without this the initial spinner would pend forever. */
@@ -821,9 +821,23 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   useEffect(() => {
     onWorkspaceOptionsChange?.(sortedProjects, selectedProject, selectedCwd, selectedHostId);
   }, [onWorkspaceOptionsChange, sortedProjects, selectedProject, selectedCwd, selectedHostId]);
+  // Cwd-less transcripts are browseable sessions, not launchable workspaces.
+  // Keep these virtual rows out of workspace selection, persistence and menus.
+  const sidebarProjects = useMemo(() => {
+    const list = [...sortedProjects];
+    const hosts = new Set<string>();
+    for (const session of visibleSessions) {
+      if (workspaceKeyOf(session)) continue;
+      const hostId = session.hostId ?? LOCAL_HOST_ID;
+      if (hosts.has(hostId)) continue;
+      hosts.add(hostId);
+      list.push({ path: "", hostId, alias: t("projects.unknownWorkspace") });
+    }
+    return list;
+  }, [sortedProjects, visibleSessions, t]);
   const sessionsByProject = useMemo(
-    () => groupSessionsByProject(sortedProjects, visibleSessions),
-    [sortedProjects, visibleSessions],
+    () => groupSessionsByProject(sidebarProjects, visibleSessions),
+    [sidebarProjects, visibleSessions],
   );
   const projectActivity = useMemo(
     () => projectActivityCounts(visibleSessions, runningSessionIds, unreadSessionIds, exitedSessions.keys()),
@@ -905,7 +919,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     const query = compileSearchQuery(trimmedSearchQuery);
     const serverScores = currentTranscriptSearch?.scores;
     const entries: { project: ManagedProject; hostId?: string; sessions: SessionInfo[]; scores?: Map<string, number>; rank: number }[] = [];
-    for (const project of sortedProjects) {
+    for (const project of sidebarProjects) {
       let list = sessionsByProject.get(hostProjectKey(project.hostId, project.path)) ?? [];
       if (runningOnly) list = list.filter((s) => runningSessionIds.has(s.id) || effectiveRecentCompletedSet.has(s.id));
       if (!query) {
@@ -931,7 +945,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     // Best match first; ties keep the workspace order (stable sort).
     if (query) entries.sort((a, b) => b.rank - a.rank);
     return entries;
-  }, [sortedProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
+  }, [sidebarProjects, sessionsByProject, runningOnly, trimmedSearchQuery, currentTranscriptSearch, runningSessionIds, effectiveRecentCompletedSet]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -1282,7 +1296,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       return;
     }
     provisionalSelectionRef.current = false;
-    if (s.cwd) setSelectedCwd(s.cwd);
+    setSelectedCwd(s.cwd || null);
     setSelectedHostId(hostOf(s));
     expandProject(workspaceKeyOf(s), hostOf(s));
     onSelectSession(s);
@@ -1711,12 +1725,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
               <button className="load-retry-button" type="button" onClick={() => { loadSessions(false); void loadProjects(); }} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("sessionSidebar.refresh")}</button>
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length === 0 && (
+          {!loading && !projectsError && !error && sidebarProjects.length === 0 && (
             <div style={{ padding: "10px 4px", color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
               {t("projects.noProjects")}
             </div>
           )}
-          {!loading && !projectsError && !error && sortedProjects.length > 0 && visibleProjectEntries.length === 0 && (
+          {!loading && !projectsError && !error && sidebarProjects.length > 0 && visibleProjectEntries.length === 0 && (
             <div style={{ padding: "14px 4px", color: "var(--text-dim)", fontSize: 11.5, lineHeight: 1.5 }}>
               {t("sessionSidebar.noMatches")}
             </div>
@@ -1728,6 +1742,28 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             const rows = entries.map(({ project, sessions }) => {
               const projectKey = hostProjectKey(project.hostId, project.path);
               const tree = treesByProject.get(projectKey) ?? buildSessionTree(sessions);
+              if (!project.path) {
+                return <section key={projectKey} aria-label={t("projects.unknownWorkspace")}>
+                  <div style={{ padding: "10px 8px 4px", color: "var(--text-muted)", fontSize: 12 }}>{t("projects.unknownWorkspace")}</div>
+                  <div style={{ padding: "0 8px 6px", color: "var(--text-dim)", fontSize: 11 }}>{t("projects.unknownWorkspaceDescription")}</div>
+                  {tree.map((node) => <SessionTreeItem
+                    key={node.session.id}
+                    node={node}
+                    depth={0}
+                    selectedSessionId={selectedSessionId}
+                    runningSessionIds={runningSessionIds}
+                    unreadSessionIds={unreadSessionIds}
+                    exitedSessions={exitedSessions}
+                    recentlyCompletedIds={effectiveRecentCompletedSet}
+                    relativeTimeNow={relativeTimeNow}
+                    onSelectSession={handleSelectSessionFromList}
+                    onRenamed={loadSessions}
+                    onSessionDeleted={handleSessionDeleted}
+                    searchQuery={trimmedSearchQuery || undefined}
+                    onOpenSearchMatch={onOpenSearchMatch ? handleOpenSearchMatch : undefined}
+                  />)}
+                </section>;
+              }
               // Sessions group under a project through the case-folded comparable
               // form (see groupSessionsByProject), so the active highlight must
               // use the same comparison: a session whose cwd/projectRoot spells
