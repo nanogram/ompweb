@@ -26,7 +26,15 @@ export const AUDIO_EXT_TO_MIME: Record<string, string> = {
   aac: "audio/aac",
   flac: "audio/flac",
   weba: "audio/webm",
-  webm: "audio/webm",
+};
+
+// WebM may contain video or audio only; a video element supports both.
+export const VIDEO_EXT_TO_MIME: Record<string, string> = {
+  mp4: "video/mp4",
+  m4v: "video/mp4",
+  mov: "video/quicktime",
+  webm: "video/webm",
+  ogv: "video/ogg",
 };
 
 export const DOCUMENT_EXT_TO_MIME: Record<DocumentPreviewKind, string> = {
@@ -43,15 +51,23 @@ export function getFileExt(filePath: string): string {
 }
 
 export function getImageMime(filePath: string): string | null {
-  return IMAGE_EXT_TO_MIME[getFileExt(filePath)] ?? null;
+  const ext = getFileExt(filePath);
+  return Object.hasOwn(IMAGE_EXT_TO_MIME, ext) ? IMAGE_EXT_TO_MIME[ext] : null;
 }
 
 export function getAudioMime(filePath: string): string | null {
-  return AUDIO_EXT_TO_MIME[getFileExt(filePath)] ?? null;
+  const ext = getFileExt(filePath);
+  return Object.hasOwn(AUDIO_EXT_TO_MIME, ext) ? AUDIO_EXT_TO_MIME[ext] : null;
+}
+
+export function getVideoMime(filePath: string): string | null {
+  const ext = getFileExt(filePath);
+  return Object.hasOwn(VIDEO_EXT_TO_MIME, ext) ? VIDEO_EXT_TO_MIME[ext] : null;
 }
 
 export function getDocumentMime(filePath: string): string | null {
-  return DOCUMENT_EXT_TO_MIME[getFileExt(filePath) as DocumentPreviewKind] ?? null;
+  const ext = getFileExt(filePath) as DocumentPreviewKind;
+  return Object.hasOwn(DOCUMENT_EXT_TO_MIME, ext) ? DOCUMENT_EXT_TO_MIME[ext] : null;
 }
 
 export function documentPreviewKind(filePath: string): DocumentPreviewKind | null {
@@ -83,6 +99,10 @@ export function isImagePath(filePath: string): boolean {
 
 export function isAudioPath(filePath: string): boolean {
   return getAudioMime(filePath) !== null;
+}
+
+export function isVideoPath(filePath: string): boolean {
+  return getVideoMime(filePath) !== null;
 }
 
 export function isDocumentPreviewPath(filePath: string): boolean {

@@ -592,13 +592,22 @@ test("a job from another browser is not adopted over an active recording", async
 });
 
 test("a browser left open picks up a job started elsewhere without a focus change", async () => {
+  const intervals = new Map();
+  let nextTimer = 0;
+  override(window, "setInterval", (callback) => {
+    const id = ++nextTimer;
+    intervals.set(id, callback);
+    return id;
+  });
+  override(window, "clearInterval", (id) => intervals.delete(id));
   world.pollResponses = [{ ok: true, status: 200, json: async () => ({ status: "done", text: "started elsewhere" }) }];
   const { transcripts } = mountDictation("session-1");
-  await settle(50);
+  await act(async () => {});
   assert.deepEqual(transcripts, []);
 
   world.scopeJobs = [{ id: "job-1", status: "pending" }];
-  await waitUntil(() => transcripts.length === 1, 6000);
+  await act(async () => { for (const callback of intervals.values()) callback(); });
+  await waitUntil(() => transcripts.length === 1);
   assert.deepEqual(transcripts, ["started elsewhere"]);
 });
 

@@ -19,6 +19,7 @@ import {
   isAudioPath,
   isDocumentPreviewPath,
   isImagePath,
+  isVideoPath,
 } from "@/lib/file-types";
 import { getFileApiUrl, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
 import { openEventStream } from "@/lib/event-stream";
@@ -31,6 +32,7 @@ import { parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
 import { parseFrontmatter } from "@/lib/frontmatter";
 import { FrontmatterCard } from "./FrontmatterCard";
+import { FileLinkMenu, NativeFileOpenButton } from "./FileLinkMenu";
 
 interface Props {
   filePath: string;
@@ -223,6 +225,8 @@ function DownloadLink({ filePath, hostId, sourceSessionId }: { filePath: string;
   const { t } = useI18n();
   const label = t("fileViewer.downloadFile");
   return (
+    <>
+    <NativeFileOpenButton filePath={filePath} hostId={hostId} sourceSessionId={sourceSessionId} />
     <Tooltip content={label}>
       <a
         href={getFileApiUrl(filePath, "download", hostId, sourceSessionId)}
@@ -237,6 +241,7 @@ function DownloadLink({ filePath, hostId, sourceSessionId }: { filePath: string;
         <Download size={14} strokeWidth={2.2} aria-hidden="true" />
       </a>
     </Tooltip>
+    </>
   );
 }
 
@@ -552,7 +557,7 @@ function formatDuration(seconds: number): string {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
-function AudioViewer({ filePath, hostId, cwd, sourceSessionId, active = true }: Props) {
+function MediaViewer({ filePath, hostId, cwd, sourceSessionId, active = true, video = false }: Props & { video?: boolean }) {
   const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
@@ -609,7 +614,7 @@ function AudioViewer({ filePath, hostId, cwd, sourceSessionId, active = true }: 
         <span style={{ fontFamily: "var(--font-mono)" }} title={filePath}>
           {getRelativeFilePath(filePath, cwd)}
         </span>
-        <span style={{ marginLeft: "auto" }}>{ext || t("fileViewer.audioType")}</span>
+        <span style={{ marginLeft: "auto" }}>{ext || t(video ? "fileViewer.videoType" : "fileViewer.audioType")}</span>
         {duration != null && <span>{formatDuration(duration)}</span>}
         {size != null && <span>{formatSize(size)}</span>}
         <span
@@ -647,15 +652,29 @@ function AudioViewer({ filePath, hostId, cwd, sourceSessionId, active = true }: 
               <button type="button" className="load-retry-button" onClick={retry} style={{ minHeight: 32, padding: "4px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{t("chatWindow.retry")}</button>
             </div>
           )}
-          <audio
-            key={src}
-            controls
-            preload="metadata"
-            src={src}
-            onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-            onError={() => setError(t("fileViewer.audioLoadFailed"))}
-            style={{ width: "100%" }}
-          />
+          {video ? (
+            <video
+              key={src}
+              controls
+              playsInline
+              preload="metadata"
+              src={src}
+              aria-label={t("fileViewer.previewTitle", { name: getFileName(filePath) })}
+              onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+              onError={() => setError(t("fileViewer.videoLoadFailed"))}
+              style={{ display: "block", width: "100%", maxHeight: "100%", background: "#000" }}
+            />
+          ) : (
+            <audio
+              key={src}
+              controls
+              preload="metadata"
+              src={src}
+              onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+              onError={() => setError(t("fileViewer.audioLoadFailed"))}
+              style={{ width: "100%" }}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -791,8 +810,11 @@ export function FileViewer({ filePath, hostId, cwd, sourceSessionId, onOpenFile,
   if (isImagePath(filePath)) {
     return <ImageViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
   }
+  if (isVideoPath(filePath)) {
+    return <MediaViewer video hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
+  }
   if (isAudioPath(filePath)) {
-    return <AudioViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
+    return <MediaViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
   }
   if (isDocumentPreviewPath(filePath)) {
     return <DocumentViewer hostId={hostId} filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} active={active} />;
@@ -1027,6 +1049,9 @@ function TextFileViewer({ filePath, hostId, cwd, sourceSessionId, onOpenFile, on
         >
           {t("chatWindow.retry")}
         </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <DownloadLink filePath={filePath} hostId={hostId} sourceSessionId={sourceSessionId} />
+        </div>
       </div>
     );
   }
@@ -1215,7 +1240,16 @@ function TextFileViewer({ filePath, hostId, cwd, sourceSessionId, onOpenFile, on
                     onOpenFile(linkedFile);
                   };
 
-                  return <a href={href} {...props} onClick={handleClick}>{children}</a>;
+                  return (
+                    <FileLinkMenu
+                      key={JSON.stringify([hostId, sourceSessionId ?? null, linkedFile])}
+                      filePath={linkedFile}
+                      source={{ hostId, cwd: cwd ?? null, sessionId: sourceSessionId ?? null }}
+                      onPreview={() => onOpenFile(linkedFile)}
+                    >
+                      <a href={href} {...props} onClick={handleClick}>{children}</a>
+                    </FileLinkMenu>
+                  );
                 },
                 img({ src, alt, ...props }) {
                   delete props.node;

@@ -6,6 +6,8 @@ import { MAX_AGENT_COMMAND_REQUEST_BYTES } from "@/lib/image-attachments";
 import { readAgentSelection } from "@/lib/agent-command";
 import { runFreshSessionCommand } from "@/lib/fresh-session-handoff";
 import { requestOwner } from "@/lib/web-auth";
+import { isDirectorWorkspace } from "@/lib/director-state";
+import { LOCAL_HOST_ID } from "@/lib/hosts/registry";
 
 function newSessionErrorResponse(error: unknown) {
   if (error instanceof RequestBodyTooLargeError) {
@@ -40,6 +42,9 @@ export async function POST(req: Request) {
 
     if (!requestedCwd || typeof requestedCwd !== "string") {
       return Response.json({ error: "cwd is required", code: "cwd_required" }, { status: 400 });
+    }
+    if (host.id === LOCAL_HOST_ID && isDirectorWorkspace(requestedCwd)) {
+      return Response.json({ error: "Use the dedicated Director entry instead of creating another Director chat.", code: "director_managed" }, { status: 409 });
     }
 
     const { provider, modelId, toolNames, thinkingLevel, advisor, ...promptCommand } = command as { provider?: string; modelId?: string; toolNames?: string[]; thinkingLevel?: string; advisor?: boolean; [key: string]: unknown };

@@ -10,6 +10,8 @@ import { useNavigationHistory } from "@/hooks/useNavigationHistory";
 import { isMacPlatform, navigateShortcutHint, NAVIGATION_HISTORY_MAX_ENTRIES } from "@/lib/navigation-history";
 import { useMobileSidebarGestures } from "@/hooks/useMobileSidebarGestures";
 import { SessionSidebar } from "./SessionSidebar";
+import { useDirector } from "@/hooks/useDirector";
+import { DirectorControls } from "./DirectorControls";
 import type { SearchMatchTarget } from "./SessionSearchMatches";
 import type { WorktreeContext } from "./SessionSidebar-helpers";
 import { ToastProvider } from "./ui/toast";
@@ -23,10 +25,8 @@ import type { RightPanelView } from "./RightPanel";
 import { useConnectionDiagnosticsEnabled } from "@/lib/connection-diagnostics-prefs";
 import { NotificationBell } from "./NotificationBell";
 import { BranchNavigator } from "./BranchNavigator";
-import { LanguageSwitcher } from "./LanguageSwitcher";
 import { CommandPaletteMount } from "./CommandPaletteMount";
 import { Check, ChevronDown, Command, Ellipsis, Folder, GitBranch, History, Menu, PanelLeft, PanelRight, Server, Terminal, Wand2, Zap } from "lucide-react";
-import { ThemeSwitcher } from "./ThemeSwitcher";
 import { translate, useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { formatGenerationSpeed } from "@/lib/generation-speed";
@@ -145,6 +145,8 @@ export function AppShell({ appName }: { appName: string }) {
     setAddProjectOpen(open);
   }, []);
   const { hosts } = useHostRows();
+  const director = useDirector();
+  const directorWorkspaceCwd = director.status?.workspaceCwd;
   const handleWorkspaceOptionsChange = useCallback((projects: ManagedProject[], selectedProject: string | null, cwd: string | null, hostId: string) => {
     setWorkspaceOptions({ projects, selectedProject, cwd, hostId });
   }, []);
@@ -365,7 +367,7 @@ export function AppShell({ appName }: { appName: string }) {
     if (container && active instanceof HTMLElement && container.contains(active)) {
       active.blur();
     }
-  }, [sidebarOpen, mobileSidebarReady]);
+  }, [sidebarOpen, mobileSidebarReady, sidebarContainerRef]);
   const refreshAppUpdate = useCallback(async (force = false, autoOpen = false): Promise<AppUpdateInfo | null> => {
     const data = await fetchAppUpdateJson<AppUpdateInfo>(
       force ? "/api/app-update?force=1" : "/api/app-update",
@@ -828,7 +830,7 @@ export function AppShell({ appName }: { appName: string }) {
     sidebarResizeHandlersRef.current = { onMove, onUp };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
-  }, [isMobile, sidebarWidth]);
+  }, [isMobile, sidebarWidth, sidebarContainerRef]);
 
   // If the app unmounts mid-drag, remove the window listeners and restore the
   // body cursor; otherwise the handlers leak and body stays cursor:col-resize.
@@ -842,94 +844,6 @@ export function AppShell({ appName }: { appName: string }) {
     document.body.style.userSelect = "";
   }, []);
 
-  const resetRightPanelWidth = useCallback(() => {
-    rightPanelRef.current?.style.removeProperty("--right-panel-width");
-    setRightPanelWidth(null);
-  }, []);
-
-  const changeRightPanelWidth = useCallback((delta: number) => {
-    setRightPanelWidth((prev) => {
-      // Keyboard steps from the fluid default start at the panel's live
-      // width so the first press doesn't jump to the clamp minimum.
-      const base = prev ?? rightPanelRef.current?.getBoundingClientRect().width ?? RIGHT_PANEL_MIN_WIDTH;
-      const next = clampRightPanelWidth(base + delta);
-      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
-      return next;
-    });
-  }, []);
-
-  const handleRightPanelResizeKey = useCallback((e: React.KeyboardEvent) => {
-    // The handle sits on the panel's left edge: left widens, right narrows.
-    if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      changeRightPanelWidth(10);
-    } else if (e.key === "ArrowRight") {
-      e.preventDefault();
-      changeRightPanelWidth(-10);
-    } else if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      resetRightPanelWidth();
-    }
-  }, [changeRightPanelWidth, resetRightPanelWidth]);
-
-  const handleRightPanelResizeStart = useCallback((e: React.MouseEvent) => {
-    if (isMobile) return;
-    e.preventDefault();
-    const startX = e.clientX;
-    // Live rect, not state: it always reflects the committed width (custom or
-    // fluid default), and keeps this callback above the state declarations
-    // without a TDZ cycle. The handle only exists while the panel is open.
-    const startWidth = rightPanelRef.current?.getBoundingClientRect().width
-      ?? RIGHT_PANEL_MIN_WIDTH;
-    // Same --ui-scale ground truth as the left sidebar handle: clientX is in
-    // viewport pixels while the panel width is zoomed layout pixels.
-    let uiScale = 1;
-    try {
-      const raw = getComputedStyle(document.documentElement).getPropertyValue("--ui-scale");
-      const value = parseFloat(raw);
-      if (Number.isFinite(value) && value > 0) uiScale = value;
-    } catch {
-      // SSR/unavailable: fall back to unscaled math.
-    }
-    setRightPanelResizing(true);
-    const onMove = (ev: MouseEvent) => {
-      // Dragging the left edge left grows the panel: inverse of the sidebar.
-      const next = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
-      // Write the CSS variable straight to the DOM: the flex row follows the
-      // pointer without re-rendering the whole AppShell on every mousemove.
-      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
-      pendingRightPanelWidthRef.current = next;
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      rightResizeHandlersRef.current = null;
-      setRightPanelResizing(false);
-      // Commit the final width so state and the persisted value agree with
-      // what the user actually dragged to.
-      setRightPanelWidth(pendingRightPanelWidthRef.current);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    pendingRightPanelWidthRef.current = startWidth;
-    rightResizeHandlersRef.current = { onMove, onUp };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  }, [isMobile]);
-
-  // If the app unmounts mid-drag, remove the window listeners and restore the
-  // body cursor; otherwise the handlers leak and body stays cursor:col-resize.
-  useEffect(() => () => {
-    const handlers = rightResizeHandlersRef.current;
-    if (!handlers) return;
-    window.removeEventListener("mousemove", handlers.onMove);
-    window.removeEventListener("mouseup", handlers.onUp);
-    rightResizeHandlersRef.current = null;
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }, []);
 
 
   // Dismiss the topbar dropdowns on outside click or Escape. The Escape
@@ -1022,6 +936,92 @@ export function AppShell({ appName }: { appName: string }) {
   });
   const pendingRightPanelWidthRef = useRef<number | null>(null);
   const rightResizeHandlersRef = useRef<{ onMove: (ev: MouseEvent) => void; onUp: () => void } | null>(null);
+  const resetRightPanelWidth = useCallback(() => {
+    rightPanelRef.current?.style.removeProperty("--right-panel-width");
+    setRightPanelWidth(null);
+  }, [rightPanelRef]);
+
+  const changeRightPanelWidth = useCallback((delta: number) => {
+    setRightPanelWidth((prev) => {
+      // Keyboard steps from the fluid default start at the panel's live
+      // width so the first press doesn't jump to the clamp minimum.
+      const base = prev ?? rightPanelRef.current?.getBoundingClientRect().width ?? RIGHT_PANEL_MIN_WIDTH;
+      const next = clampRightPanelWidth(base + delta);
+      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
+      return next;
+    });
+  }, [rightPanelRef]);
+
+  const handleRightPanelResizeKey = useCallback((e: React.KeyboardEvent) => {
+    // The handle sits on the panel's left edge: left widens, right narrows.
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      changeRightPanelWidth(10);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      changeRightPanelWidth(-10);
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      resetRightPanelWidth();
+    }
+  }, [changeRightPanelWidth, resetRightPanelWidth]);
+
+  const handleRightPanelResizeStart = useCallback((e: React.MouseEvent) => {
+    if (isMobile) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    // Read the committed width, including the fluid default, before dragging.
+    const startWidth = rightPanelRef.current?.getBoundingClientRect().width
+      ?? RIGHT_PANEL_MIN_WIDTH;
+    // Same --ui-scale ground truth as the left sidebar handle: clientX is in
+    // viewport pixels while the panel width is zoomed layout pixels.
+    let uiScale = 1;
+    try {
+      const raw = getComputedStyle(document.documentElement).getPropertyValue("--ui-scale");
+      const value = parseFloat(raw);
+      if (Number.isFinite(value) && value > 0) uiScale = value;
+    } catch {
+      // SSR/unavailable: fall back to unscaled math.
+    }
+    setRightPanelResizing(true);
+    const onMove = (ev: MouseEvent) => {
+      // Dragging the left edge left grows the panel: inverse of the sidebar.
+      const next = clampRightPanelWidth(startWidth - (ev.clientX - startX) / uiScale);
+      // Write the CSS variable straight to the DOM: the flex row follows the
+      // pointer without re-rendering the whole AppShell on every mousemove.
+      rightPanelRef.current?.style.setProperty("--right-panel-width", `${next}px`);
+      pendingRightPanelWidthRef.current = next;
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      rightResizeHandlersRef.current = null;
+      setRightPanelResizing(false);
+      // Commit the final width so state and the persisted value agree with
+      // what the user actually dragged to.
+      setRightPanelWidth(pendingRightPanelWidthRef.current);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    pendingRightPanelWidthRef.current = startWidth;
+    rightResizeHandlersRef.current = { onMove, onUp };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [isMobile, rightPanelRef]);
+
+  // If the app unmounts mid-drag, remove the window listeners and restore the
+  // body cursor; otherwise the handlers leak and body stays cursor:col-resize.
+  useEffect(() => () => {
+    const handlers = rightResizeHandlersRef.current;
+    if (!handlers) return;
+    window.removeEventListener("mousemove", handlers.onMove);
+    window.removeEventListener("mouseup", handlers.onUp);
+    rightResizeHandlersRef.current = null;
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }, []);
   useEffect(() => {
     setRightPanelWidth(loadRightPanelWidth());
   }, []);
@@ -1210,6 +1210,8 @@ export function AppShell({ appName }: { appName: string }) {
   }, [router, isMobile, selectedSession?.id]);
 
   const handleNewSession = useCallback((_sessionId: string, cwd: string | null, hostId?: string) => {
+    if (cwd && (hostId ?? LOCAL_HOST_ID) === LOCAL_HOST_ID && directorWorkspaceCwd
+      && comparableProjectPath(cwd) === comparableProjectPath(directorWorkspaceCwd)) return;
     setSettingsTab(null);
     setSelectedSession(null);
     setNewSessionCwd(cwd);
@@ -1225,7 +1227,7 @@ export function AppShell({ appName }: { appName: string }) {
       requestAnimationFrame(() => chatInputRef.current?.focus());
     }
     router.replace("/");
-  }, [router, isMobile]);
+  }, [router, isMobile, directorWorkspaceCwd]);
 
   // ---- In-app Navigate back / forward over visited chat views ----
   // Own stack, not the browser History API (that one belongs to the mobile
@@ -1753,59 +1755,105 @@ export function AppShell({ appName }: { appName: string }) {
     const right = header?.querySelector<HTMLElement>("[data-topbar-right-group]");
     const tools = header?.querySelector<HTMLElement>(".shell-topbar-tools");
     if (!header || !details || !content || !right || !tools) return;
+    let frame: number | null = null;
+    let controlsWidth: number | null = null;
+    let lastCompact: boolean | null = null;
+    let disposed = false;
     const update = () => {
+      frame = null;
+      if (disposed) return;
       const hadControlsFocus = content.contains(document.activeElement);
-      // Measure the real controls even while their disclosure is closed.
-      const closed = !details.open;
-      const display = content.style.display;
-      const visibility = content.style.visibility;
-      content.style.visibility = "hidden";
-      content.style.display = "flex";
-      details.open = true;
-      const children = Array.from(content.children).filter((child) =>
-        !["absolute", "fixed"].includes(getComputedStyle(child).position));
-      const contentStyle = getComputedStyle(content);
+      // Read the current clusters together, before exposing hidden controls or
+      // changing the title inset. Never force a second layout after restoring.
       const headerStyle = getComputedStyle(header);
-      const controlsWidth = children.reduce((width, child) => {
-        const style = getComputedStyle(child);
-        return width + child.getBoundingClientRect().width
-          + parseFloat(style.marginLeft) + parseFloat(style.marginRight);
-      }, 0) + Math.max(0, children.length - 1) * parseFloat(contentStyle.columnGap);
-      const leftNeed = controlsWidth
-        + (tools.firstElementChild?.getBoundingClientRect().width ?? 0)
-        + parseFloat(getComputedStyle(tools).columnGap)
-        + parseFloat(headerStyle.paddingLeft);
-      const rightNeed = parseFloat(headerStyle.paddingRight) + right.offsetWidth;
-      const required = leftNeed + parseFloat(headerStyle.columnGap) + rightNeed;
-      if (closed) details.open = false;
-      content.style.display = display;
-      content.style.visibility = visibility;
-      // Title pill: same inset on both sides = widest real cluster (+8px gap), so it
-      // is truly centered and never under a control. Expand the tools only if the
-      // pill still keeps >= 200px (the container-query hide threshold) with them.
-      header.style.setProperty(
-        "--topbar-side",
-        `${Math.ceil(Math.max(tools.offsetLeft + tools.offsetWidth, header.clientWidth - right.offsetLeft)) + 8}px`,
-      );
-      const titleFits = header.querySelector(".shell-topbar-center") === null
-        || 2 * Math.max(leftNeed, rightNeed) + 216 <= header.clientWidth;
-      const compact = required > header.clientWidth || !titleFits;
-      if (compact && details.dataset.compact !== "true" && hadControlsFocus) {
-        restoreToolsFocusRef.current = true;
+      const headerPadding = parseFloat(headerStyle.paddingLeft) || 0;
+      const headerGap = parseFloat(headerStyle.columnGap) || 0;
+      const toolsGap = parseFloat(getComputedStyle(tools).columnGap) || 0;
+      const headerWidth = header.clientWidth;
+      const toolsRight = tools.offsetLeft + tools.offsetWidth;
+      const rightNeed = headerWidth - right.offsetLeft;
+      const sidebarWidth = tools.firstElementChild?.getBoundingClientRect().width ?? 0;
+      const hasTitle = header.querySelector(".shell-topbar-center") !== null;
+      if (controlsWidth === null) {
+        // Closed details need real DOM measurement, but only when the controls
+        // change, not on every resize/observer delivery. Keep disclosure state.
+        const closed = !details.open;
+        const display = content.style.display;
+        const visibility = content.style.visibility;
+        const hidden = closed || getComputedStyle(content).display === "none";
+        if (hidden) {
+          content.style.visibility = "hidden";
+          content.style.display = "flex";
+          if (closed) details.open = true;
+        }
+        const gap = parseFloat(getComputedStyle(content).columnGap) || 0;
+        let count = 0;
+        controlsWidth = 0;
+        for (const child of content.children) {
+          const style = getComputedStyle(child);
+          if (style.display === "none" || style.position === "absolute" || style.position === "fixed") continue;
+          controlsWidth += child.getBoundingClientRect().width
+            + (parseFloat(style.marginLeft) || 0) + (parseFloat(style.marginRight) || 0);
+          count++;
+        }
+        controlsWidth += Math.max(0, count - 1) * gap;
+        if (hidden) {
+          if (closed) details.open = false;
+          content.style.display = display;
+          content.style.visibility = visibility;
+        }
       }
-      setCompactTopbar(compact);
+      const leftNeed = controlsWidth + sidebarWidth + toolsGap + headerPadding;
+      const required = leftNeed + headerGap + rightNeed;
+      // Equal insets keep the title centered. Reserve the expanded cluster
+      // before expanding it; shrinking is safely refined by the next resize.
+      const titleFits = !hasTitle || 2 * Math.max(leftNeed, rightNeed) + 216 <= headerWidth;
+      const compact = required > headerWidth || !titleFits;
+      const side = `${Math.ceil(Math.max(compact || isMobile ? toolsRight : leftNeed, rightNeed)) + 8}px`;
+      if (header.style.getPropertyValue("--topbar-side") !== side) {
+        header.style.setProperty("--topbar-side", side);
+      }
+      if (compact !== lastCompact) {
+        if (compact && details.dataset.compact !== "true" && hadControlsFocus) {
+          restoreToolsFocusRef.current = true;
+        }
+        lastCompact = compact;
+        setCompactTopbar(compact);
+      }
     };
-    const observer = new ResizeObserver(update);
+    const schedule = () => {
+      if (!disposed && frame === null) frame = requestAnimationFrame(update);
+    };
+    const invalidateControls = () => {
+      controlsWidth = null;
+      schedule();
+    };
+    // Observer callbacks only enqueue one frame; layout/state writes never run
+    // inside ResizeObserver delivery and cannot start a synchronous resize loop.
+    const observer = new ResizeObserver(schedule);
     observer.observe(header);
     observer.observe(right);
     observer.observe(tools);
-    observer.observe(content);
-    for (const child of content.children) observer.observe(child);
-    document.fonts.addEventListener("loadingdone", update);
+    const controlsObserver = new MutationObserver((records) => {
+      // Ignore our temporary content styles; descendant changes are real inputs.
+      if (records.some((record) => record.target !== content || record.type !== "attributes")) invalidateControls();
+    });
+    controlsObserver.observe(content, { childList: true, subtree: true, characterData: true, attributes: true });
+    const appearanceObserver = new MutationObserver(invalidateControls);
+    appearanceObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style", "lang", "dir", "data-theme", "data-font-size", "data-touch-targets", "data-ui-scale"],
+    });
+    document.fonts.addEventListener("loadingdone", invalidateControls);
+    // One synchronous initial pass preserves the pre-paint compact/title guard.
     update();
     return () => {
+      disposed = true;
+      if (frame !== null) cancelAnimationFrame(frame);
       observer.disconnect();
-      document.fonts.removeEventListener("loadingdone", update);
+      controlsObserver.disconnect();
+      appearanceObserver.disconnect();
+      document.fonts.removeEventListener("loadingdone", invalidateControls);
     };
   }, [isMobile, locale, settingsTab, showChat]);
   // While restoring initial session from URL, don't show the placeholder
@@ -1853,8 +1901,12 @@ export function AppShell({ appName }: { appName: string }) {
     setSearchMatchTarget((target) => (target && target.sessionId !== selectedSession?.id ? null : target));
   }, [selectedSession?.id]);
 
+  const handleOpenSettings = useCallback(() => setSettingsTab((previous) => previous ? null : "general"), []);
+  const handleOpenArchive = useCallback(() => setArchiveBrowserOpen(true), []);
+
   const sidebarContent = (
     <SessionSidebar
+      director={director}
       selectedSessionId={selectedSession?.id ?? null}
       optimisticSession={selectedSession?.path === "" ? selectedSession : null}
       onSelectSession={handleSelectSession}
@@ -1877,8 +1929,8 @@ export function AppShell({ appName }: { appName: string }) {
       setAddProjectOpen={openAddProject}
       usageVisible={providerUsageVisible}
       settingsOpen={Boolean(settingsTab)}
-      onOpenSettings={() => setSettingsTab((prev) => prev ? null : "general")}
-      onOpenArchive={() => setArchiveBrowserOpen(true)}
+      onOpenSettings={handleOpenSettings}
+      onOpenArchive={handleOpenArchive}
       navigation={sidebarNavigation}
       updateAvailable={Boolean(appUpdate?.updateAvailable)}
       onClose={isMobile ? handleSidebarToggle : undefined}
@@ -1918,6 +1970,8 @@ export function AppShell({ appName }: { appName: string }) {
         }}
       />
       <CommandPaletteMount
+        directorWorkspaceCwd={directorWorkspaceCwd}
+        newSessionDisabled={Boolean(selectedSession && selectedSession.id === director.status?.session?.id)}
         onSelectSession={handleSelectSession}
         onNewSession={() => {
           // An empty cwd is truthy, so showChat would render the shell while
@@ -2107,7 +2161,7 @@ export function AppShell({ appName }: { appName: string }) {
           gap: "0 8px",
           minWidth: 0,
         }}>
-          {/* Left Zone: Utility group (sidebar, theme, language) & session controls (history, branches, system) */}
+          {/* Left zone: sidebar and session controls (history, branches, system). */}
           <div className="shell-topbar-tools" style={{ display: "flex", alignItems: "center", gap: 4, height: isMobile ? 43 : 35, minWidth: 0, flexShrink: 0 }}>
             <button
               onClick={handleSidebarToggle}
@@ -2136,8 +2190,6 @@ export function AppShell({ appName }: { appName: string }) {
                 <Ellipsis size={16} strokeWidth={1.8} aria-hidden="true" />
               </summary>
               <div ref={mobileToolsContentRef} className="shell-topbar-overflow-content">
-            <ThemeSwitcher />
-            <LanguageSwitcher />
                 <button
                   type="button"
                   onClick={() => {
@@ -2481,6 +2533,7 @@ export function AppShell({ appName }: { appName: string }) {
 
         </div>
 
+        {selectedSession && selectedSession.id === director.status?.session?.id && <DirectorControls director={director} />}
         {/* Chat content */}
         <div style={{ flex: 1, overflow: "hidden", position: "relative" }}>
           {showChat ? (
@@ -2608,7 +2661,6 @@ export function AppShell({ appName }: { appName: string }) {
               onSessionStatsChange={handleSessionStatsChange}
               sessionInfoContainer={sessionInfoContainer}
               onGenerationSpeedChange={handleGenerationSpeedChange}
-              onOpenProviders={() => setSettingsTab("providers")}
               toolCallsDefaultCollapsed={toolCallsDefaultCollapsed}
               hideToolActivity={hideToolActivity}
               neverFoldActivity={neverFoldActivity}

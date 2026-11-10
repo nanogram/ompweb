@@ -12,7 +12,10 @@ const execFileAsync = promisify(execFile);
 export interface WebServiceConfig {
   port: number;
   hostname: string;
-  mode: "start" | "dev";
+  mode: "start" | "dev" | "ui";
+  uiSource?: string;
+  uiPublicUrl?: string;
+  uiProxyPort?: number;
   autostart: boolean;
   openBrowserOnLaunch: boolean;
   autoRestart: boolean;
@@ -25,7 +28,7 @@ export interface WebServiceStatus {
   isRunning: boolean;
   port: number;
   hostname: string;
-  mode: "start" | "dev";
+  mode: WebServiceConfig["mode"];
   desktopShortcutExists: boolean;
   startMenuShortcutExists: boolean;
   startupShortcutExists: boolean;
@@ -67,6 +70,10 @@ export const DEFAULT_WEB_SERVICE_CONFIG: WebServiceConfig = {
 };
 
 export function getRepoRoot(): string {
+  // A GUI snapshot must operate on its explicit, stable service installation.
+  if (process.env.OMP_WEB_SERVICE_ROOT) {
+    return process.env.OMP_WEB_SERVICE_ROOT;
+  }
   if (process.env.OMP_WEB_CHANNEL_MANAGER_ROOT && existsSync(process.env.OMP_WEB_CHANNEL_MANAGER_ROOT)) {
     return process.env.OMP_WEB_CHANNEL_MANAGER_ROOT;
   }
@@ -170,6 +177,7 @@ export function getWindowsExecutionEnv(): NodeJS.ProcessEnv {
 }
 
 export function getWebServiceConfigPath(): string {
+  if (process.env.OMP_WEB_SERVICE_CONFIG_PATH) return process.env.OMP_WEB_SERVICE_CONFIG_PATH;
   return path.join(getAgentDir(), "web-service.json");
 }
 
@@ -217,8 +225,8 @@ export function sanitizeHostname(val: unknown, fallback = DEFAULT_WEB_SERVICE_CO
   return fallback;
 }
 
-export function sanitizeMode(val: unknown, fallback: "start" | "dev" = DEFAULT_WEB_SERVICE_CONFIG.mode): "start" | "dev" {
-  if (val === "start" || val === "dev") {
+export function sanitizeMode(val: unknown, fallback: WebServiceConfig["mode"] = DEFAULT_WEB_SERVICE_CONFIG.mode): WebServiceConfig["mode"] {
+  if (val === "start" || val === "dev" || val === "ui") {
     return val;
   }
   return fallback;
@@ -233,6 +241,9 @@ export async function loadWebServiceConfig(): Promise<WebServiceConfig> {
       port: sanitizePort(data.port, DEFAULT_WEB_SERVICE_CONFIG.port),
       hostname: sanitizeHostname(data.hostname, DEFAULT_WEB_SERVICE_CONFIG.hostname),
       mode: sanitizeMode(data.mode, DEFAULT_WEB_SERVICE_CONFIG.mode),
+      ...(typeof data.uiSource === "string" ? { uiSource: data.uiSource } : {}),
+      ...(typeof data.uiPublicUrl === "string" ? { uiPublicUrl: data.uiPublicUrl } : {}),
+      ...(typeof data.uiProxyPort === "number" && Number.isInteger(data.uiProxyPort) && data.uiProxyPort >= 1 && data.uiProxyPort <= 65535 ? { uiProxyPort: data.uiProxyPort } : {}),
       autostart: typeof data.autostart === "boolean" ? data.autostart : DEFAULT_WEB_SERVICE_CONFIG.autostart,
       openBrowserOnLaunch: typeof data.openBrowserOnLaunch === "boolean" ? data.openBrowserOnLaunch : DEFAULT_WEB_SERVICE_CONFIG.openBrowserOnLaunch,
       autoRestart: typeof data.autoRestart === "boolean" ? data.autoRestart : DEFAULT_WEB_SERVICE_CONFIG.autoRestart,
@@ -245,9 +256,13 @@ export async function loadWebServiceConfig(): Promise<WebServiceConfig> {
 export async function saveWebServiceConfig(updates: Partial<WebServiceConfig>): Promise<WebServiceConfig> {
   const current = await loadWebServiceConfig();
   const merged: WebServiceConfig = {
+    ...current,
     port: updates.port !== undefined ? sanitizePort(updates.port, current.port) : current.port,
     hostname: updates.hostname !== undefined ? sanitizeHostname(updates.hostname, current.hostname) : current.hostname,
     mode: updates.mode !== undefined ? sanitizeMode(updates.mode, current.mode) : current.mode,
+    ...(typeof updates.uiSource === "string" ? { uiSource: updates.uiSource } : {}),
+    ...(typeof updates.uiPublicUrl === "string" ? { uiPublicUrl: updates.uiPublicUrl } : {}),
+    ...(typeof updates.uiProxyPort === "number" && Number.isInteger(updates.uiProxyPort) && updates.uiProxyPort >= 1 && updates.uiProxyPort <= 65535 ? { uiProxyPort: updates.uiProxyPort } : {}),
     autostart: typeof updates.autostart === "boolean" ? updates.autostart : current.autostart,
     openBrowserOnLaunch: typeof updates.openBrowserOnLaunch === "boolean" ? updates.openBrowserOnLaunch : current.openBrowserOnLaunch,
     autoRestart: typeof updates.autoRestart === "boolean" ? updates.autoRestart : current.autoRestart,
@@ -641,36 +656,12 @@ export async function stopTrayService(): Promise<{ success: boolean; message?: s
     return { success: false, message: "Only supported on Windows." };
   }
   try {
-    // Try to end Scheduled Task first (headless service)
-    try {
-      await execFileAsync("schtasks.exe", ["/end", "/tn", "omp-web"], { timeout: 3000, env: getWindowsExecutionEnv(), windowsHide: true });
-    } catch { }
-    const taskkillExe = resolveTaskkillBin();
-    const psCommand = `
-      $trayProcs = Get-CimInstance Win32_Process -Filter "Name LIKE '%powershell%' OR Name LIKE '%pwsh%' OR Name LIKE '%omp-web-tray%'" -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -ne $PID -and ($_.CommandLine -like '*omp-web-tray.ps1*' -or $_.CommandLine -like '*omp-web-service.ps1*' -or $_.CommandLine -like '*omp-web-tray.exe*') }
-      foreach ($p in $trayProcs) {
-          Start-Process -FilePath '${taskkillExe.replace(/'/g, "''")}' -ArgumentList "/PID $($p.ProcessId) /T /F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
-      }
-      # Also kill native tray exe directly by name (in case CommandLine is empty)
-      $nativeProcs = Get-CimInstance Win32_Process -Filter "Name = 'omp-web-tray.exe'" -ErrorAction SilentlyContinue
-      foreach ($p in $nativeProcs) {
-          Start-Process -FilePath '${taskkillExe.replace(/'/g, "''")}' -ArgumentList "/PID $($p.ProcessId) /T /F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
-      }
-      # Also kill orphaned node or bun servers on the service port
-      $port = if ($cfg -and $cfg.port) { [int]$cfg.port } else { 30177 }
-      $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Listen" }
-      foreach ($c in $conns) {
-          $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($c.OwningProcess)" -ErrorAction SilentlyContinue
-          if ($owner -and ($owner.Name -like "node*" -or $owner.Name -like "bun*")) {
-              Start-Process -FilePath '${taskkillExe.replace(/'/g, "''")}' -ArgumentList "/PID $($c.OwningProcess) /T /F" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
-          }
-      }
-    `;
-    const psExe = resolvePowerShellBin();
+    const repoRoot = getRepoRoot();
+    const controller = path.join(repoRoot, "scripts", "windows", "control-tray.ps1");
     await execFileAsync(
-      psExe,
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCommand],
-      { timeout: 8000, env: getWindowsExecutionEnv(), windowsHide: true }
+      resolvePowerShellBin(),
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", controller, "-Action", "Stop", "-ConfigPath", getWebServiceConfigPath()],
+      { cwd: repoRoot, timeout: 30_000, env: getWindowsExecutionEnv(), windowsHide: true }
     );
     invalidateTrayRunningCache();
     return { success: true };
@@ -679,10 +670,23 @@ export async function stopTrayService(): Promise<{ success: boolean; message?: s
     return { success: false, message: err.message };
   }
 }
-export async function restartTrayService(): Promise<{ success: boolean; message?: string }> {
-  await stopTrayService();
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, 800);
-  await promise;
-  return startTrayService({ openBrowser: false });
+/** WScript exits before the delayed controller stops this web process's tree. */
+export async function requestTrayServiceAction(action: "stop" | "restart"): Promise<{ success: boolean; message?: string }> {
+  if (process.platform !== "win32") {
+    return { success: false, message: "Only supported on Windows." };
+  }
+  const repoRoot = getRepoRoot();
+  const launcher = path.join(repoRoot, "scripts", "windows", "control-tray.vbs");
+  if (!existsSync(launcher) || !existsSync(path.join(repoRoot, "scripts", "windows", "control-tray.ps1"))) {
+    return { success: false, message: "The installed Windows service controller is missing." };
+  }
+  try {
+    await execFileAsync(resolveWscriptBin(), [launcher, action, getWebServiceConfigPath()], {
+      cwd: repoRoot, timeout: 8_000, env: getWindowsExecutionEnv(), windowsHide: true,
+    });
+    invalidateTrayRunningCache();
+    return { success: true, message: action === "restart" ? "OMPweb restart scheduled." : "OMPweb stop scheduled." };
+  } catch (error) {
+    return { success: false, message: error instanceof Error ? error.message : String(error) };
+  }
 }

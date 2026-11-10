@@ -7,6 +7,7 @@ const { default: userEvent } = await import("@testing-library/user-event");
 
 const { ChatInput } = await import("./ChatInput.tsx");
 const { clearDraft, getDraft, recoverDraft, setDraft } = await import("@/lib/draft-store");
+const { composerModelPreference } = await import("@/lib/composer-model-preference");
 
 const KEY = "queue-attachments";
 // 1x1 transparent PNG.
@@ -37,11 +38,18 @@ function override(target, key, replacement) {
   Object.defineProperty(target, key, { configurable: true, writable: true, value: replacement });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
   globalThis.FileReader = TestFileReader;
   URL.createObjectURL ??= () => "blob:test";
   URL.revokeObjectURL ??= () => {};
+  override(globalThis, "fetch", async (url) => {
+    if (new URL(url, window.location.href).pathname === "/api/web-settings") {
+      return Response.json({ composerModelKeys: null });
+    }
+    throw new Error(`Unexpected attachment fixture request: ${url}`);
+  });
+  await composerModelPreference.refresh();
 });
 afterEach(() => {
   try {
@@ -702,6 +710,7 @@ function installPendingDictation({ holdUpload = false, holdClaim = false, after 
   override(globalThis, "fetch", async (url, init) => {
     const target = new URL(url, window.location.href);
     const method = init?.method ?? "GET";
+    if (target.pathname === "/api/web-settings") return response({ composerModelKeys: null });
     if (target.pathname === "/api/stt" && method === "GET" && target.searchParams.has("scope")) {
       return response({ jobs: [] });
     }

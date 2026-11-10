@@ -1,7 +1,7 @@
 "use client";
 
 import type { RefObject } from "react";
-import { Check, Copy, FileText } from "lucide-react";
+import { Check, Copy } from "lucide-react";
 import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { useI18n } from "@/lib/i18n";
 import { Tooltip } from "./ui/primitives";
@@ -36,28 +36,22 @@ export function MessageCopyActions({ texts, bodyRef }: {
   bodyRef: RefObject<HTMLDivElement | null>;
 }) {
   const { t } = useI18n();
-  const plain = useCopyFeedback();
-  const markdown = useCopyFeedback();
+  const { copied, copy } = useCopyFeedback();
   if (!texts.some((text) => text.trim())) return null;
 
   const copyPlain = () => {
     const bodies = bodyRef.current?.querySelectorAll<HTMLElement>("[data-message-text]");
-    plain.copy(texts.map((text, index) => bodies?.[index] ? renderedText(bodies[index], text) : text).filter((text) => text.trim()).join("\n\n"));
+    copy(texts.map((text, index) => bodies?.[index] ? renderedText(bodies[index], text) : text).filter((text) => text.trim()).join("\n\n"));
   };
 
   return (
     <div className="message-copy-actions">
-      {[
-        { label: t("messageView.copyMessage"), text: t("messageView.copy"), copied: plain.copied, onClick: copyPlain, Icon: Copy },
-        { label: t("messageView.copyMarkdown"), text: t("messageView.markdown"), copied: markdown.copied, onClick: () => markdown.copy(texts.join("\n\n")), Icon: FileText },
-      ].map(({ label, text, copied, onClick, Icon }) => (
-        <Tooltip key={label} content={label}>
-          <button type="button" className="message-copy-action" onClick={onClick} aria-label={label}>
-            {copied ? <Check size={13} aria-hidden="true" /> : <Icon size={13} aria-hidden="true" />}
-            <span aria-live="polite">{copied ? t("messageView.copied") : text}</span>
-          </button>
-        </Tooltip>
-      ))}
+      <Tooltip content={t("messageView.copyMessage")}>
+        <button type="button" className="message-copy-action" onClick={copyPlain} aria-label={t("messageView.copyMessage")}>
+          {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+          <span aria-live="polite">{copied ? t("messageView.copied") : t("messageView.copy")}</span>
+        </button>
+      </Tooltip>
     </div>
   );
 }

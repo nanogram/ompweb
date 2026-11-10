@@ -4,6 +4,7 @@ import { getAgentDir } from "./omp/paths";
 import { BROWSER_TRANSPORTS, type BrowserTransport, type BrowserTransportState } from "./event-stream-protocol";
 import { DEFAULT_UPLOAD_RETENTION_DAYS, isUploadRetentionDays } from "./upload-limits";
 import { isRecord } from "./type-guards";
+import { isComposerModelKeys, type ComposerModelKeys } from "./composer-model-visibility";
 
 /** omp-web's own server-side settings (omp's config.yml stays omp's). */
 export interface WebServerSettings {
@@ -27,6 +28,8 @@ export interface WebServerSettings {
   browserTransport: BrowserTransport;
   /** Days a sent upload stays in its session's `local://uploads/` on every host; `null` keeps them for ever (docs/specs/2026-11-02-file-uploads-design.md, U6). */
   uploadRetentionDays: number | null;
+  /** Composer-only visibility: absent until configured, null = all, [] = none. Never changes omp's model registry. */
+  composerModelKeys?: ComposerModelKeys;
 }
 
 const DEFAULTS: WebServerSettings = {
@@ -61,35 +64,51 @@ declare global {
   var __ompWebSettingsCache: { path: string; settings: WebServerSettings } | undefined;
 }
 
-export function loadWebServerSettings(): WebServerSettings {
+export function loadWebServerSettings(strict = false): WebServerSettings {
   const path = settingsPath();
   const cached = globalThis.__ompWebSettingsCache;
   if (cached?.path === path) return cached.settings;
   let settings = DEFAULTS;
   try {
-    if (existsSync(path)) {
-      const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
-      if (isRecord(raw)) {
-        settings = {
-          autoResumeSessions: raw.autoResumeSessions === true,
-          agentToolsEnabled: raw.agentToolsEnabled === true,
-          agentEnv: readAgentEnvRecord(raw.agentEnv),
-          browserTransport: BROWSER_TRANSPORTS.find((transport) => transport === raw.browserTransport) ?? "ws",
-          uploadRetentionDays: isUploadRetentionDays(raw.uploadRetentionDays) ? raw.uploadRetentionDays : DEFAULT_UPLOAD_RETENTION_DAYS,
-        };
-      }
+    let source: string;
+    try {
+      source = readFileSync(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      globalThis.__ompWebSettingsCache = { path, settings };
+      return settings;
     }
-  } catch {
-    // Unreadable settings fall back to the defaults.
+    const raw: unknown = JSON.parse(source);
+    if (!isRecord(raw)) throw new Error("Web settings must be an object");
+    if (raw.composerModelKeys !== undefined && !isComposerModelKeys(raw.composerModelKeys)) {
+      throw new Error("Invalid stored composer model visibility");
+    }
+    settings = {
+      autoResumeSessions: raw.autoResumeSessions === true,
+      agentToolsEnabled: raw.agentToolsEnabled === true,
+      agentEnv: readAgentEnvRecord(raw.agentEnv),
+      browserTransport: BROWSER_TRANSPORTS.find((transport) => transport === raw.browserTransport) ?? "ws",
+      uploadRetentionDays: isUploadRetentionDays(raw.uploadRetentionDays) ? raw.uploadRetentionDays : DEFAULT_UPLOAD_RETENTION_DAYS,
+      ...(raw.composerModelKeys !== undefined ? { composerModelKeys: raw.composerModelKeys as ComposerModelKeys } : {}),
+    };
+  } catch (error) {
+    // Runtime consumers retain their defaults; preference reads/writes must not
+    // mistake an unreadable selection for an unconfigured installation.
+    if (strict) throw error;
+    return DEFAULTS;
   }
   globalThis.__ompWebSettingsCache = { path, settings };
   return settings;
 }
 
 /** Atomic write (temp file + rename), like the project registry. */
-export function saveWebServerSettings(patch: Partial<WebServerSettings>): WebServerSettings {
+export function saveWebServerSettings(patch: Partial<WebServerSettings>, composerModelKeysIfUnset = false): WebServerSettings {
   const path = settingsPath();
-  const settings = { ...loadWebServerSettings(), ...patch };
+  const current = loadWebServerSettings(true);
+  // No await between the check and atomic rename: concurrent migrations in
+  // this settings-owning web process are first-authoritative-wins.
+  if (composerModelKeysIfUnset && current.composerModelKeys !== undefined) return current;
+  const settings = { ...current, ...patch };
   mkdirSync(resolve(path, ".."), { recursive: true });
   const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
   try {

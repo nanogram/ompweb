@@ -108,7 +108,6 @@ export type NativeRegistrySettings = {
 export type RetrySettings = {
   retry?: { enabled?: boolean; maxRetries?: number; modelFallback?: boolean; fallbackRevertPolicy?: "cooldown-expiry" | "never"; fallbackChains?: Record<string, string[]> };
 };
-export const COMPOSER_MODELS_STORAGE_KEY = "omp-composer-models";
 export const NATIVE_MODEL_ROLES = ["default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor"];
 // omp's models.yml ApiSchema (config/models-config-schema.ts)
 export const API_OPTIONS = [

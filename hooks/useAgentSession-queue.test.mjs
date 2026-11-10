@@ -20,3 +20,13 @@ test("a confirmation the server snapshot has not covered yet replaces the browse
   assert.deepEqual(order(mergeHeldMessages("s", browser, confirmed, server)), ["first:server", "second:server", "third:browser"]);
   assert.deepEqual(order(mergeHeldMessages("s", [local("gone", 50, 0)], confirmed, EMPTY_SERVER_OUTBOX)), ["second:server"], "a delivered confirmation removes the browser copy");
 });
+
+test("settling one original id removes its late failed bridge, never an unrelated identical held prompt", () => {
+  const unknown = { ...stored("original", 100, "failed"), message: "identical", mayHaveBeenSent: true };
+  const identical = { ...stored("different", 100, "failed"), message: "identical", mayHaveBeenSent: true };
+  const current = applyOutboxSnapshot(EMPTY_SERVER_OUTBOX, [unknown, identical]);
+  const reconciled = applyOutboxSnapshot(current, [identical], ["original"]);
+  const lateLocal = { ...local("original", 100, 1), message: "identical" };
+  assert.deepEqual(mergeHeldMessages("s", [lateLocal], [unknown], reconciled).map(({ id, mayHaveBeenSent }) => [id, mayHaveBeenSent]), [["different", true]]);
+  assert.equal(mergeHeldMessages("s", [], [], current).length, 2, "unknown same-time/text records remain distinct until correlated settlement");
+});

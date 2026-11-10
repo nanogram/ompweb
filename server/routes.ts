@@ -16,6 +16,7 @@ import * as authProviders from "@/app/api/auth/providers/route";
 import * as cwdBrowse from "@/app/api/cwd/browse/route";
 import * as cwdValidate from "@/app/api/cwd/validate/route";
 import * as defaultCwd from "@/app/api/default-cwd/route";
+import * as director from "@/app/api/director/route";
 import * as events from "@/app/api/events/route";
 import * as eventsLink from "@/app/api/events/link/route";
 import * as fileIndex from "@/app/api/file-index/route";
@@ -116,6 +117,7 @@ export const ROUTE_MODULES: Record<string, RouteModule> = {
   "cwd/browse": cwdBrowse,
   "cwd/validate": cwdValidate,
   "default-cwd": defaultCwd,
+  "director": director,
   "events": events,
   "events/link": eventsLink,
   "file-index": fileIndex,

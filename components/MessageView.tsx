@@ -1,13 +1,13 @@
 "use client";
 
-import { memo, useState, useId, useRef, useEffect, useLayoutEffect, useMemo, useCallback, useContext, type ComponentProps } from "react";
-import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, Clock, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Volume2, Square, Trash2, Paperclip } from "lucide-react";
+import { memo, useState, useId, useRef, useEffect, useMemo, useCallback, useContext, type ComponentProps } from "react";
+import { Copy, Check, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, Clock, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench, Trash2, Paperclip } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
 import { WorkspaceFileContext } from "@/lib/workspace-file-context";
 import { AgentLinkContext, agentLinkIds } from "../lib/agent-links";
 import { MessageCopyActions } from "./MessageCopyActions";
-import { useSpeechContext } from "@/hooks/useSpeechSynthesis";
 import { ClickableImage } from "./ImageLightbox";
+import { FileLinkMenu } from "./FileLinkMenu";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { isEmptyThinkingBlock, isReplyBlock } from "@/lib/message-display";
@@ -18,7 +18,7 @@ import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { formatCompactNumber } from "@/lib/format";
 import { TaskResultPanel } from "./MessageView-task-panel";
 import { HubResultPanel } from "./MessageView-hub-panel";
-import { isMessageOverflowing } from "@/lib/message-overflow";
+import { scheduleMessageOverflow } from "@/lib/display/message-measurements";
 import { getResultDiff, PairedDiffResult, PairedResult } from "./MessageView-diff-view";
 import {
   getToolPreview,
@@ -162,13 +162,6 @@ interface Props {
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
   entryId?: string;
-  /** Branch point omp's `branch` command accepts for this message (a user entry; see lib/chat-fork.ts). */
-  forkEntryId?: string;
-  /** Forking puts the branched prompt back into the composer (edit-and-resend). */
-  forkEditsPrompt?: boolean;
-  onFork?: (entryId: string, editPrompt: boolean) => void;
-  forking?: boolean;
-  forkDisabled?: boolean;
   onEdit?: (entryId: string, content: string) => Promise<boolean>;
   editing?: boolean;
   editDisabled?: boolean;
@@ -234,12 +227,12 @@ export function areMessageViewPropsEqual(previous: Props, next: Props): boolean 
   return haveSameRelevantToolResults(previous.message, previous.toolResults, next.toolResults);
 }
 
-export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, forkEntryId, forkEditsPrompt, onFork, forking, forkDisabled, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
+export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, entryId, onEdit, editing, editDisabled, showTimestamp, prevTimestamp, sessionId, toolCallsDefaultCollapsed = true, expandThinkingByDefault = false, hideThinking = false, sourceBlockIndices, liveTokensPerSecond }: Props) {
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} forkDisabled={forkDisabled} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
+    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onEdit={onEdit} editing={editing} editDisabled={editDisabled} />;
   }
   if (message.role === "assistant") {
-    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} forkEntryId={forkEntryId} forkEditsPrompt={forkEditsPrompt} onFork={onFork} forking={forking} forkDisabled={forkDisabled} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
+    return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} toolCallsDefaultCollapsed={toolCallsDefaultCollapsed} expandThinkingByDefault={expandThinkingByDefault} hideThinking={hideThinking} sourceBlockIndices={sourceBlockIndices} liveTokensPerSecond={liveTokensPerSecond} />;
   }
   if (message.role === "toolResult") {
     // Rendered inline under its toolCall — skip standalone rendering if paired
@@ -277,72 +270,11 @@ function imageBlockSrc(img: ImageContent): string {
       : "";
 }
 
-/**
- * "New session" (fork) action, shared by user and assistant messages.
- *
- * omp's `branch` command accepts a user-message entry only (an assistant entry
- * answers "Invalid entry ID for branching"), so `entryId` is the branch point
- * resolved by `resolveForkTargets` — for an assistant reply, the next user
- * prompt, so the reply stays in the fork's history.
- */
-function ForkSessionButton({ entryId, editPrompt, onFork, forking, forkDisabled }: {
-  entryId: string;
-  editPrompt: boolean;
-  onFork: (entryId: string, editPrompt: boolean) => void;
-  forking?: boolean;
-  forkDisabled?: boolean;
-}) {
-  const { t } = useI18n();
-  // Rows are keyed by index, so bind the dialog to the entry it was opened for.
-  const [confirmingId, setConfirmingId] = useState<string | null>(null);
-  if (confirmingId !== null && confirmingId !== entryId) setConfirmingId(null);
-  const confirming = confirmingId === entryId;
-  const blocked = forkDisabled || forking;
-  return (
-    <>
-    <ConfirmDialog
-      open={confirming}
-      onOpenChange={(open) => { setConfirmingId(open ? entryId : null); }}
-      title={t("messageView.forkConfirmTitle")}
-      description={t(editPrompt ? "messageView.forkConfirmEditBody" : "messageView.forkConfirmBody")}
-      confirmLabel={t("messageView.newSession")}
-      cancelLabel={t("chatInput.cancel")}
-      onConfirm={() => { setConfirmingId(null); if (!blocked) onFork(entryId, editPrompt); }}
-    />
-    <Tooltip content={forking ? t("messageView.creatingSession") : t("messageView.newSessionTitle")}>
-      <button
-        onClick={() => { setConfirmingId(entryId); }}
-        disabled={blocked}
-        aria-label={forking ? t("messageView.creatingSession") : t("messageView.newSessionTitle")}
-        style={{
-          display: "flex", alignItems: "center", gap: 4,
-          padding: "3px 8px", height: 24, minHeight: 24,
-          background: "none", border: "none",
-          borderRadius: 5,
-          color: forking ? "var(--accent)" : "var(--text-dim)",
-          cursor: blocked ? "not-allowed" : "pointer",
-          fontSize: 11, fontWeight: 400,
-          whiteSpace: "nowrap",
-          transition: "color var(--dur-fast) var(--ease-out-warm)",
-        }}
-        onMouseEnter={(e) => { if (!blocked) e.currentTarget.style.color = "var(--accent)"; }}
-        onMouseLeave={(e) => { if (!blocked) e.currentTarget.style.color = "var(--text-dim)"; }}
-      >
-        <GitFork size={11} strokeWidth={1.8} />
-        {forking ? t("messageView.creating") : t("messageView.newSession")}
-      </button>
-    </Tooltip>
-    </>
-  );
-}
-function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, forkDisabled, onEdit, editing, editDisabled }: {
+function UserMessageView({ message, cwd, onOpenFile, entryId, onEdit, editing, editDisabled }: {
   message: UserMessage;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
   entryId?: string;
-  onFork?: (entryId: string, editPrompt: boolean) => void;
-  forking?: boolean;
-  forkDisabled?: boolean;
   onEdit?: (entryId: string, content: string) => Promise<boolean>;
   editing?: boolean;
   editDisabled?: boolean;
@@ -351,7 +283,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, f
   const bodyRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
-  // Rows are keyed by index, so bind the dialog to the entry it was opened for.
+  // Bind confirmation to its entry so a reused row cannot rewind another message.
   const [confirmingEditId, setConfirmingEditId] = useState<string | null>(null);
 
   const content =
@@ -366,27 +298,30 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, f
     typeof message.content === "string"
       ? []
       : message.content.filter((b): b is ImageContent => b.type === "image");
-  useLayoutEffect(() => {
+  useEffect(() => {
     const element = bodyRef.current;
     if (!element) return;
-    const observedElement = element;
-    const updateOverflow = () => setHasOverflow(isMessageOverflowing(observedElement));
+    let cancelMeasurement = () => {};
+    const updateOverflow = () => {
+      cancelMeasurement();
+      cancelMeasurement = scheduleMessageOverflow(element, setHasOverflow);
+    };
     updateOverflow();
-    observedElement.addEventListener("scroll", updateOverflow, { passive: true });
+    element.addEventListener("scroll", updateOverflow, { passive: true });
     const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(updateOverflow) : null;
-    observer?.observe(observedElement);
+    observer?.observe(element);
     return () => {
-      observedElement.removeEventListener("scroll", updateOverflow);
+      cancelMeasurement();
+      element.removeEventListener("scroll", updateOverflow);
       observer?.disconnect();
     };
-  }, [content, imageBlocks.length]);
+  }, [content, imageBlocks.length, expanded]);
 
   const time = formatTime(message.timestamp, locale);
-  const canFork = !!entryId && !!onFork;
   const canEdit = !!entryId && !!onEdit && !message.branchSummary;
   if (confirmingEditId !== null && (!canEdit || confirmingEditId !== entryId)) setConfirmingEditId(null);
   const confirmingEdit = canEdit && confirmingEditId === entryId;
-  const editBlocked = editing || editDisabled || forking || forkDisabled;
+  const editBlocked = editing || editDisabled;
 
   return (
     <div
@@ -460,13 +395,12 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, f
             gap: 6, marginTop: 3, width: "100%",
           }}>
           <MessageCopyActions texts={[content]} bodyRef={bodyRef} />
-          {(canEdit || canFork) && (
+          {canEdit && (
             <div
               style={{
                 display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 3,
               }}
             >
-              {canEdit && <>
               <ConfirmDialog
                 open={confirmingEdit}
                 onOpenChange={(open) => { setConfirmingEditId(open ? entryId! : null); }}
@@ -501,8 +435,6 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, f
                   {t("messageView.editFromHere")}
                 </button>
               </Tooltip>
-              </>}
-              {canFork && <ForkSessionButton entryId={entryId!} editPrompt onFork={onFork!} forking={forking} forkDisabled={forkDisabled || editing || editDisabled} />}
             </div>
           )}
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{time}</span>}
@@ -518,8 +450,8 @@ const heldActionStyle = {
   fontSize: 11, whiteSpace: "nowrap",
 } as const;
 
-/** A message omp-web holds until omp has it (docs/specs/2026-11-04-message-outbox-design.md O1): dimmed, after the
- * live turn, naming the leg it waits on. Delete only while nothing of it can have reached omp. */
+/** A message awaiting confirmed handoff or a retained failure/unknown outcome.
+ * Delete dismisses the record; it does not cancel anything omp may already have accepted. */
 export function HeldMessageView({ held, hostLabel, onDelete }: {
   held: HeldMessage;
   hostLabel?: string;
@@ -528,8 +460,9 @@ export function HeldMessageView({ held, hostLabel, onDelete }: {
   const { t, locale } = useI18n();
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const failed = held.state === "failed";
+  const uncertain = failed && held.mayHaveBeenSent === true;
   const status = failed
-    ? held.mayHaveBeenSent ? t("heldMessage.mayHaveBeenSent") : held.error ? t("heldMessage.notSentReason", { reason: held.error }) : t("heldMessage.notSent")
+    ? uncertain ? t("heldMessage.mayHaveBeenSent") : held.error ? t("heldMessage.notSentReason", { reason: held.error }) : t("heldMessage.notSent")
     : held.state === "waiting_host" ? t("heldMessage.waitingForHost", { host: hostLabel || t("heldMessage.theHost") })
     : held.state === "held" ? t("heldMessage.waiting")
     : held.state === "delivering" ? t("heldMessage.delivering")
@@ -568,7 +501,7 @@ export function HeldMessageView({ held, hostLabel, onDelete }: {
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 6, marginTop: 3, width: "100%", fontSize: 11 }}>
           <span style={{ padding: "1px 6px", border: "1px solid var(--border)", borderRadius: 999, color: "var(--text-dim)" }}>{mode}</span>
-          <span style={{ display: "flex", alignItems: "center", gap: 4, color: failed ? "var(--status-error)" : "var(--text-dim)" }}>
+          <span role="status" data-delivery-status={uncertain ? "unconfirmed" : failed ? "not-sent" : held.state} title={uncertain ? held.error : undefined} style={{ display: "flex", alignItems: "center", gap: 4, color: failed && !uncertain ? "var(--status-error)" : "var(--text-dim)" }}>
             <StatusIcon size={12} strokeWidth={1.8} className={failed || waits ? undefined : "activity-row-spinner"} aria-hidden />
             {status}
           </span>
@@ -619,11 +552,6 @@ function AssistantMessageView({
   prevTimestamp,
   sessionId,
   entryId,
-  forkEntryId,
-  forkEditsPrompt = false,
-  onFork,
-  forking,
-  forkDisabled,
   toolCallsDefaultCollapsed,
   expandThinkingByDefault,
   hideThinking,
@@ -640,12 +568,6 @@ function AssistantMessageView({
   prevTimestamp?: number;
   sessionId?: string;
   entryId?: string;
-  /** User entry omp's `branch` command accepts for this reply (see lib/chat-fork.ts). */
-  forkEntryId?: string;
-  forkEditsPrompt?: boolean;
-  onFork?: (entryId: string, editPrompt: boolean) => void;
-  forking?: boolean;
-  forkDisabled?: boolean;
   toolCallsDefaultCollapsed: boolean;
   expandThinkingByDefault: boolean;
   hideThinking: boolean;
@@ -653,19 +575,9 @@ function AssistantMessageView({
   liveTokensPerSecond?: number | null;
 }) {
   const { t, locale } = useI18n();
-  const { isSupported: ttsSupported, isSpeaking: ttsSpeaking, speakingId: ttsSpeakingId, toggle: ttsToggle } = useSpeechContext();
-  const speakableText = useMemo(() => {
-    return (message.content ?? [])
-      .filter((b): b is TextContent => b.type === "text" && typeof b.text === "string")
-      .map((b) => b.text)
-      .join("\n\n");
-  }, [message.content]);
-  const messageSpeechId = entryId ?? (message.timestamp ? String(message.timestamp) : "msg");
-  const isThisSpeaking = ttsSpeaking && ttsSpeakingId === messageSpeechId;
   const time = showTimestamp ? formatTime(message.timestamp, locale) : null;
   const bodyRef = useRef<HTMLDivElement>(null);
   const texts = (message.content ?? []).filter((block): block is TextContent => block.type === "text").map((block) => block.text);
-  const canFork = !!forkEntryId && !!onFork;
   const blockItems = (message.content ?? [])
     .map((block, index) => ({ block, originalIndex: sourceBlockIndices?.[index] ?? index }))
     .filter(({ block }) => !(hideThinking && block.type === "thinking") && !isEmptyThinkingBlock(block, { isStreaming }));
@@ -874,25 +786,10 @@ function AssistantMessageView({
         )}
       </div>
 
-      {!isStreaming && (texts.some((text) => text.trim()) || time || canFork || (ttsSupported && speakableText.trim().length > 0)) && (
+      {!isStreaming && (texts.some((text) => text.trim()) || time) && (
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 3 }}>
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
             <MessageCopyActions texts={texts} bodyRef={bodyRef} />
-            {ttsSupported && speakableText.trim().length > 0 && (
-              <Tooltip content={isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}>
-                <button
-                  type="button"
-                  className="message-copy-action"
-                  onClick={() => ttsToggle(messageSpeechId, speakableText)}
-                  aria-label={isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.readAloud")}
-                  style={isThisSpeaking ? { color: "var(--accent)", background: "var(--bg-hover)" } : undefined}
-                >
-                  {isThisSpeaking ? <Square size={13} aria-hidden="true" /> : <Volume2 size={13} aria-hidden="true" />}
-                  <span>{isThisSpeaking ? t("messageView.stopSpeech") : t("messageView.read")}</span>
-                </button>
-              </Tooltip>
-            )}
-            {canFork && <ForkSessionButton entryId={forkEntryId!} editPrompt={forkEditsPrompt} onFork={onFork!} forking={forking} forkDisabled={forkDisabled} />}
           </div>
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: "auto" }}>{time}</span>}
         </div>
@@ -1071,6 +968,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
 }) {
   const { t } = useI18n();
   const openAgentLink = useContext(AgentLinkContext);
+  const fileSource = useContext(WorkspaceFileContext);
   // `partial` results are omp's live snapshots for a tool that is still
   // executing (see lib/types.ts); the committed toolResult replaces them.
   const isRunning = result?.partial === true;
@@ -1183,6 +1081,12 @@ const ToolCallBlock = memo(function ToolCallBlock({
                 {hubPreview ?? preview}
               </span>
             ) : cleanFilePath && onOpenFile ? (
+              <FileLinkMenu
+                key={JSON.stringify([fileSource?.hostId ?? "local", fileSource?.sessionId ?? null, cleanFilePath])}
+                filePath={cleanFilePath}
+                source={fileSource}
+                onPreview={() => onOpenFile(cleanFilePath)}
+              >
               <span
                 role="button"
                 tabIndex={0}
@@ -1201,6 +1105,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
               >
                 {hubPreview ?? preview}
               </span>
+              </FileLinkMenu>
             ) : webUrl ? (
               <span
                 role="link"

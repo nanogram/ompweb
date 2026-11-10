@@ -1,15 +1,12 @@
 "use client";
 
-// Composer-attached queue panel: omp's queued prompts plus the progress the
-// server's ledger tracks for the current batch (lib/queue-progress.ts) —
-// done items with their duration, the running item, pending items (still
-// editable while omp holds them), failed and cancelled ones.
+// Composer-attached native pending queue. Once omp consumes a message, its
+// transcript owns the display; the ledger is not a second execution history.
 
 import React, { useState } from "react";
-import { Ban, Check, ChevronDown, Circle, CircleAlert, Loader2, X } from "lucide-react";
+import { ChevronDown, Circle } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
-import type { QueuePanelItem, QueueProgressStatus } from "@/lib/queue-progress";
-import { formatDuration } from "@/lib/subagent-format";
+import type { QueuePanelItem } from "@/lib/queue-progress";
 import { QueuedActionButton } from "./ChatInput-banners";
 
 export interface QueuedEntry {
@@ -27,59 +24,33 @@ interface QueueProgressPanelProps {
   promoteBlocked: boolean;
   onAction: (entry: QueuedEntry, action: "edit" | "steer") => void;
   onDelete: (entry: QueuedEntry) => void;
-  onDismiss?: () => void;
 }
 
-const STATUS_COLORS: Record<QueueProgressStatus, string> = {
-  queued: "var(--text-dim)",
-  running: "var(--accent)",
-  done: "var(--status-success)",
-  failed: "var(--status-error)",
-  cancelled: "var(--text-dim)",
-};
-
-function StatusIcon({ status, label }: { status: QueueProgressStatus; label: string }) {
-  const props = { size: 12, strokeWidth: 2, "aria-hidden": true as const };
+function PendingIcon({ label }: { label: string }) {
   return (
     <span
       role="img"
       aria-label={label}
       title={label}
-      data-queue-status={status}
-      style={{ display: "inline-flex", flexShrink: 0, color: STATUS_COLORS[status] }}
+      data-queue-status="queued"
+      style={{ display: "inline-flex", flexShrink: 0, color: "var(--text-dim)" }}
     >
-      {status === "running" ? <Loader2 {...props} className="animate-spin" />
-        : status === "done" ? <Check {...props} />
-          : status === "failed" ? <CircleAlert {...props} />
-            : status === "cancelled" ? <Ban {...props} />
-              : <Circle {...props} size={10} />}
+      <Circle size={10} strokeWidth={2} aria-hidden />
     </span>
   );
 }
 
 export function QueueProgressPanel({
-  items, actionPending, canRemove, canPromote, promoteBlocked, onAction, onDelete, onDismiss,
+  items, actionPending, canRemove, canPromote, promoteBlocked, onAction, onDelete,
 }: QueueProgressPanelProps) {
   const { t } = useI18n();
-  const finished = items.every((item) => item.status !== "queued" && item.status !== "running");
-  // The list starts collapsed and folds back into the summary once every item
-  // has finished (state derived from the previous render, not an effect).
-  const [view, setView] = useState({ expanded: false, finished });
-  if (view.finished !== finished) setView({ expanded: finished ? false : view.expanded, finished });
-  const expanded = view.expanded;
-  const toggle = () => setView((current) => ({ ...current, expanded: !current.expanded }));
-
-  const count = (status: QueueProgressStatus) => items.filter((item) => item.status === status).length;
-  const failed = count("failed");
-  const cancelled = count("cancelled");
-  const statusLabel = (status: QueueProgressStatus) => t(`chatInput.queueStatus.${status}`);
-  const current = items.find((item) => item.status === "running") ?? items.find((item) => item.status === "queued");
+  const [expanded, setExpanded] = useState(false);
+  const toggle = () => setExpanded((current) => !current);
+  const current = items[0];
+  if (!current) return null;
 
   const renderItem = (item: QueuePanelItem) => {
     const entry: QueuedEntry = { kind: item.queue === "steering" ? "steer" : "follow-up", text: item.text };
-    const duration = item.status === "done" && item.startedAt !== undefined && item.finishedAt !== undefined
-      ? formatDuration(item.finishedAt - item.startedAt)
-      : null;
     const steer = entry.kind === "steer";
     return (
       <div
@@ -95,7 +66,7 @@ export function QueueProgressPanel({
           fontSize: 12,
         }}
       >
-        <StatusIcon status={item.status} label={statusLabel(item.status)} />
+        <PendingIcon label={t("chatInput.queueStatus.queued")} />
         <span style={{
           flexShrink: 0,
           fontSize: 9.5,
@@ -118,24 +89,14 @@ export function QueueProgressPanel({
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
-            color: item.status === "failed" ? "var(--status-error)"
-              : item.status === "queued" || item.status === "running" ? "var(--text)" : "var(--text-muted)",
-            textDecoration: item.status === "cancelled" ? "line-through" : "none",
+            color: "var(--text)",
             fontFamily: "var(--font-mono)",
             fontSize: 11.5,
           }}
         >
           {item.text}
         </span>
-        {duration && (
-          <span
-            title={t("chatInput.queueDurationTitle", { duration })}
-            style={{ flexShrink: 0, color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 10.5 }}
-          >
-            {duration}
-          </span>
-        )}
-        {item.status === "queued" && item.actionable && (
+        {item.actionable && (
           <>
             <QueuedActionButton disabled={actionPending || !canRemove} onClick={() => onAction(entry, "edit")} title={t("chatInput.queuedEditTitle")}>
               {t("chatInput.queuedEdit")}
@@ -154,28 +115,6 @@ export function QueueProgressPanel({
     );
   };
 
-  const dismissButton = finished && onDismiss && (
-    <button
-      type="button"
-      onClick={onDismiss}
-      title={t("chatInput.queueDismissTitle")}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-        background: "none",
-        border: "none",
-        padding: "2px 6px",
-        cursor: "pointer",
-        color: "var(--text-dim)",
-        fontSize: 11,
-        flexShrink: 0,
-      }}
-    >
-      <X size={12} strokeWidth={2} aria-hidden="true" />
-      {t("chatInput.queueDismiss")}
-    </button>
-  );
 
   return (
     <div
@@ -189,9 +128,8 @@ export function QueueProgressPanel({
       }}
     >
       {items.length === 1 ? (
-        <div style={{ display: "flex", alignItems: "center", paddingRight: dismissButton ? 4 : 0 }}>
+        <div style={{ display: "flex", alignItems: "center" }}>
           <div style={{ flex: 1, minWidth: 0, padding: "1px 0" }}>{renderItem(items[0])}</div>
-          {dismissButton}
         </div>
       ) : (
         <>
@@ -238,12 +176,9 @@ export function QueueProgressPanel({
               />
               <span style={{ flexShrink: 0 }}>{t("chatInput.queuedPrompts")}</span>
               <span
-                data-queue-progress
-                style={{ flexShrink: 0, color: finished && failed === 0 ? "var(--status-success)" : "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 10, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}
+                style={{ flexShrink: 0, color: "var(--text-dim)", fontFamily: "var(--font-mono)", fontSize: 10, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}
               >
-                {t("chatInput.queueProgress", { done: count("done"), total: items.length })}
-                {failed > 0 && <span style={{ color: "var(--status-error)" }}>{` · ${t("chatInput.queueFailedCount", { count: failed })}`}</span>}
-                {cancelled > 0 && ` · ${t("chatInput.queueCancelledCount", { count: cancelled })}`}
+                {items.length}
               </span>
               {!expanded && current && (
                 <span style={{
@@ -258,15 +193,14 @@ export function QueueProgressPanel({
                   textTransform: "none",
                   letterSpacing: 0,
                 }}>
-                  <StatusIcon status={current.status} label={statusLabel(current.status)} />
+                  <PendingIcon label={t("chatInput.queueStatus.queued")} />
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {current.queue === "steering" ? `[${t("chatInput.queuedSteer")}] ` : ""}{current.text}
                   </span>
                 </span>
               )}
             </button>
-            {dismissButton || (
-              <button
+            <button
                 type="button"
                 onClick={toggle}
                 style={{
@@ -280,8 +214,7 @@ export function QueueProgressPanel({
                 }}
               >
                 {expanded ? t("chatInput.collapseQueued") : t("chatInput.expandQueued")}
-              </button>
-            )}
+            </button>
           </div>
           {expanded && (
             <div style={{

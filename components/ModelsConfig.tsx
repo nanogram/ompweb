@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useComposerModelPreference } from "@/hooks/useComposerModelPreference";
 import { useI18n } from "@/lib/i18n";
 import { isSafeExternalUrl } from "@/lib/safe-url";
 import { omitUntouchedModelDrafts } from "@/lib/models-config-drafts";
@@ -27,7 +28,6 @@ import { ModelCatalogPicker } from "./ModelCatalogPicker";
 import { ProviderAccounts } from "./ProviderAccounts";
 import {
   API_OPTIONS,
-  COMPOSER_MODELS_STORAGE_KEY,
   COST_LABEL_KEYS,
   ENDPOINT_PRESETS,
   LEVEL_COLORS,
@@ -1054,7 +1054,9 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
   const [connectedProviders, setConnectedProviders] = useState<ConnectedProvider[]>([]);
   const [runtimeModelsLoading, setRuntimeModelsLoading] = useState(true);
   const [connectSearch, setConnectSearch] = useState("");
-  const [visibleModelKeys, setVisibleModelKeys] = useState<Set<string> | null>(null);
+  const composerModels = useComposerModelPreference();
+  const { visibleModelKeys, save: saveComposerModels } = composerModels;
+  const composerPickerDisabled = !composerModels.ready || composerModels.loading || composerModels.saving || Boolean(composerModels.error);
   const [composerPickerSearch, setComposerPickerSearch] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   // Provider name whose catalog picker is open (null = closed).
@@ -1125,45 +1127,22 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
     loadRuntimeModels();
   }, [loadConfig, loadOAuthProviders, loadApiKeyProviders, loadRuntimeModels]);
 
-  useEffect(() => {
-    try {
-      const stored = JSON.parse(localStorage.getItem(COMPOSER_MODELS_STORAGE_KEY) ?? "null");
-      if (Array.isArray(stored)) setVisibleModelKeys(new Set(stored.filter((item): item is string => typeof item === "string")));
-    } catch {
-      // Invalid UI-only preferences fall back to showing all native runtime models.
-    }
-  }, []);
-
-  useEffect(() => {
-    if (visibleModelKeys === null) return;
-    try {
-      localStorage.setItem(COMPOSER_MODELS_STORAGE_KEY, JSON.stringify([...visibleModelKeys]));
-      window.dispatchEvent(new Event("omp-composer-models-change"));
-    } catch {
-      // Storage is optional UI state; a disabled or full store must not break settings.
-    }
-  }, [visibleModelKeys]);
-
   const setComposerModelVisible = useCallback((model: RuntimeModelEntry, visible: boolean) => {
-    setVisibleModelKeys((current) => {
-      const next = new Set(current ?? runtimeModels.map((entry) => `${entry.provider}:${entry.id}`));
-      const key = `${model.provider}:${model.id}`;
-      if (visible) next.add(key); else next.delete(key);
-      return next;
-    });
-  }, [runtimeModels]);
+    const next = new Set(visibleModelKeys ?? runtimeModels.map((entry) => `${entry.provider}:${entry.id}`));
+    const key = `${model.provider}:${model.id}`;
+    if (visible) next.add(key); else next.delete(key);
+    void saveComposerModels([...next]);
+  }, [runtimeModels, visibleModelKeys, saveComposerModels]);
 
   const setComposerProviderVisible = useCallback((provider: string, visible: boolean) => {
-    setVisibleModelKeys((current) => {
-      const next = new Set(current ?? runtimeModels.map((entry) => `${entry.provider}:${entry.id}`));
-      for (const model of runtimeModels) {
-        if (model.provider !== provider) continue;
-        const key = `${model.provider}:${model.id}`;
-        if (visible) next.add(key); else next.delete(key);
-      }
-      return next;
-    });
-  }, [runtimeModels]);
+    const next = new Set(visibleModelKeys ?? runtimeModels.map((entry) => `${entry.provider}:${entry.id}`));
+    for (const model of runtimeModels) {
+      if (model.provider !== provider) continue;
+      const key = `${model.provider}:${model.id}`;
+      if (visible) next.add(key); else next.delete(key);
+    }
+    void saveComposerModels([...next]);
+  }, [runtimeModels, visibleModelKeys, saveComposerModels]);
 
 
   const enableConnectedProvider = useCallback(async (provider: string) => {
@@ -1351,6 +1330,9 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
               <span style={{ fontSize: 11, padding: "3px 8px", borderRadius: 10, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text-muted)", fontWeight: 600 }}>{t("modelsConfig.modelsVisible", { visible: totalVisible, total: runtimeModels.length })}</span>
               <span style={{ fontSize: 11, color: "var(--text-dim)" }}>·</span>
               <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{tn("modelsConfig.providerCount", Object.keys(runtimeModelsByProvider).length)}</span>
+              <button type="button" style={presetButtonStyle} disabled={composerPickerDisabled} onClick={() => void composerModels.save(null)}>{t("modelsConfig.composerPickerShowAll")}</button>
+              <button type="button" style={presetButtonStyle} disabled={composerPickerDisabled} onClick={() => void composerModels.save([])}>{t("modelsConfig.composerPickerHideAll")}</button>
+              {(composerModels.loading || composerModels.saving) && <span role="status" style={{ fontSize: 12, color: "var(--text-muted)" }}>{t(composerModels.saving ? "modelsConfig.saving" : "modelsConfig.loading")}</span>}
             </div>
             <label style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px var(--control-padding-inline)", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", cursor: "text" }}>
               <Search size={14} aria-hidden="true" style={{ color: "var(--text-dim)", flexShrink: 0 }} />
@@ -1365,6 +1347,12 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
               )}
             </label>
           </div>
+          {composerModels.error && (
+            <div role="alert" style={{ color: "var(--status-error)", fontSize: 12 }}>
+              {t("modelsConfig.composerPickerSyncError")} {composerModels.error}{" "}
+              <button type="button" style={presetButtonStyle} disabled={composerModels.loading} onClick={() => void composerModels.refresh()}>{t("chatWindow.retry")}</button>
+            </div>
+          )}
           {runtimeModelsLoading ? <div style={{ color: "var(--text-muted)", fontSize: 12 }}>{t("modelsConfig.loadingRuntimeModels")}</div> : filteredProviders.length === 0 ? (
             <div style={{ padding: "24px 16px", border: "1px dashed var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", color: "var(--text-dim)", fontSize: 12, textAlign: "center" }}>
               {pickerQuery ? t("modelsConfig.noModelsMatch", { query: composerPickerSearch }) : t("modelsConfig.noReportedModels")}
@@ -1374,7 +1362,7 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
             const providerSomeVisible = models.some((model) => visibleModelKeys === null || visibleModelKeys.has(`${model.provider}:${model.id}`));
             return <section key={provider} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-card)", overflow: "hidden", background: "var(--bg-panel)", boxShadow: "var(--shadow-card)" }}>
               <label style={{ display: "flex", alignItems: "center", gap: 9, padding: "10px 12px", background: "var(--bg)", borderBottom: "1px solid var(--border)", color: "var(--text)", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
-                <input type="checkbox" checked={providerVisible} ref={(input) => { if (input) input.indeterminate = providerSomeVisible && !providerVisible; }} onChange={(event) => setComposerProviderVisible(provider, event.target.checked)} aria-label={`Show all ${provider} models in composer`} />
+                <input type="checkbox" disabled={composerPickerDisabled} checked={providerVisible} ref={(input) => { if (input) input.indeterminate = providerSomeVisible && !providerVisible; }} onChange={(event) => setComposerProviderVisible(provider, event.target.checked)} aria-label={`Show all ${provider} models in composer`} />
                 <ProviderIcon id={provider} size={15} />
                 <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{provider}</span>
                 <span style={{ color: "var(--text-dim)", fontSize: 11, fontWeight: 500, padding: "2px 7px", borderRadius: 10, background: "var(--bg-subtle)", border: "1px solid var(--border)" }}>{models.length}</span>
@@ -1382,7 +1370,7 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
               <div style={{ display: "flex", flexDirection: "column" }}>
                 {models.map((model) => (
                   <label key={`${model.provider}:${model.id}`} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", color: "var(--text)", cursor: "pointer", borderTop: "1px solid var(--border)", background: visibleModelKeys !== null && !visibleModelKeys.has(`${model.provider}:${model.id}`) ? "var(--bg)" : "var(--bg-panel)" }}>
-                    <input type="checkbox" checked={visibleModelKeys === null || visibleModelKeys.has(`${model.provider}:${model.id}`)} onChange={(event) => setComposerModelVisible(model, event.target.checked)} aria-label={`Show ${model.provider}/${model.id} in composer`} />
+                    <input type="checkbox" disabled={composerPickerDisabled} checked={visibleModelKeys === null || visibleModelKeys.has(`${model.provider}:${model.id}`)} onChange={(event) => setComposerModelVisible(model, event.target.checked)} aria-label={`Show ${model.provider}/${model.id} in composer`} />
                     <span style={{ minWidth: 0, flex: 1, fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{model.name || model.id}</span>
                     <code style={{ color: "var(--text-dim)", fontSize: 11, fontFamily: "var(--font-mono)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 220 }}>{model.provider}/{model.id}</code>
                   </label>

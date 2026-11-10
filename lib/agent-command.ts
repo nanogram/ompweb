@@ -7,6 +7,8 @@ import { attachUploads, forgetUploads, takeUploads, type OutboxUploadReceipt } f
 import { runOutboxCommand } from "@/lib/message-outbox";
 import { HostOpError } from "@/lib/hosts/link-protocol";
 import { isRecord } from "@/lib/type-guards";
+import { directorCommandError } from "./director-policy";
+import { isDirectorSession } from "./director-state";
 
 export interface AgentSelection {
   provider?: string;
@@ -121,6 +123,10 @@ export async function runAgentCommand(id: string, body: unknown, advisor: boolea
       return Response.json({ error: "command type is required", code: "command_type_required" }, { status: 400 });
     }
     const type = command.type;
+    const liveDirector = getRpcSession(id);
+    const directorError = directorCommandError(id, liveDirector?.cwd, command, liveDirector?.host.id);
+    if (directorError) throw new WebRpcError(directorError, "director_read_only");
+    if ((!liveDirector || liveDirector.host.id === "local") && isDirectorSession(id, liveDirector?.cwd)) advisor = false;
     const selection: AgentSelection = type === "prompt" ? readAgentSelection(command) : {};
     const captureBoundary = type === "prompt" && command.captureRunBoundary === true;
     if (type === "prompt") {

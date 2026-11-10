@@ -68,7 +68,7 @@ export function TodoList({ phases = [], liveStatus = null, waitingForInput = fal
   }).filter((phase) => phase.tasks.length > 0);
   const isTruncated = displayedPhases.reduce((count, phase) => count + phase.tasks.length, 0) < tasks.length;
 
-  const headerRowClass = "flex items-center gap-2 px-3 py-2 text-xs text-text-muted";
+  const headerRowClass = "flex min-w-0 items-center gap-2 px-3 py-2 text-xs text-text-muted";
   const headerBorderClass = collapsed ? "" : "border-b border-border";
   const progress = t("chatWindow.todoProgress", { done, total: tasks.length });
   // Merged live status (#245): sits in this already-present header row so
@@ -93,29 +93,31 @@ export function TodoList({ phases = [], liveStatus = null, waitingForInput = fal
   return (
     <section
       aria-label={t("chatWindow.todoList")}
-      className={`overflow-hidden border border-border bg-bg-subtle ${collapsible ? "" : "my-2"}`}
+      className={`min-w-0 overflow-hidden border border-border bg-bg-subtle ${collapsible ? "" : "my-2"}`}
       style={{ borderRadius: "var(--radius-card)" }}
     >
       {collapsible ? (
         <button
           type="button"
           aria-expanded={!collapsed}
+          aria-label={`${t("chatWindow.todoList")}: ${progress}`}
           onClick={() => setCollapsed((value) => !value)}
           title={collapsed ? t("chatWindow.expandPanel") : t("chatWindow.collapsePanel")}
-          className={`${headerRowClass} ${headerBorderClass} w-full cursor-pointer text-left`}
+          className={`${headerRowClass} border-t ${collapsed ? "border-transparent" : "border-border"} w-full cursor-pointer text-left`}
           style={{ background: "none" }}
         >
-          <ListChecks size={15} strokeWidth={1.8} aria-hidden />
-          <strong className="font-medium text-text">{t("chatWindow.todoList")}</strong>
+          <ListChecks size={15} strokeWidth={1.8} className="shrink-0" aria-hidden />
+          <strong className="composer-activity-label shrink-0 font-medium text-text">{t("chatWindow.todoList")}</strong>
           {liveStatusNode}
-          <span className={liveStatus ? "shrink-0" : "ml-auto"}>{progress}</span>
+          <span className={`${liveStatus ? "shrink-0" : "ml-auto"} whitespace-nowrap`}>{progress}</span>
           <ChevronDown
             size={14}
             strokeWidth={1.8}
             aria-hidden
+            className="shrink-0"
             style={{
               color: "var(--text-dim)",
-              transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)",
+              transform: collapsed ? "rotate(-90deg)" : "rotate(180deg)",
               transition: "transform var(--dur-med) var(--ease-out-warm)",
             }}
           />
@@ -129,7 +131,7 @@ export function TodoList({ phases = [], liveStatus = null, waitingForInput = fal
         </div>
       )}
       {!collapsed && (
-        <>
+        <div className="composer-activity-expansion flex min-h-0 flex-col">
       {/* Capped and scrolled like the sibling subagents panel in
           ComposerPanels. Both panels are pinned above the composer, outside the
           chat scroller, so an uncapped list runs its own rows off-screen with
@@ -142,7 +144,7 @@ export function TodoList({ phases = [], liveStatus = null, waitingForInput = fal
           differs from the section's so a screen reader does not announce
           "Tasks" twice on the way in. */}
       <div
-        className="grid gap-3 px-3 py-2.5 animate-slide-down"
+        className={`grid min-h-0 gap-3 px-3 py-2.5 ${collapsible ? "animate-slide-up" : "animate-slide-down"}`}
         style={{ maxHeight: "min(30vh, 240px)", overflowY: "auto" }}
         role="group"
         aria-label={t("chatWindow.todoPlanScroll")}
@@ -178,13 +180,13 @@ export function TodoList({ phases = [], liveStatus = null, waitingForInput = fal
       {(isTruncated || expanded) && (
         <button
           type="button"
-          className="border-t border-border px-3 py-2 text-left text-xs text-accent hover:text-accent-hover"
+          className="shrink-0 border-t border-border px-3 py-2 text-left text-xs text-accent hover:text-accent-hover"
           onClick={() => setExpanded((value) => !value)}
         >
           {expanded ? t("chatWindow.todoShowLess") : t("chatWindow.todoShowAll")}
         </button>
       )}
-        </>
+        </div>
       )}
     </section>
   );

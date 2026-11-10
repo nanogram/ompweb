@@ -129,7 +129,7 @@ interface ProjectRowProps {
 /** One project in the sidebar: a card row matching the session items' visual
  *  language, with the project's session tree (capped at MAX_PROJECT_SESSIONS
  *  roots, with a show-more toggle) nested under it when expanded. */
-function ProjectRow({
+const ProjectRow = memo(function ProjectRow({
   project,
   isActive,
   isExpanded,
@@ -502,7 +502,7 @@ function ProjectRow({
       )}
     </section>
   );
-}
+});
 const SessionTreeItem = memo(function SessionTreeItem({
   node,
   selectedSessionId,

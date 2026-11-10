@@ -34,7 +34,7 @@ Commands:
 Options:
   -p, --port <port>       Server port for background service (default 30177)
   -H, --hostname <host>   Bind address (default 127.0.0.1)
-  -m, --mode <mode>       Execution mode: "start" or "dev" (default "start", Windows only)
+  -m, --mode <mode>       Execution mode: "start", "dev", or "ui" (default "start", Windows only)
       --no-autostart      Disable automatic startup on logon
       --start             Start tray manager immediately after installation (Windows)
       --clean-config      Also delete ~/.omp/agent/web-service.json on uninstallation

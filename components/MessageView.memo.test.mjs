@@ -30,8 +30,7 @@ test("all message props, callbacks, deferred source indices and live metrics inv
   const base = { message };
   const variants = {
     message: { ...message }, isStreaming: true, modelNames: {}, cwd: "/new", onOpenFile() {},
-    entryId: "new", forkEntryId: "new", forkEditsPrompt: true, onFork() {}, forking: true,
-    forkDisabled: true, onEdit: async () => true, editing: true, editDisabled: true,
+    entryId: "new", onEdit: async () => true, editing: true, editDisabled: true,
     showTimestamp: true, prevTimestamp: 42, sessionId: "new", toolCallsDefaultCollapsed: false,
     expandThinkingByDefault: true, hideThinking: true, sourceBlockIndices: [0], liveTokensPerSecond: 5,
   };

@@ -4,6 +4,7 @@ import test, { afterEach, beforeEach } from "node:test";
 import React from "react";
 import { existsSync, readFileSync } from "node:fs";
 import { mock } from "bun:test";
+import { recentHistoryStorage } from "../tests/recent-history-storage.mjs";
 const { act, cleanup, fireEvent, render, renderHook, within } = await import("@testing-library/react/pure.js");
 
 // useAgentSession is the chat state machine. These tests drive it through a
@@ -205,6 +206,10 @@ async function fetchStub(url, init = {}) {
     }
   }
 
+  if (u === "/api/web-settings" && method === "GET") {
+    return jsonResponse(200, { composerModelKeys: null });
+  }
+
   let m;
   if ((m = u.match(/\/api\/sessions\/([^/?#]+)\/state/))) {
     const wrapper = world.wrappers.get(decodeURIComponent(m[1]));
@@ -380,7 +385,7 @@ afterEach(async () => {
 mock.module("@/components/ui/toast", () => import("./__fixtures__/toast-stub.mjs"));
 const { useAgentSession } = await import("../hooks/useAgentSession.ts");
 const { selectSessionHistory, selectRecentHistoryRange } = await import("@/lib/session-sync");
-const { recentHistoryCache } = await import("@/lib/recent-history-cache");
+const { createRecentHistoryCache, recentHistoryCache } = await import("@/lib/recent-history-cache");
 const { rememberOutboxScope } = await import("@/lib/agent-client");
 const { publishSessionsChanged } = await import("@/lib/session-change-bus");
 const { AgentSessionWrapper } = await import("@/lib/rpc-manager");
@@ -647,6 +652,7 @@ for (const [preference, mode] of [["steer", "steer"], ["followup", "followUp"]])
     await settle();
     await act(async () => { lastEs()?.open(); });
     await settle();
+    await act(async () => { fireEvent.click(view.getByRole("button", { name: "Expand input" })); });
     await act(async () => { fireEvent.keyDown(view.getByRole("textbox"), { key: "Enter" }); });
     await until(() => world.outbox.length === 1, "queue submission must reach worker storage");
     assert.equal(world.outbox[0].mode, mode);
@@ -4136,7 +4142,7 @@ async function attachEditableWrapper(t, native, { holdHistory = false } = {}) {
   };
 }
 
-async function mountMovableChat(initialId, { onOpenFile } = {}) {
+async function mountMovableChat(initialId, { onOpenFile, strictMode = false } = {}) {
   const chatInputRef = React.createRef();
   let selectedId = initialId;
   let navigate;
@@ -4163,7 +4169,7 @@ async function mountMovableChat(initialId, { onOpenFile } = {}) {
     });
   }
   window.history.replaceState(null, "", `?session=${encodeURIComponent(initialId)}`);
-  const view = ownRoot(render(React.createElement(Shell), { wrapper: TestRoot }));
+  const view = ownRoot(render(React.createElement(Shell), { wrapper: TestRoot, reactStrictMode: strictMode }));
   await settle();
   await act(async () => { lastEs()?.open(); });
   await settle();
@@ -6104,6 +6110,40 @@ test("a state snapshot requested before a newer skill update cannot overwrite it
   assert.deepEqual(w.latest.skillDiagnostics, newer, "the late older snapshot is dropped");
 });
 
+test("a consumed steer moves from the composer queue to the transcript once, without hiding a later equal-text submission", async () => {
+  resetWorld();
+  const sid = "single-place-steer";
+  const text = "unique queued steer handoff";
+  const progress = (revision, status) => ({ epoch: "handoff", revision, items: [{ id: "steer-1", text, queue: "steering", status, queuedAt: 1 }] });
+  primeSession(sid, [userMsg("u0", "before")]);
+  world.agents.set(sid, { running: true, state: {
+    isStreaming: true, isPromptRunning: true,
+    queuedMessages: { steering: [text], followUp: [] }, queueProgress: progress(1, "queued"),
+  } });
+  const chat = await mountMovableChat(sid);
+  const stream = lastEs();
+  await act(() => stream.emit({ type: "agent_start" }));
+  await act(() => fireEvent.click(chat.view.getByRole("button", { name: translate("chatWindow.expandComposer") })));
+  assert.equal(chat.view.getAllByText(text).length, 1, "pending input is shown only in the queue");
+  const message = userMsg("queued-steer", text);
+  await act(() => {
+    stream.emit({ type: "queue_update", steering: [], followUp: [] });
+    stream.emit({ type: "message_start", messageId: "queued-steer", message });
+    stream.emit({ type: "message_end", messageId: "queued-steer", message });
+  });
+  await until(() => chat.view.queryAllByText(text).length === 1
+    && chat.view.queryByLabelText(translate("chatInput.queuedPrompts")) === null,
+  "even a stale queued ledger cannot retain a consumed chip beside its transcript message");
+  for (const [revision, status] of [[2, "running"], [3, "done"]]) {
+    await act(() => stream.emit({ type: "queue_progress", ...progress(revision, status) }));
+    assert.equal(chat.view.getAllByText(text).length, 1, "progress updates do not create a second copy above the composer");
+    assert.equal(chat.view.queryByLabelText(translate("chatInput.queuedPrompts")), null);
+  }
+  await act(() => stream.emit({ type: "queue_update", steering: [text], followUp: [] }));
+  assert.equal(chat.view.getAllByText(text).length, 2, "a different pending occurrence is not erased by matching historical text");
+  assert.ok(chat.view.getByLabelText(translate("chatInput.queuedPrompts")));
+});
+
 test("a state snapshot requested before a newer queue_progress frame cannot replace it with another ledger or none", async () => {
   const ledger = (epoch, revision, text) => ({ epoch, revision, items: [{ id: `${epoch}-${revision}`, text, queue: "followUp", status: "queued", queuedAt: 1 }] });
   for (const stale of [{ running: true, state: { queueProgress: ledger("old-process", 9, "stale") } }, { running: false }]) {
@@ -7001,6 +7041,7 @@ test("an existing ChatWindow queues the newly typed follow-up without restoring 
   });
   assert.equal(callsTo("POST", `/api/agent/${sid}`).filter((call) => call.body?.type === "prompt").length, 1);
   world.outboxHold = true;
+  await act(() => fireEvent.click(chat.view.getByRole("button", { name: translate("chatWindow.expandComposer") })));
   await act(() => fireEvent.change(composer, { target: { value: "queue smoke followup" } }));
   const queue = chat.view.getByRole("button", { name: translate("chatInput.queue"), exact: true });
   assert.equal(queue.disabled, false);
@@ -7488,6 +7529,66 @@ test("cached transcript renders its revalidation notice without live controls an
   assert.equal(chat.view.queryByText("readable offline transcript"), null);
   assert.equal(chat.view.queryByText(translate("chatWindow.cachedHistoryNotice")), null);
 });
+
+for (const delayedOpen of [false, true]) {
+  test(`StrictMode ${delayedOpen ? "discards an IndexedDB open past its deadline" : "paints an IndexedDB transcript"} before delayed HTTP history`, async (t) => {
+    resetWorld();
+    const sid = `strict-idb-cache-${delayedOpen}`;
+    const db = recentHistoryStorage();
+    let now = Date.now() - 1000;
+    const cache = createRecentHistoryCache({ indexedDB: () => db.factory, now: () => now });
+    for (const method of ["read", "write", "invalidate", "clearAll"]) t.mock.method(recentHistoryCache, method, cache[method]);
+    await cache.write(sid, { leafId: null, includePreCompaction: false }, {
+      messages: [userMsg("cached", "persisted before page reload")], entryIds: ["cached"],
+      model: null, thinkingLevel: "off", todoPhases: [],
+    });
+    assert.equal(db.rows.size, 1);
+    now += 1000;
+    if (delayedOpen) db.holdOpens();
+    primeSession(sid, [userMsg("fresh", "authoritative replacement")]);
+    let release;
+    world.holds.push({
+      match: (method, url) => method === "GET" && url.startsWith(`/api/sessions/${sid}?`),
+      produce: () => new Promise((resolve) => {
+        release = () => resolve({ value: {
+          sessionId: sid, tree: [], filePath: "/fixture", leafId: "e0",
+          context: { ...world.sessions.get(sid), model: null, thinkingLevel: "off", todoPhases: [] },
+          cursor: { firstEntryId: "e0", lastEntryId: "e0", contextFirstEntryId: "e0" }, hasOlder: false, hasMore: false,
+        } });
+      }),
+    });
+    t.after(() => { db.releaseOpens(); release?.(); });
+    const chat = await mountMovableChat(sid, { strictMode: true });
+    if (delayedOpen) {
+      await settle(1600);
+      const closedBeforeLateOpen = db.closeCount;
+      await act(async () => { db.releaseOpens(); });
+      await settle();
+      assert.ok(db.closeCount > closedBeforeLateOpen, "the expired open must close without starting a transaction");
+      assert.equal([...db.rows.values()][0].touchedAt, now - 1000);
+      assert.ok(chat.view.getByText(translate("chatWindow.loadingSession")));
+      assert.equal(chat.view.queryByRole("textbox"), null);
+      assert.equal(chat.view.queryByText("persisted before page reload"), null);
+    } else {
+      assert.ok(chat.view.getByText("persisted before page reload"));
+      assert.ok(chat.view.getByText(translate("chatWindow.cachedHistoryNotice"), { exact: false }));
+      assert.equal([...db.rows.values()][0].touchedAt, now, "the real IDB adapter must complete its read after the effect replay");
+      const composer = chat.view.getByRole("textbox");
+      await act(async () => {
+        fireEvent.change(composer, { target: { value: "cache cannot authorize this send" } });
+        fireEvent.keyDown(composer, { key: "Enter", code: "Enter" });
+      });
+    }
+    assert.equal(callsTo("GET", `/api/sessions/${sid}?`).length, 1);
+    assert.equal(world.outbox.length, 0);
+    assert.equal(callsTo("POST", "/api/agent/").length, 0);
+    await act(async () => { release(); });
+    await settle();
+    assert.ok(chat.view.getByText("authoritative replacement"));
+    assert.equal(chat.view.queryByText("persisted before page reload"), null);
+    assert.equal(chat.view.queryByText(translate("chatWindow.cachedHistoryNotice")), null);
+  });
+}
 
 for (const failure of [false, true]) {
   test(`multi-page forward catch-up preserves the loaded view until its final page${failure ? " and retries a failed page" : ""}`, async (t) => {

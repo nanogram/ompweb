@@ -6,7 +6,7 @@
 npm run dev     # Bun server with hot reload (HMR for the SPA), port 30178
 npm run build   # bundle the SPA into dist/ (scripts/build-client.ts)
 npm start       # serve dist/ + the API, port 30177
-npm test        # bun test --parallel
+npm test        # bun test --parallel=1 --max-concurrency=1 --timeout 120000
 npm run smoke   # start the built server and `ompweb host` (or a packed install: -- --package <dir>; a binary: -- --binary <path>) and check them
 npm run build:binary [-- --target bun-<os>-<arch>]   # build, then compile release/ompweb-<os>-<arch>/ and its .tar.gz/.zip (scripts/build-binary.ts)
 npm run typecheck && npm run lint
@@ -115,12 +115,38 @@ and 1.5-second storage deadline. HTTP is authoritative. Cached history cannot
 enable sending or restore cursors/models/live state; authorization failure,
 confirmed deletion, history edits and installation-scope changes invalidate it.
 
+**Responsive initial display**: the validated composer commits with readable
+source text before deferred historical Markdown. `HistoryMessage` shares a
+viewport observer per chat and enhances nearby rows once; newest/live output,
+explicit search and outline targets remain immediate. Source text, entry IDs
+and navigation refs stay mounted. This display scheduling never enables sends
+from provisional cache or changes history retention.
+Precommit scroll snapshots preserve the viewed row while source markup is
+replaced, without depending on the browser's native scroll anchoring.
+
+**Responsive steady-state input**: unchanged Director responses retain their
+snapshot/client identities; stable shell actions and memoized chat/project rows
+keep unrelated refreshes from repainting the editor. Duplicate running snapshots
+still advance the authority fence and honor list invalidations, but do not
+replace equal sidebar collections. A stream error resets deduplication so the
+next frame can replace HTTP fallback state. Never skip real status, selection,
+callback or session changes to achieve a render bailout.
+
+**Slow-mode button visibility**: `composer-prefs.ts` owns the browser-local
+`omp-web:slow-mode-control-visible` choice, default off. Settings and composer
+share a reactive snapshot, including other-tab storage updates. Visibility never
+changes native `/slow`, bypasses model capability checks, or hides usage-limit
+warnings; the native mode remains authoritative when the button is shown.
+
 **Activity and startup navigation**: successful native settlement is distinct
 from a question, quota failure, interruption or background work. Only unread
 success gets a green mark; viewing clears it. Folder status priority is
 error/quota, input, unread completion. Last-chat startup restoration is opt-in
 and browser-local, preserves host identity and yields to explicit deep links.
 Initial list failures must remain visible with the mobile sidebar closed.
+Known-owner startup restores use a targeted owner lookup alongside aggregate
+workspace/sidebar loading. Id-only links discover and revalidate their owner;
+later user navigation cancels the pending restore.
 
 Shared foundations in `lib/omp/`:
 
@@ -371,8 +397,10 @@ The table is static imports, not a runtime glob, so `bun build --compile` (`scri
 - `readSttConfig` lives in server-only `lib/stt-jobs.ts`; the browser bundle must never import it.
 - Browser code must not import `next/*`: use `lib/dynamic.tsx` and `lib/navigation.ts`.
 
-### Tests (`npm test`, or `bun test --parallel`)
+### Tests (`npm test`, or `bun test --parallel=1 --max-concurrency=1 --timeout 120000`)
 - `--parallel` is required, not just faster: Bun gives each file a fresh global/module registry. The transport singleton (`lib/event-stream.ts`) and each file's `SharedWorker`/fetch/DOM fakes otherwise leak into the next file; a shared-process run can send commands to another file's fake worker. These fixtures are deliberately file-isolated rather than reset between files. Use `--parallel` even for a multi-file subset.
+- Keep the default single worker/case for complete Windows checks: overlapping process-heavy integration fixtures can time out and leave late teardown affecting subsequent cases. `--parallel=1` retains per-file isolation without that cross-file contention.
+- The two-minute scenario budget covers cold native probes (up to 30s), process inventories and multi-step restart/rollback integration checks; shorter explicit behavior deadlines stay in their individual tests.
 - DOM tests import `tests/setup-dom.mjs` first and then import Testing Library dynamically, so its queries bind to that document. Nothing is torn down.
 - A module under test that must see a fake builtin is imported with a fresh query (`?fresh=N`) after `mockBuiltin(t, name, overrides)` (`tests/mock-builtin.mjs`, built on `mock.module`; Bun's `mock.restore()` does not undo `mock.module`, so the helper restores by hand).
 
@@ -673,8 +701,8 @@ the whole tree shows the "unexpected error" screen. Use `AbortController` + time
 executor-style promises instead. Server code may use them freely.
 
 ### Editing and branching — don't confuse them
-- **Fork** ("Fork a new session from this point" button, `messageView.newSessionTitle`, on user and assistant messages; only offered while the session is idle — ChatWindow gates it on `!sessionBusy && !isNew`): creates a new independent `.jsonl` file via omp's `branch` RPC. Shown as a child in the sidebar tree via `parentSession` header field. `branch` only takes a user entry and keeps the history *before* it, so `lib/chat-fork.ts` maps rows: a user prompt forks at itself and its returned text prefills the fork's composer (edit-and-resend, text only — attached images are not restored); an assistant reply forks at the next user prompt so the reply is kept; the newest reply falls back to its own prompt with the prefill. Rows that would edit the very first prompt (an empty fork) offer no fork.
-  The button only opens a `ConfirmDialog` (`ForkSessionButton`); `onFork` runs on confirm, so a stray tap while scrolling never forks.
+- **Message footers** expose Copy and user-message Edit, not Markdown, Read or Fork actions. The per-message fork target planner and confirmation UI are removed.
+- **Native branching** still creates an independent `.jsonl` file via omp's `branch` RPC, shown as a sidebar child through `parentSession`. It accepts a user entry and keeps history before that entry; it must never be confused with in-place Edit.
 - **Edit** (`edit_message`, user-message button): moves the live conversation's history to before that user entry; it is not a read-only historical view or an explicit Fork. `lib/omp/session-edit-extension.mjs`, explicitly loaded on spawn/restart, calls omp's public `ctx.navigateTree(entryId, { summarize: false })` and appends a non-message `omp-web-history-navigation` entry. Node never imports the Bun-only SDK or rewrites the JSONL.
   - The button only opens a `ConfirmDialog` in `UserMessageView`; `onEdit` runs on confirm, so a stray tap never rewinds the live session.
   - Require authoritative `get_state.isSettled === true` and reject pending background work; runtimes without settlement reporting fail explicitly. Preserve run/edit fencing, including rename and automatic-title fallbacks, and do not report success after an observed edit-time native persistence error.
@@ -844,6 +872,12 @@ load/reconcile/stream open and live `queue_update` frames. Never track chips
 client-side — every client viewing the session must show the same queue.
 The one exception is what omp does not have yet: the message outbox's held
 bubbles (below), never omp's queue.
+The composer shows only occurrences still in the native pending snapshot.
+Consumed/departed, running and finished ledger items do not remain as a second
+copy beside the transcript; the panel disappears when the native queue empties.
+Ledger snapshots can supply stable pending IDs, never resurrect missing chips.
+Do not deduplicate against historical message text: a new equal-text submission
+is a separate pending occurrence, with only the first native match actionable.
 One sequence (`queueSeqRef`) orders every source: a get_state snapshot takes
 a number when requested and applies only if no newer snapshot or
 `queue_update` was applied (HTTP and SSE can reorder). Edit/Delete use
@@ -943,6 +977,16 @@ during the wait.
   `outbox_scope_changed`; normal same-owner re-login keeps it. With no cached
   scope, a first-ever offline send must retain its draft until the server can
   identify itself.
+- **Native acceptance identity.** Privately persist the original wire command ID,
+  type and host synchronously before transport write; a failed persistence commit
+  prevents dispatch. A correlated successful native response cannot be negated
+  by missing or ambiguous echo/queue replacement evidence. Late original native
+  success or completed, invoked `prompt_result` reconciles uncertain entries,
+  including after reopening storage. Scope receipts to the owning host/session;
+  transport/broker acknowledgements, matching text and unrelated replies prove
+  nothing. Preserve explicit rejection, pre-delivery cancellation and deletion
+  fences. Legacy uncertain entries without native identity remain visibly
+  unconfirmed; never infer them away or automatically resend them.
 - **Server leg.** SQLite and a per-conversation FIFO dispatcher (aliases share
   the same claim) send through the wrapper. Acceptance is bounded by the
   per-alias 16 MiB limit and the global 256 MiB/1,000-active-row pool; overflow
@@ -1012,7 +1056,8 @@ during the wait.
   settled ids prevent late ACKs from resurrecting delivered entries. States:
   Sending (browser, locked while its first-leg command may be in flight),
   Waiting to send / Waiting for <host> (Delete), Delivering (locked),
-  Not sent (Delete). The delivery mode is a read-only label. Delete
+  Delivery unconfirmed (possibly sent; Delete only, no automatic resend), or
+  Not sent (definite failure; Delete). The delivery mode is a read-only label. Delete
   (`deleteHeldMessage`) awaits the IndexedDB delete commit for a browser-held
   entry; a server entry sends `outbox_remove`, refused with 409
   `outbox_dispatched` once delivering. A late commit consumes only the original
@@ -1176,10 +1221,13 @@ during the wait.
 ### Composer-attached panels (`components/ComposerPanels.tsx`)
 - The live todo plan (`TodoList`) and the subagent roster live **pinned above
   the chat input**, not inside the scrollable message list. `ComposerPanels`
-  renders both, each independently collapsible via its header row (`chevron`);
-  panels start collapsed (headers always show live progress / running-summary).
-  Non-running chips (terminal or history) nest under a `Completed (N)` toggle
-  inside the roster, collapsed on every mount (not persisted).
+  renders only active plans/rosters, each independently collapsible through its
+  header. Both share half a row without labels; a sole panel fills it and shows
+  its label. Expanded details overlay the chat upward without changing bar,
+  composer or transcript geometry. Available space is measured against the
+  chat/visual viewport, keeping keyboard-height lists scrollable and their
+  Show all/less footer reachable. Non-running chips nest under a `Completed (N)`
+  toggle, collapsed on every mount (not persisted).
   Subagent chips carry live state (pulsing dot while `started`, check/alert/ban
   for terminal states) fed by the same `subagent_lifecycle`/`subagent_progress`
   SSE frames; clicking a chip opens the transcript dialog. `TodoList` keeps a
@@ -1375,11 +1423,11 @@ during the wait.
 - A manual scroll-up sets `completionScrollAllowedRef = false` and disables
   following until the next prompt; `scrollUserMsgToTop` handles the
   pending-scroll after sending.
-- A `ResizeObserver` on the chat scroller (`ChatWindow`, beside `nearBottom`)
-  keeps a reader whose previous view reached the bottom there when the
-  scroller changes height (phone keyboard, composer or ask panel growing). It
-  judges by the previous height, so content that grew below the reader (an
-  expanded tool call) does not count as being at the bottom.
+- A frame-coalesced `ResizeObserver` on the scroller and its content follows
+  viewport sizing and deferred rich-history enhancement only when the previous
+  view reached the bottom. Manual scroll/search navigation wins; expanding tool
+  details does not pull the reader to the bottom. Capped user-message overflow
+  reads are batched before state updates, rather than measured per layout effect.
 - Programmatic smooth scrolling must respect `prefers-reduced-motion`
   (`usePrefersReducedMotion` in `hooks/usePrefersReducedMotion.ts` — also the
   only way to stop SVG SMIL animations, which CSS cannot).
@@ -1448,6 +1496,9 @@ during the wait.
 ### Auth and model config
 - Auth flows go through RPC commands (`get_login_providers`, `login`, `get_logout_accounts`, `logout`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly. `/api/auth/accounts/[provider]` lists stored accounts and removes one by `credentialId`; omp without those commands reports `supported: false` and the UI falls back to the read-only `omp usage` account list.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).
+- Composer model visibility is shared by this web installation in `omp-web-settings.json` (`composerModelKeys`), not in OMP's model registry. An absent field permits one-time migration of a valid browser-local `omp-composer-models` array; the conditional save never overwrites a configured server preference. `null` explicitly shows all models and `[]` explicitly hides all.
+- `useComposerModelPreference` shares one client store between Settings and the composer, refreshing on mount, focus, foreground and reconnect. The server wins over stale browser caches. A clean browser never persists its default show-all state, so it cannot prevent the original desktop from importing its subset. Failed reads/saves retain the previous selection and expose Retry instead of silently showing every model; before the first successful read, a cacheless browser shows no choices.
+- The composer uses one model/reasoning picker: effort glyph in the trigger, provider-grouped models left and the selected model's native-supported efforts right, including mobile. Use saved visible models directly: no search, repeated model caption, next-prompt hint or provider-management footer. Model selection stays open and both panes wait for the model-change promise before effort mutations; streaming disables changes. Keep native aliases/capabilities authoritative, including custom effort names. Portal the picker to the body and anchor `useFixedMenuPosition` to the full `chat-input-shell`, not the toolbar button. Above-anchor menus shrink to the available space; observe anchor resizing so draft growth and visual-viewport changes cannot move the picker over the input. Opening focuses the enabled selected model (or the first enabled choice, including reasoning-only access when model metadata is unavailable); preserve cross-pane keyboard navigation and Escape/focus return.
 - API-key status endpoints must never return the raw key.
 
 ### Navigate back / forward (`lib/navigation-history.ts`, `hooks/useNavigationHistory.ts`)
@@ -1632,6 +1683,8 @@ during the wait.
 - Every file-tab URL uses `getFileApiUrl` with that tab's host ID and source session ID, including both Download controls. `authorizeFileAccess` grants session-local access only for reads, downloads and file watch, never listing. It confines realpaths even when the transcript names the path. Both it and the resolver apply `isOmpSecretFile`: owned credentials and symlink/hard-link aliases stay private, while independent `agent.db` or `models.yml` artifacts remain usable.
 - The daemon file watch re-authorizes its target and rejects a pathname swapped for an outside symlink without reporting the outside file's metadata. Its error ends the subscription; a fresh subscription performs authorization again.
 - A session-local absolute target takes precedence over workspace-relative fallback, even if a workspace contains a file mirroring its entire pathname or the artifact is missing. Apply its local-root realpath restriction even when a broader config/workspace root also admits the path.
+- Desktop `FileLinkMenu` adds system-app/preview/download actions to eligible local paths in chat, tool rows and Markdown file previews; viewers expose the same explicit native action. The native action is POST-only `/api/files/[...path]?type=open-native` and retains the source host/session. Resolve and authorize through `host.workspaceOps.fileInfo` first; reject linked hosts before touching the web machine's filesystem. Only then `openNativeFile` canonicalizes and checks the local file's metadata/type/credential identity before invoking the OS default application on the **OMPweb computer**, never the browser's remote device. Scripts, executables, shortcuts, device paths and alternate streams are refused. Filenames remain data, not command source; child environments strip web secrets. No daemon capability or restart is required. Graphical desktop/file-association failures remain visible.
+- Video previews classify the authorized path in both the web file API and viewer, rather than trusting an older daemon's MIME metadata. MP4/M4V, MOV, WebM and OGV stream with existing range/auth/watch ownership; WebM uses a video-capable player for audio-only containers too. Codec failures retain download/native-open controls. Keep text's 256 KiB and image/DOCX's 10 MiB limits; unknown/prototype-property extensions stay ordinary non-media files.
 
 ### Voice transcription jobs (`lib/stt-jobs.ts`, `/api/stt`, `hooks/useDictation.ts`)
 - The browser never waits on the STT endpoint: `POST /api/stt` keeps the

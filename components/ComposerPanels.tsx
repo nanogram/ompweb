@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity, Bot, Check, ChevronDown, Copy,
   CircleDollarSign, CircleHelp, Clock3, Cpu, Gauge, GitBranch, Network, RefreshCw,
@@ -12,11 +12,12 @@ import type { GenerationSpeedInfo, SessionStatsInfo, TodoPhase } from "@/lib/pi-
 import { countNestedSubagents, formatCost, formatDuration, formatTokens, shortModel } from "@/lib/subagent-format";
 import { formatCompactNumber, formatPercent, getCacheHitRate } from "@/lib/format";
 import { copyText } from "@/lib/clipboard";
+import { composerPanelVisibility, isActiveComposerSubagent } from "@/lib/display/composer-activity";
 import { TodoList } from "./TodoList";
 import { SubagentStatusIcon } from "./SubagentStatusIcon";
 import { BtwPanel, type BtwPanelProps } from "./BtwPanel";
 
-// Panels unmount when their inputs are empty and remount when they fill
+// Activity panels unmount while settled and return as soon as new work appears.
 const TODO_COLLAPSED_STORAGE_KEY = "omp-web:composer-todo-collapsed";
 const SUBAGENTS_COLLAPSED_STORAGE_KEY = "omp-web:composer-subagents-collapsed";
 
@@ -164,7 +165,7 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
   const running: SubagentInfo[] = [];
   const completed: SubagentInfo[] = [];
   for (const subagent of subagents) {
-    (subagent.source !== "history" && subagent.status === "started" ? running : completed).push(subagent);
+    (isActiveComposerSubagent(subagent) ? running : completed).push(subagent);
   }
   const runningCount = running.length;
 
@@ -223,23 +224,25 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
       </button>
     );
   }
-  if (subagents.length === 0) return null;
+  if (runningCount === 0) return null;
 
   return (
     <section
       aria-label={t("chatWindow.subagentsPanel")}
-      className="overflow-hidden border border-border bg-bg-subtle"
+      className="min-w-0 overflow-hidden border border-border bg-bg-subtle"
       style={{ borderRadius: "var(--radius-card)" }}
     >
       <button
         type="button"
+        aria-expanded={!collapsed}
+        aria-label={`${t("chatWindow.subagentsPanel")}: ${t("chatWindow.subagentSummary", { running: runningCount, total: subagents.length })}`}
         onClick={() => setCollapsed((value) => { saveCollapsed(SUBAGENTS_COLLAPSED_STORAGE_KEY, !value); return !value; })}
         title={collapsed ? t("chatWindow.expandPanel") : t("chatWindow.collapsePanel")}
-        className={`ui-focus-ring flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-xs text-text-muted ${collapsed ? "" : "border-b border-border"}`}
+        className={`ui-focus-ring flex min-w-0 w-full cursor-pointer items-center gap-2 px-3 py-2 text-left text-xs text-text-muted border-t ${collapsed ? "border-transparent" : "border-border"}`}
         style={{ background: "none" }}
       >
-        <Network size={14} strokeWidth={1.8} aria-hidden />
-        <strong className="font-medium text-text">{t("chatWindow.subagentsPanel")}</strong>
+        <Network size={14} strokeWidth={1.8} className="shrink-0" aria-hidden />
+        <strong className="composer-activity-label shrink-0 font-medium text-text">{t("chatWindow.subagentsPanel")}</strong>
         {liveStatus ? (
           <span
             role="status"
@@ -256,7 +259,7 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
           </span>
         ) : null}
         <span
-          className={`${liveStatus ? "" : "ml-auto "}inline-flex items-center gap-1.5`}
+          className={`${liveStatus ? "" : "ml-auto "}inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap`}
           aria-label={t("chatWindow.subagentSummary", { running: runningCount, total: subagents.length })}
           title={t("chatWindow.subagentSummary", { running: runningCount, total: subagents.length })}
         >
@@ -266,17 +269,18 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
           size={14}
           strokeWidth={1.8}
           aria-hidden
+          className="shrink-0"
           style={{
             color: "var(--text-dim)",
-            transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)",
+            transform: collapsed ? "rotate(-90deg)" : "rotate(180deg)",
             transition: "transform var(--dur-med) var(--ease-out-warm)",
           }}
         />
       </button>
       {!collapsed && (
         <div
-          className="grid grid-cols-1 gap-2 px-3 py-2.5 animate-slide-down"
-          style={{ maxHeight: "min(30vh, 240px)", overflowY: "auto" }}
+          className="composer-activity-expansion grid grid-cols-1 gap-2 px-3 py-2.5 animate-slide-up"
+          style={{ maxHeight: "min(30vh, 240px, var(--composer-expansion-space, 240px))", overflowY: "auto" }}
         >
           {running.length > 0 && (
             <div className="flex flex-wrap gap-1.5">{running.map(renderChip)}</div>
@@ -313,11 +317,9 @@ function SubagentsPanel({ subagents, onSelectSubagent, defaultExpanded = false, 
   );
 }
 
-/** Session panels attached to the composer: the active side question (`/btw`),
- * live todo plan + running subagent roster. Each is independently collapsible
- * via its header row (`chevron`); todo/subagents start collapsed (headers
- * always show live progress / running-summary), a new side question starts
- * expanded. Rendered pinned above the chat input. */
+/** Active work shares a compact composer row; a sole panel fills the width.
+ * Finished tasks and inactive rosters disappear until more work arrives.
+ * Side questions remain full-width above the row. */
 export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = null, defaultExpanded = false, liveStatus = null, waitingForInput = false }: {
   todoPhases: TodoPhase[];
   subagents: SubagentInfo[];
@@ -327,28 +329,62 @@ export function ComposerPanels({ todoPhases, subagents, onSelectSubagent, btw = 
   defaultExpanded?: boolean;
   /** Transient live-agent status (the ChatInput status bar's text) to merge
    * into an existing panel header row instead of mounting as its own line
-   * (#245). Hosted by the todo row when one exists, else by the subagent
-   * row; when neither exists the caller keeps the standalone bar so the
-   * status is never hidden. */
+   * (#245). Hosted by active tasks first, otherwise active subagents; the
+   * caller keeps the standalone bar when both panels are hidden. */
   liveStatus?: string | null;
   waitingForInput?: boolean;
 }) {
   const [todoCollapsed, setTodoCollapsed] = useState(() => loadCollapsed(TODO_COLLAPSED_STORAGE_KEY, defaultExpanded));
-  if (todoPhases.length === 0 && subagents.length === 0 && !btw) return null;
-  const todoHostsLiveStatus = todoPhases.length > 0;
+  const visible = composerPanelVisibility(todoPhases, subagents);
+  const activityRowRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const row = activityRowRef.current;
+    const chat = row?.closest<HTMLElement>("[data-chat-window]");
+    const composer = row?.closest<HTMLElement>("[data-composer-area]");
+    if (!row || !chat || !composer) return;
+    let frame: number | null = null;
+    const update = () => {
+      frame = null;
+      const scale = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-scale")) || 1;
+      const top = Math.max(chat.getBoundingClientRect().top, window.visualViewport?.offsetTop ?? 0);
+      const space = `${Math.max(0, (row.getBoundingClientRect().top - top) / scale - 4)}px`;
+      if (row.style.getPropertyValue("--composer-expansion-space") !== space) row.style.setProperty("--composer-expansion-space", space);
+    };
+    const schedule = () => { if (frame === null) frame = requestAnimationFrame(update); };
+    const observer = new ResizeObserver(schedule);
+    observer.observe(chat);
+    observer.observe(composer);
+    observer.observe(row);
+    window.visualViewport?.addEventListener("resize", schedule);
+    window.visualViewport?.addEventListener("scroll", schedule);
+    update();
+    return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.visualViewport?.removeEventListener("resize", schedule);
+      window.visualViewport?.removeEventListener("scroll", schedule);
+    };
+  }, [visible.tasks, visible.subagents]);
+  if (!visible.tasks && !visible.subagents && !btw) return null;
   return (
     <div style={{ display: "grid", gap: 6, marginBottom: 8 }}>
       {btw && <BtwPanel key={btw.record.id} {...btw} />}
-      <TodoList
-        phases={todoPhases}
-        liveStatus={todoHostsLiveStatus ? liveStatus : null}
-        waitingForInput={waitingForInput}
-        collapsible
-        defaultExpanded={defaultExpanded}
-        collapsed={todoCollapsed}
-        onCollapsedChange={(collapsed) => { saveCollapsed(TODO_COLLAPSED_STORAGE_KEY, collapsed); setTodoCollapsed(collapsed); }}
-      />
-      <SubagentsPanel subagents={subagents} onSelectSubagent={onSelectSubagent} defaultExpanded={defaultExpanded} liveStatus={todoHostsLiveStatus ? null : liveStatus} waitingForInput={waitingForInput} />
+      {(visible.tasks || visible.subagents) && (
+        <div ref={activityRowRef} className="composer-activity-row">
+          {visible.tasks && (
+            <TodoList
+              phases={todoPhases}
+              liveStatus={liveStatus}
+              waitingForInput={waitingForInput}
+              collapsible
+              defaultExpanded={defaultExpanded}
+              collapsed={todoCollapsed}
+              onCollapsedChange={(collapsed) => { saveCollapsed(TODO_COLLAPSED_STORAGE_KEY, collapsed); setTodoCollapsed(collapsed); }}
+            />
+          )}
+          {visible.subagents && <SubagentsPanel subagents={subagents} onSelectSubagent={onSelectSubagent} defaultExpanded={defaultExpanded} liveStatus={visible.tasks ? null : liveStatus} waitingForInput={waitingForInput} />}
+        </div>
+      )}
     </div>
   );
 }

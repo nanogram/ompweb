@@ -36,23 +36,6 @@ test("attaches todo plan and subagent roster with live states", () => {
   assert.doesNotMatch(html, />1 running · 2 total</);
 });
 
-test("panels start collapsed with live summary in their headers", () => {
-  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
-    todoPhases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
-    subagents: [{ id: "s1", agent: "scout", status: "started", task: "Map the surface", index: 0 }],
-    onSelectSubagent: noop,
-  }));
-  // Headers (with live counts) are visible...
-  assert.match(html, /Tasks/);
-  assert.match(html, /0\/1 complete/);
-  assert.match(html, /Subagents/);
-  assert.match(html, /aria-label="1 running · 1 total"/);
-  assert.doesNotMatch(html, />1 running · 1 total</);
-  // ...but both panels start collapsed: toggle headers only, no content.
-  assert.match(html, /aria-expanded="false"/);
-  assert.doesNotMatch(html, /Wire panels/);
-  assert.doesNotMatch(html, /Map the surface/);
-});
 
 test("live chips show current tool, telemetry, and async marker", () => {
   const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
@@ -116,26 +99,20 @@ test("coexists with composer layout and keeps todo progress summary accessible",
   assert.match(html, /1\/2 complete/);
 });
 
-test("history chips render terminal telemetry without pulsing state", () => {
-  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
-    todoPhases: [],
-    subagents: [{
-      id: "s1",
-      agent: "scout",
-      status: "completed",
-      task: "Map the surface",
-      index: 0,
-      source: "history",
-      progress: { status: "completed", tokens: 999000, cost: 1.23, durationMs: 360000, resolvedModel: "provider/gpt-5.6:medium" },
-    }],
-    onSelectSubagent: noop,
-    defaultExpanded: true,
-  }));
-  assert.match(html, /Map the surface/);
-  assert.match(html, /data-subagent-metric="999k tok"/);
-  assert.match(html, /data-subagent-metric="6m"/);
-  // History chips must not show the pulsing live dot.
-  assert.doesNotMatch(html, /live-pulse/);
+test("settled and history-only rosters do not reserve composer space", () => {
+  for (const subagent of [
+    { status: "completed" },
+    { status: "failed" },
+    { status: "aborted" },
+    { status: "started", source: "history" },
+  ]) {
+    assert.equal(renderToStaticMarkup(React.createElement(ComposerPanels, {
+      todoPhases: [],
+      subagents: [{ id: "s1", agent: "scout", task: "Earlier work", index: 0, ...subagent }],
+      onSelectSubagent: noop,
+      defaultExpanded: true,
+    })), "");
+  }
 });
 
 test("chips show agent source, nested count, and async marker", () => {
@@ -174,7 +151,8 @@ test("history chips mark detached async spawns", () => {
       index: 0,
       source: "history",
       detached: true,
-    }],
+    },
+    { id: "s2", agent: "worker", status: "started", task: "Current work", index: 1 }],
     onSelectSubagent: noop,
     defaultExpanded: true,
   }));
@@ -265,14 +243,4 @@ test("merges live status into the subagent header row when no tasks exist (#245)
   }));
   assert.match(html, /Waiting for model\.\.\./);
   assert.match(html, /Subagents/);
-});
-
-test("keeps panels unchanged when no live status is present (#245)", () => {
-  const html = renderToStaticMarkup(React.createElement(ComposerPanels, {
-    todoPhases: [{ name: "Implementation", tasks: [{ content: "Wire panels", status: "in_progress" }] }],
-    subagents: [],
-    onSelectSubagent: noop,
-  }));
-  assert.match(html, /Tasks/);
-  assert.doesNotMatch(html, /Waiting for model/);
 });

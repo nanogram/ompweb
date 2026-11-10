@@ -23,7 +23,7 @@ function propsFor(messages, options = {}) {
     conversationMeta: { toolResultsMap: collectToolResults(messages), lastAnchorIdx, visibleRefIndexByMessage: refs },
     messageRefs: { current: [] }, isStreaming: false, sessionBusy: false, isCompacting: false,
     externalRunActive: false, isNew: true, forkingEntryId: null, editingEntryId: null,
-    handleFork() {}, handleEdit: async () => true, modelNames: {}, toolCallsDefaultCollapsed: true,
+    handleEdit: async () => true, modelNames: {}, toolCallsDefaultCollapsed: true,
     hideToolActivity: true, expandThinkingByDefault: false, hideThinkingBlock: false,
     visibleCount: 40, nearBottom: true, sentinelRef: { current: null }, handleLoadMoreClick() {},
     hasOlder: false, loadingOlder: false, olderHistoryError: false, handleLoadOlder() {}, ...options,

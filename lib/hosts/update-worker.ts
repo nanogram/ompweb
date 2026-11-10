@@ -64,7 +64,20 @@ export function writeHostUpdateJson(path: string, value: unknown): void {
   if (existsSync(path)) assertOwnedPath(path);
   const temporary = `${path}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-  try { renameSync(temporary, path); } finally { rmSync(temporary, { force: true }); }
+  try {
+    const deadline = Date.now() + 1000;
+    let sharingWait: Int32Array | undefined;
+    for (;;) {
+      try { renameSync(temporary, path); break; }
+      catch (error) {
+        // Windows readers and scanners can briefly deny replacement. Keep the
+        // old complete status present: moving it away would unblock new sessions.
+        if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "") || Date.now() >= deadline) throw error;
+        sharingWait ??= new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(sharingWait, 0, 0, 10);
+      }
+    }
+  } finally { rmSync(temporary, { force: true }); }
 }
 export function readHostUpdateState(): HostUpdateStoredState | null {
   const root = hostUpdateRoot();

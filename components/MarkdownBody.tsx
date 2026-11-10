@@ -11,6 +11,8 @@ import { normalizeDisplayMath, useMarkdownPlugins, type MarkdownPlugins } from "
 import { markdownCodeRenderer } from "./MarkdownCode";
 import { ClickableImage } from "./ImageLightbox";
 import { TableChart } from "./TableChart";
+import { HistoryRenderingContext } from "./display/HistoryMessage";
+import { FileLinkMenu } from "./FileLinkMenu";
 
 // The default sanitizer reads `C:` as a scheme; a drive path (`\` arrives as `%5C`) is a local file the `a` renderer opens.
 const urlTransform: UrlTransform = (url, key, node) => (/^[A-Za-z]:(?:\/|%5C)/i.test(url) ? url : agentAwareUrlTransform(url, key, node));
@@ -25,7 +27,13 @@ interface MarkdownBodyProps {
   autoCharts?: boolean;
 }
 
-export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile, suppressImages = false, autoCharts = false }: MarkdownBodyProps) {
+export function MarkdownBody(props: MarkdownBodyProps) {
+  const enhanced = useContext(HistoryRenderingContext);
+  return enhanced ? <RichMarkdownBody {...props} />
+    : <div className={["markdown-body", props.className].filter(Boolean).join(" ")} style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{props.children}</div>;
+}
+
+function RichMarkdownBody({ children, className, isStreaming, cwd, onOpenFile, suppressImages = false, autoCharts = false }: MarkdownBodyProps) {
   const normalizedMarkdown = useMemo(() => normalizeDisplayMath(children), [children]);
   const fileSource = useContext(WorkspaceFileContext);
   const { remarkPlugins: baseRemarkPlugins, rehypePlugins } = useMarkdownPlugins(normalizedMarkdown);
@@ -128,7 +136,7 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
       }
       const filePath = resolveLocalFileHref(href, cwd);
       if (filePath) {
-        // Without a file panel (a remote host's session, a dialog) a path link has nowhere to go: show its text.
+        // Without a file-opening surface, keep filesystem targets as text.
         if (!onOpenFile) return <>{textParts}{imageParts}</>;
         const openFile = onOpenFile;
         const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
@@ -140,7 +148,12 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
           openFile(filePath);
         };
         const anchor = <a href={href} {...props} onClick={handleClick} onAuxClick={(event) => event.preventDefault()}>{textParts}</a>;
-        return imageParts.length > 0 ? <>{anchor}{imageParts}</> : anchor;
+        const fileLink = (
+          <FileLinkMenu key={JSON.stringify([fileSource?.hostId ?? "local", fileSource?.sessionId ?? null, filePath])} filePath={filePath} source={fileSource} onPreview={() => openFile(filePath)}>
+            {anchor}
+          </FileLinkMenu>
+        );
+        return imageParts.length > 0 ? <>{fileLink}{imageParts}</> : fileLink;
       }
 
       const anchor = (

@@ -15,7 +15,7 @@ export async function buildEventStreamWorker(root: string): Promise<string> {
 }
 
 // Build-time constants for the browser bundle; the build script and the dev server use the same values.
-export function clientEnv(root: string, worker: string) {
+export function clientEnv(root: string, worker: string, options: { uiCustomization?: boolean } = {}) {
   const { version } = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { version: string };
   let commitHash = "";
   let commitDate = "";
@@ -51,5 +51,6 @@ export function clientEnv(root: string, worker: string) {
     OMP_WEB_PUBLIC_COMMIT_HASH: commitHash,
     OMP_WEB_PUBLIC_COMMIT_DATE: commitDate,
     OMP_WEB_PUBLIC_EVENT_STREAM_WORKER_VERSION: eventStreamWorkerVersion,
+    OMP_WEB_PUBLIC_UI_CUSTOMIZATION: options.uiCustomization === true ? "1" : "0",
   };
 }

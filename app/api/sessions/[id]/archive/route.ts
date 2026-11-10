@@ -3,6 +3,7 @@ import { HostOpError } from "@/lib/hosts/link-protocol";
 import { invalidateHostSessionList } from "@/lib/hosts/session-index";
 import { LOCAL_HOST_ID } from "@/lib/hosts/registry";
 import { clearExitedRpcSession, clearRpcSessionActivity, getRpcSession } from "@/lib/rpc-manager";
+import { isDirectorSession } from "@/lib/director-state";
 
 /** POST /api/sessions/[id]/archive — stop the live child, then archive the
  * native OMP JSONL and its sibling artifacts using OMP's gc layout. */
@@ -11,6 +12,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
+  if (isDirectorSession(id)) return Response.json({ error: "Pause the Director from its monitoring controls instead of archiving its dedicated chat.", code: "director_managed" }, { status: 409 });
   try {
     const resolved = await resolveSessionHostOr404(id);
     if ("response" in resolved) return resolved.response;

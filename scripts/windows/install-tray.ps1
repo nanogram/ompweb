@@ -7,7 +7,7 @@
 .PARAMETER Hostname
     Default hostname to configure (default 127.0.0.1).
 .PARAMETER Mode
-    Execution mode: "start" or "dev" (default "start").
+    Execution mode: "start", "dev", or "ui" (default "start").
 .PARAMETER NoAutostart
     Disable automatic Windows startup on logon.
 .PARAMETER StartImmediately
@@ -26,6 +26,7 @@ param(
 )
 
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
+. (Join-Path $PSScriptRoot "web-service-ui.ps1")
 $IcoPath = Join-Path $RepoRoot "public\omp-web.ico"
 $PngPath = Join-Path $RepoRoot "public\icon.png"
 $LaunchVbs = Join-Path $RepoRoot "scripts\windows\launch-tray.vbs"
@@ -139,15 +140,25 @@ $configData = @{
 }
 
 # Preserve existing custom values if already present
-if (Test-Path $ConfigPath) {
+if (Test-Path -LiteralPath $ConfigPath) {
     try {
-        $existing = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-        if ($existing.openBrowserOnLaunch -ne $null) { $configData.openBrowserOnLaunch = [bool]$existing.openBrowserOnLaunch }
-        if ($existing.autoRestart -ne $null) { $configData.autoRestart = [bool]$existing.autoRestart }
-    } catch { }
+        $existing = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        foreach ($property in $existing.PSObject.Properties) { $configData[$property.Name] = $property.Value }
+    } catch { throw "Cannot read web service configuration '${ConfigPath}': $($_.Exception.Message)" }
 }
+if ($PSBoundParameters.ContainsKey("Port")) { $configData.port = $Port }
+if ($PSBoundParameters.ContainsKey("Hostname")) { $configData.hostname = $Hostname }
+if ($PSBoundParameters.ContainsKey("Mode")) { $configData.mode = $Mode }
+if ($PSBoundParameters.ContainsKey("NoAutostart")) { $configData.autostart = !$NoAutostart }
+if ($configData.mode -cnotin @("start", "dev", "ui")) { throw "Unsupported web service mode '$($configData.mode)'; expected start, dev or ui." }
+if ($configData.mode -eq "ui") { $null = Resolve-WebServiceUiConfig ([PSCustomObject]$configData) $configData.hostname $configData.port }
+# Registration must follow the persisted value when an existing installation
+# is refreshed without explicit command-line overrides.
+$NoAutostart = !$configData.autostart
+$Port = $configData.port
+$Hostname = $configData.hostname
 
-$configData | ConvertTo-Json -Depth 4 | Set-Content -Path $ConfigPath -Force
+[System.IO.File]::WriteAllText($ConfigPath, ($configData | ConvertTo-Json -Depth 32), (New-Object System.Text.UTF8Encoding($false)))
 Log-Message "  [OK] Configuration written to: $ConfigPath"
 
 # -----------------------------------------------------------------------------
@@ -167,10 +178,10 @@ try {
     $sc = $wsh.CreateShortcut($desktopLnk)
     if ($useNative) {
         $sc.TargetPath = $nativeExe
-        $sc.Arguments = "-OpenBrowser"
+        $sc.Arguments = "-OpenBrowser -ConfigPath `"$ConfigPath`""
     } else {
         $sc.TargetPath = $wscriptExe
-        $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser"
+        $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser -ConfigPath `"$ConfigPath`""
     }
     $sc.WorkingDirectory = $RepoRoot
     if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
@@ -188,10 +199,10 @@ try {
     $sc = $wsh.CreateShortcut($startMenuLnk)
     if ($useNative) {
         $sc.TargetPath = $nativeExe
-        $sc.Arguments = "-OpenBrowser"
+        $sc.Arguments = "-OpenBrowser -ConfigPath `"$ConfigPath`""
     } else {
         $sc.TargetPath = $wscriptExe
-        $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser"
+        $sc.Arguments = "`"$LaunchVbs`" -OpenBrowser -ConfigPath `"$ConfigPath`""
     }
     $sc.WorkingDirectory = $RepoRoot
     if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
@@ -210,10 +221,10 @@ if (!$NoAutostart) {
         $sc = $wsh.CreateShortcut($startupLnk)
         if ($useNative) {
             $sc.TargetPath = $nativeExe
-            $sc.Arguments = "-Startup"
+            $sc.Arguments = "-Startup -ConfigPath `"$ConfigPath`""
         } else {
             $sc.TargetPath = $wscriptExe
-            $sc.Arguments = "`"$LaunchVbs`" -Startup"
+            $sc.Arguments = "`"$LaunchVbs`" -Startup -ConfigPath `"$ConfigPath`""
         }
         $sc.WorkingDirectory = $RepoRoot
         if (Test-Path $IcoPath) { $sc.IconLocation = "$IcoPath,0" }
@@ -240,7 +251,7 @@ $ServicePs1 = Join-Path $RepoRoot "scripts\windows\omp-web-service.ps1"
 if (!$NoAutostart -and (Test-Path $ServicePs1)) {
     try {
         $taskName = "omp-web"
-        $actionArg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ServicePs1`""
+        $actionArg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ServicePs1`" -ConfigPath `"$ConfigPath`""
         # Use schtasks for compatibility (no admin required for current user ONLOGON)
         $createArgs = "/create /tn `"$taskName`" /tr `"powershell $actionArg`" /sc onlogon /f"
         # schtasks may require quoted task name
@@ -293,5 +304,5 @@ if (Test-Path $HostPs1) {
 # -----------------------------------------------------------------------------
 if ($StartImmediately) {
     Log-Message "Starting background service and opening browser..."
-    $wsh.Run("`"$wscriptExe`" `"$LaunchVbs`" -OpenBrowser", 0, $false)
+    $wsh.Run("`"$wscriptExe`" `"$LaunchVbs`" -OpenBrowser -ConfigPath `"$ConfigPath`"", 0, $false)
 }

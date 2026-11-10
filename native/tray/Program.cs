@@ -7,6 +7,9 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -38,8 +41,16 @@ static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
-        var tray = new TrayApplication(portArg, hostnameArg, modeArg, configPath, startup, openBrowser);
-        tray.Run();
+        try
+        {
+            using var tray = new TrayApplication(portArg, hostnameArg, modeArg, configPath, startup, openBrowser);
+            tray.Run();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "omp-web Service Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Environment.ExitCode = 1;
+        }
     }
 }
 
@@ -59,6 +70,10 @@ class TrayApplication : IDisposable
     private string _effectiveMode = "start";
     private bool _effectiveAutoRestart = true;
     private string _serverUrl = "http://127.0.0.1:30177";
+    private string _healthUrl = "http://127.0.0.1:30177";
+    private string? _uiSource;
+    private string? _uiPublicUrl;
+    private int? _uiProxyPort;
 
     private NotifyIcon _notifyIcon = null!;
     private ContextMenuStrip _contextMenu = null!;
@@ -154,7 +169,7 @@ class TrayApplication : IDisposable
                 config = doc.RootElement.Clone();
             }
         }
-        catch { }
+        catch (Exception ex) { throw new InvalidOperationException($"Cannot read web service configuration '{_configPath}': {ex.Message}", ex); }
 
         int? cfgPort = null;
         string? cfgHost = null;
@@ -164,6 +179,7 @@ class TrayApplication : IDisposable
         if (config.HasValue)
         {
             var el = config.Value;
+            if (el.ValueKind != JsonValueKind.Object) throw new InvalidOperationException("Web service configuration must be a JSON object.");
             if (el.TryGetProperty("port", out var p) && p.TryGetInt32(out var pi)) cfgPort = pi;
             if (el.TryGetProperty("hostname", out var h)) cfgHost = h.GetString();
             if (el.TryGetProperty("mode", out var m)) cfgMode = m.GetString();
@@ -175,6 +191,12 @@ class TrayApplication : IDisposable
         _effectiveHostname = !string.IsNullOrWhiteSpace(_hostnameArg) ? _hostnameArg : (!string.IsNullOrWhiteSpace(cfgHost) ? cfgHost! : DefaultHostname);
         _effectiveMode = !string.IsNullOrWhiteSpace(_modeArg) ? _modeArg : (!string.IsNullOrWhiteSpace(cfgMode) ? cfgMode! : DefaultMode);
         _effectiveAutoRestart = cfgAutoRestart ?? true;
+        if (_effectiveMode != "start" && _effectiveMode != "dev" && _effectiveMode != "ui")
+            throw new InvalidOperationException($"Unsupported web service mode '{_effectiveMode}'; expected start, dev or ui.");
+        _uiSource = null;
+        _uiPublicUrl = null;
+        _uiProxyPort = null;
+        if (_effectiveMode == "ui") ResolveUiConfig(config);
         if (_openBrowser) { /* explicit */ }
         else if (!_startup && cfgOpenBrowser == true) _openBrowser = true;
 
@@ -185,9 +207,60 @@ class TrayApplication : IDisposable
             if (_effectivePort == 30177) _effectivePort = 30178;
         }
 
-        _serverUrl = (_effectiveHostname == "0.0.0.0" || _effectiveHostname == "::" || string.IsNullOrWhiteSpace(_effectiveHostname))
+        _healthUrl = (_effectiveHostname == "0.0.0.0" || _effectiveHostname == "::" || string.IsNullOrWhiteSpace(_effectiveHostname))
             ? $"http://localhost:{_effectivePort}"
-            : $"http://{_effectiveHostname}:{_effectivePort}";
+            : $"http://{(_effectiveHostname.Contains(':') ? $"[{_effectiveHostname}]" : _effectiveHostname)}:{_effectivePort}";
+        _serverUrl = _uiPublicUrl ?? _healthUrl;
+    }
+
+    private void ResolveUiConfig(JsonElement? config)
+    {
+        if (!config.HasValue || !config.Value.TryGetProperty("uiSource", out var source)
+            || source.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(source.GetString())
+            || !Path.IsPathFullyQualified(source.GetString()!))
+            throw new InvalidOperationException("UI mode requires uiSource to be an absolute full source checkout path in web-service.json.");
+        _uiSource = Path.TrimEndingDirectorySeparator(Path.GetFullPath(source.GetString()!));
+        foreach (var relative in new[] { "package.json", "bin/omp-web-ui.js", "server/ui.ts", "app/client.tsx" })
+            if (!File.Exists(Path.Combine(_uiSource, relative)))
+                throw new InvalidOperationException($"UI mode uiSource is not a full source checkout: missing {relative} under {_uiSource}.");
+        if (_effectiveHostname != "127.0.0.1" && _effectiveHostname != "localhost" && _effectiveHostname != "::1")
+            throw new InvalidOperationException("UI mode requires a loopback hostname.");
+        if (_effectivePort < 1 || _effectivePort > 65535)
+            throw new InvalidOperationException("UI mode requires a web service port from 1 to 65535.");
+        if (config.Value.TryGetProperty("uiPublicUrl", out var publicUrl) && publicUrl.ValueKind != JsonValueKind.Null)
+        {
+            if (publicUrl.ValueKind != JsonValueKind.String || !Uri.TryCreate(publicUrl.GetString(), UriKind.Absolute, out var uri)
+                || uri.Scheme != "https" || uri.UserInfo.Length != 0 || uri.AbsolutePath != "/" || uri.Query.Length != 0 || uri.Fragment.Length != 0
+                || publicUrl.GetString()!.Any(c => char.IsWhiteSpace(c) || c == '"' || c == '<' || c == '>'))
+                throw new InvalidOperationException("UI mode uiPublicUrl must be a trusted HTTPS origin without credentials, path, query or fragment.");
+            _uiPublicUrl = uri.GetLeftPart(UriPartial.Authority);
+        }
+        if (config.Value.TryGetProperty("uiProxyPort", out var proxyPort) && proxyPort.ValueKind != JsonValueKind.Null)
+        {
+            if (proxyPort.ValueKind != JsonValueKind.Number || !proxyPort.TryGetInt32(out var value) || value < 1 || value > 65535 || value == _effectivePort)
+                throw new InvalidOperationException("UI mode uiProxyPort must be an integer from 1 to 65535, different from the web service port.");
+            _uiProxyPort = value;
+        }
+    }
+
+    private void SaveConfig(bool autostart)
+    {
+        var config = File.Exists(_configPath) ? JsonNode.Parse(File.ReadAllText(_configPath)) as JsonObject
+            : new JsonObject
+            {
+                ["port"] = _effectivePort, ["hostname"] = _effectiveHostname, ["mode"] = _effectiveMode,
+                ["openBrowserOnLaunch"] = false, ["autoRestart"] = _effectiveAutoRestart,
+            };
+        if (!File.Exists(_configPath))
+        {
+            if (_uiSource != null) config!["uiSource"] = _uiSource;
+            if (_uiPublicUrl != null) config!["uiPublicUrl"] = _uiPublicUrl;
+            if (_uiProxyPort.HasValue) config!["uiProxyPort"] = _uiProxyPort.Value;
+        }
+        if (config == null) throw new InvalidOperationException("Web service configuration must be a JSON object.");
+        config["autostart"] = autostart;
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_configPath))!);
+        File.WriteAllText(_configPath, config.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
     }
 
     private void WriteLog(string message)
@@ -248,6 +321,14 @@ class TrayApplication : IDisposable
     private void StartWebServer()
     {
         if (_childProcess != null && !_childProcess.HasExited) return;
+        try { ResolveConfig(); }
+        catch (Exception ex)
+        {
+            _state = "Error";
+            WriteLog($"Web service configuration error: {ex.Message}");
+            UpdateTrayUI();
+            return;
+        }
         _state = "Starting";
         UpdateTrayUI();
         WriteLog($"Starting web server in {_effectiveMode} mode on {_effectiveHostname}:{_effectivePort}...");
@@ -257,7 +338,7 @@ class TrayApplication : IDisposable
         var psi = new ProcessStartInfo
         {
             FileName = _nodeExe,
-            WorkingDirectory = _repoRoot,
+            WorkingDirectory = _uiSource ?? _repoRoot,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -265,8 +346,27 @@ class TrayApplication : IDisposable
         };
 
         var production = _effectiveMode == "start";
-        psi.ArgumentList.Add(Path.Combine(_repoRoot, "bin", production ? "omp-web.js" : "bun-runtime.js"));
-        if (!production)
+        var ui = _effectiveMode == "ui";
+        psi.ArgumentList.Add(Path.Combine(_uiSource ?? _repoRoot, "bin", ui ? "omp-web-ui.js" : production ? "omp-web.js" : "bun-runtime.js"));
+        if (ui)
+        {
+            psi.ArgumentList.Add("--source");
+            psi.ArgumentList.Add(_uiSource!);
+            psi.ArgumentList.Add("--primary");
+            psi.ArgumentList.Add("--service-root");
+            psi.ArgumentList.Add(_repoRoot);
+            if (_uiPublicUrl != null)
+            {
+                psi.ArgumentList.Add("--public-url");
+                psi.ArgumentList.Add(_uiPublicUrl);
+            }
+            if (_uiProxyPort.HasValue)
+            {
+                psi.ArgumentList.Add("--proxy-port");
+                psi.ArgumentList.Add(_uiProxyPort.Value.ToString(CultureInfo.InvariantCulture));
+            }
+        }
+        else if (!production)
         {
             psi.ArgumentList.Add("--hot");
             psi.ArgumentList.Add(Path.Combine(_repoRoot, "server", "dev.ts"));
@@ -282,6 +382,12 @@ class TrayApplication : IDisposable
         psi.EnvironmentVariables["OMP_WEB_PORT"] = port;
         psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = _effectiveHostname;
         psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1";
+        if (ui)
+        {
+            psi.EnvironmentVariables["OMP_WEB_SERVICE_ROOT"] = _repoRoot;
+            psi.EnvironmentVariables["OMP_WEB_SERVICE_CONFIG_PATH"] = _configPath;
+            psi.EnvironmentVariables["PI_CODING_AGENT_DIR"] = Path.GetDirectoryName(_configPath)!;
+        }
         psi.EnvironmentVariables["PORT"] = port;
         // bin/omp-web.js refuses a non-loopback bind without a password hash. A plaintext
         // OMP_WEB_PASSWORD is passed through only so the server can refuse it with instructions.
@@ -344,7 +450,7 @@ class TrayApplication : IDisposable
     {
         try
         {
-            var req = WebRequest.Create(_serverUrl);
+            var req = WebRequest.Create(_healthUrl);
             req.Timeout = 2000;
             using var resp = req.GetResponse();
             return true;
@@ -371,21 +477,23 @@ class TrayApplication : IDisposable
             var lnk = Path.Combine(startup, "omp-web-tray.lnk");
             if (enable)
             {
-                // Recreate via install script logic (simplified): copy from install
-                var ps = Path.Combine(_repoRoot, "scripts", "windows", "install-tray.ps1");
-                if (File.Exists(ps))
-                {
-                    var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -ExecutionPolicy Bypass -File \"{ps}\"") { CreateNoWindow = true, UseShellExecute = false };
-                    using var p = Process.Start(psi);
-                    p?.WaitForExit(10000);
-                }
+                var shellType = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException("Windows Script Host is unavailable.");
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                dynamic shortcut = shell.CreateShortcut(lnk);
+                shortcut.TargetPath = Environment.ProcessPath!;
+                shortcut.Arguments = $"-Startup -ConfigPath \"{_configPath}\"";
+                shortcut.WorkingDirectory = _repoRoot;
+                if (File.Exists(_icoPath)) shortcut.IconLocation = $"{_icoPath},0";
+                shortcut.Description = "omp-web Background Tray Service";
+                shortcut.Save();
             }
             else
             {
                 if (File.Exists(lnk)) File.Delete(lnk);
             }
+            SaveConfig(enable);
         }
-        catch { }
+        catch (Exception ex) { WriteLog($"Failed to update autostart: {ex.Message}"); }
     }
 
     private void UpdateTrayUI()
@@ -425,9 +533,12 @@ class TrayApplication : IDisposable
         // Mutex
         try
         {
-            _appMutex = new Mutex(true, @"Local\OmpWebTray_Instance_Mutex", out _createdNew);
+            var configKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(_configPath).Replace('/', '\\').ToUpperInvariant())));
+            _appMutex = new Mutex(false, $@"Local\OmpWebService_{configKey}");
+            try { _createdNew = _appMutex.WaitOne(0); }
+            catch (AbandonedMutexException) { _createdNew = true; }
         }
-        catch { _createdNew = true; }
+        catch (Exception ex) { throw new InvalidOperationException($"Cannot acquire the web service configuration mutex: {ex.Message}", ex); }
         if (!_createdNew)
         {
             if (_openBrowser)
@@ -507,8 +618,7 @@ class TrayApplication : IDisposable
             var cfg = _configPath;
             if (!File.Exists(cfg))
             {
-                // create via autostart check
-                SetAutostart(CheckAutostart());
+                SaveConfig(CheckAutostart());
             }
             try { Process.Start("notepad.exe", $"\"{cfg}\""); } catch { }
         });

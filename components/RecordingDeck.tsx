@@ -196,7 +196,7 @@ export function RecordingDeck({
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [captureRef, captureActive, isPaused, isReviewing, isPlayingPreview, previewCurrentTime, previewDuration]);
+  }, [captureRef, captureActive, isPaused, isReviewing, isPlayingPreview, previewCurrentTime, previewDuration, elapsed]);
 
   // Playback of a recording that is being, or failed to be, transcribed.
   const jobPlayButton = onPlayPreview ? (

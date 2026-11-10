@@ -2,13 +2,14 @@
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useImperativeHandle, useMemo, forwardRef, memo, KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, CircleHelp, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, Reply, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
-import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
+import { ChevronDown, CircleHelp, ClipboardPaste, CornerDownRight, ListChecks, Loader2, Mic, Paperclip, Plus, Reply, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
+import { getSubmitDuringRunBehavior, isWordCompletionEnabled, useSlowModeControlVisible } from "@/lib/composer-prefs";
 import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActivePlan } from "@/lib/web-mode-state";
 import { toast } from "@/components/ui/toast";
 import { ConfirmDialog } from "@/components/ui/field";
 import { useDictation } from "@/hooks/useDictation";
+import { useComposerModelPreference } from "@/hooks/useComposerModelPreference";
 import { toastBtwError } from "@/hooks/useBtw";
 import type { GenerationSpeedInfo, GoalModeState, SessionStatsInfo, SlowModeScope, UsageLimitState } from "@/lib/pi-types";
 import { buildQueuePanelItems, type QueueProgressSnapshot } from "@/lib/queue-progress";
@@ -51,11 +52,8 @@ import {
   type SlashCommandSource,
 } from "./ChatInput-slash-commands";
 import {
-  COMPOSER_MODELS_STORAGE_KEY,
-  compareModelOptions,
-  filterModelOptions,
+  buildModelOptions,
   formatTokenCount,
-  readVisibleModelKeys,
   type ModelOption,
 } from "./ChatInput-model-options";
 import { ModelPickerPanel } from "./ChatInput-model-picker";
@@ -84,21 +82,15 @@ import {
 } from "@/lib/slash-autocomplete";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useFixedMenuPosition } from "@/hooks/useFixedMenuPosition";
 import { useWordPrediction, type PredictWord, type PredictWordFeedback } from "@/hooks/useWordPrediction";
 import { acceptGhost } from "@/lib/word-prediction";
 import { GhostMirror } from "@/components/GhostMirror";
 import { useI18n } from "@/lib/i18n";
-import { selectableThinkingLevels, DEFAULT_THINKING_LEVELS } from "@/lib/thinking-levels";
+import { ThinkingGlyph } from "./ThinkingGlyph";
+import { displayThinkingLevel } from "@/lib/thinking-levels";
 import type { ToolPreset } from "@/lib/tool-presets";
 
-function ThinkingGlyph({ level }: { level: string }) {
-  if (!DEFAULT_THINKING_LEVELS.includes(level)) return null;
-  return (
-    <span className="composer-thinking-glyph" data-level={level} aria-hidden="true">
-      {level === "auto" ? <RotateCw strokeWidth={2} /> : null}
-    </span>
-  );
-}
 
 const SLOW_MODE_SAME_DAY_MS = 20 * 3_600_000;
 
@@ -165,7 +157,6 @@ function readBase64(file: Blob): Promise<string> {
 }
 
 export type { AttachedImage, AttachedTextFile } from "./ChatInput-draft-attachments";
-export { filterModelOptions } from "./ChatInput-model-options";
 export { ModelErrorBanner } from "./ChatInput-banners";
 
 const TOOL_PRESET_OPTIONS: Array<{ value: ToolPreset; descriptionKey: string }> = [
@@ -197,7 +188,7 @@ interface Props {
   modelList?: { id: string; name: string; provider: string; supportsFastMode?: boolean }[];
   modelError?: string | null;
   modelsLoading?: boolean;
-  onModelChange?: (provider: string, modelId: string) => void;
+  onModelChange?: (provider: string, modelId: string) => void | Promise<void>;
   fastModeEnabled?: boolean;
   fastModeActive?: boolean;
   /** omp's structured provider usage-limit state, shown as a warning chip. */
@@ -226,7 +217,6 @@ interface Props {
   onAbortRetry?: () => void;
   queuedMessages?: QueuedMessages | null;
   queueProgress?: QueueProgressSnapshot | null;
-  onDismissQueueProgress?: () => void;
   inputHistory?: string[];
   /** True while the advisor model is actively reviewing the running turn. */
   advisorActive?: boolean;
@@ -269,13 +259,9 @@ interface Props {
   advisorEnabled?: boolean;
   /** Toggle the per-chat advisor (composer icon + /advisor command). */
   onAdvisorChange?: (enabled: boolean) => void;
-  /** Collapse the entire composer into a minimized bar. */
-  onMinimize?: () => void;
   /** Active status label attached to the composer's top edge (e.g. "Waiting for model..."). */
   statusText?: string | null;
   waitingForInput?: boolean;
-  /** Open Settings → API Keys & Providers from the model picker footer. */
-  onOpenProviders?: () => void;
 }
 
 export interface ChatInputHandle {
@@ -369,7 +355,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onAbortCompaction, isCompacting, compactResult,
   thinkingLevel, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap, modelNameOverride,
   toolPreset, onToolPresetChange,
-  retryInfo, queuedMessages, queueProgress, onDismissQueueProgress, inputHistory = [], onAbortRetry,
+  retryInfo, queuedMessages, queueProgress, inputHistory = [], onAbortRetry,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
   onAudioUnlock,
@@ -394,14 +380,13 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   activePlan,
   advisorEnabled,
   onAdvisorChange,
-  onMinimize,
   statusText,
   waitingForInput = false,
-  onOpenProviders,
 }: Props, ref) {
   const isMobile = useIsMobile();
   // Read per render so a Settings change applies on the next keystroke.
   const wordCompletionOn = isWordCompletionEnabled();
+  const slowModeControlVisible = useSlowModeControlVisible();
   const wordPrediction = useWordPrediction(
     wordCompletionOn ? onPredictWord : undefined,
     wordCompletionOn ? onPredictWordFeedback : undefined,
@@ -413,7 +398,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const atListboxId = `${composerId}-at`;
   const plusMenuId = `${composerId}-plus-menu`;
   const modelPickerId = `${composerId}-model-picker`;
-  const thinkingMenuId = `${composerId}-thinking-menu`;
   const moveMenuFocus = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
@@ -451,7 +435,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     queue: Props["queuedMessages"];
   } | null>(null);
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
-  const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
+  const [modelSelectionPending, setModelSelectionPending] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   // Desktop context popover height cap: the room above its trigger, so it only
   // scrolls when the window is genuinely too short for it.
@@ -460,7 +444,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const contextContainer = isMobile ? sessionInfoContainer : composerContextContainer;
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [plusExpanded, setPlusExpanded] = useState<"tools" | "advisor" | null>(null);
-  const [modelSearchQuery, setModelSearchQuery] = useState("");
   const [attachedImages, setAttachedImages] = useState<AttachedImage[]>(() => (
     draftKey ? draftImagesToAttachedImages(getDraft(draftKey)?.images) : []
   ));
@@ -505,9 +488,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const dropdownRef = useRef<HTMLDivElement>(null);
   const modelDropdownPanelRef = useRef<HTMLDivElement>(null);
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
+  const composerShellRef = useRef<HTMLDivElement>(null);
   const modelWasOpenRef = useRef(false);
-  const modelSearchInputRef = useRef<HTMLInputElement>(null);
-  const thinkingDropdownRef = useRef<HTMLDivElement>(null);
+  const modelPickerPosition = useFixedMenuPosition(modelDropdownOpen, composerShellRef, 520, { placement: "above", height: 420 });
+  const modelPickerPositioned = modelPickerPosition !== null;
   const contextWrapRef = useRef<HTMLDivElement>(null);
   const contextReturnFocusRef = useRef<HTMLElement | null>(null);
   const plusMenuRef = useRef<HTMLDivElement>(null);
@@ -2070,13 +2054,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         return;
       }
 
-      // Esc minimizes the composer when idle, empty, and no menus open.
-      if (e.key === "Escape" && !isComposing && !isStreaming && onMinimize && value.trim().length === 0) {
-        e.preventDefault();
-        onMinimize();
-        return;
-      }
-
       // Soft keyboards rarely offer Shift+Enter; on the mobile breakpoint Enter
       // inserts a newline and the Send button submits.
       if (e.key === "Enter" && !e.shiftKey && !isMobile) {
@@ -2093,7 +2070,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         }
       }
     },
-    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, onMinimize, slashMenuOpen, slashQuery, filteredSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, toggleDictation, wordPrediction, setValue]
+    [isMobile, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, filteredSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, toggleDictation, wordPrediction, setValue]
   );
 
 
@@ -2138,41 +2115,12 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     slashItemRefs.current[slashActiveIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [slashActiveIndex, slashMenuOpen]);
 
-  // Build model options: prefer modelList (has provider info), fallback to modelNames
-  const [visibleModelKeys, setVisibleModelKeys] = useState<Set<string> | null>(null);
-  useEffect(() => {
-    const refresh = () => setVisibleModelKeys(readVisibleModelKeys());
-    const refreshFromStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === COMPOSER_MODELS_STORAGE_KEY) refresh();
-    };
-    refresh();
-    window.addEventListener("omp-composer-models-change", refresh);
-    window.addEventListener("storage", refreshFromStorage);
-    return () => {
-      window.removeEventListener("omp-composer-models-change", refresh);
-      window.removeEventListener("storage", refreshFromStorage);
-    };
-  }, []);
-
-  const modelOptions: ModelOption[] = React.useMemo(() => {
-    if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }))
-        .filter((m) => visibleModelKeys === null || visibleModelKeys.has(`${m.provider}:${m.modelId}`))
-        .sort((a, b) => compareModelOptions(modelCollator, a, b));
-    }
-    return Object.entries(modelNames ?? {}).map(([modelId, name]) => ({
-      provider: model?.provider ?? "unknown",
-      modelId,
-      name,
-    })).sort((a, b) => compareModelOptions(modelCollator, a, b));
-  }, [modelList, modelNames, model?.provider, visibleModelKeys, modelCollator]);
-
-  const filteredModelOptions = React.useMemo(
-    () => filterModelOptions(modelOptions, modelSearchQuery, locale),
-    [locale, modelOptions, modelSearchQuery],
+  const composerModels = useComposerModelPreference();
+  const modelOptions: ModelOption[] = React.useMemo(
+    () => buildModelOptions(modelList, modelNames, model?.provider, composerModels.visibleModelKeys, modelCollator),
+    [modelList, modelNames, model?.provider, composerModels.visibleModelKeys, modelCollator],
   );
 
-  // Grouping for the nested picker lives in ChatInput-model-picker (providers rail + models pane).
 
   const displayModelName = model
     ? (modelOptions.find((o) => o.modelId === model.modelId && o.provider === model.provider)?.name
@@ -2183,8 +2131,21 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const currentName = displayModelName;
   // A failed load surfaces modelError; only an in-flight load shows the
   // loading chip, so "no models" can only appear after the fetch settled.
-  const showModelsLoading = Boolean(modelsLoading) && !modelError;
-  const modelSelectorDisabled = isStreaming || (showModelsLoading && modelOptions.length === 0);
+  const showModelsLoading = !modelError && (Boolean(modelsLoading) || (!composerModels.ready && composerModels.loading));
+  const modelSelectorDisabled = isStreaming || modelSelectionPending || (showModelsLoading && modelOptions.length === 0 && !onThinkingLevelChange);
+  const selectPickerModel = async (provider: string, modelId: string) => {
+    if (isStreaming || modelSelectionPending || !onModelChange) return;
+    if (provider === model?.provider && modelId === model?.modelId && !isAutoModelSelection) return;
+    setModelSelectionPending(true);
+    try {
+      // Keep reasoning disabled until the selected model's native metadata is ready.
+      await onModelChange(provider, modelId);
+    } catch (error) {
+      toast.error(t("chatInput.changeModel"), error instanceof Error ? error.message : String(error));
+    } finally {
+      setModelSelectionPending(false);
+    }
+  };
 
   const compactSavedTokens = compactResult
     ? Math.max(0, compactResult.tokensBefore - compactResult.estimatedTokensAfter)
@@ -2219,45 +2180,31 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         t("chatInput.compactContext"),
       ].filter(Boolean).join(" · ")
     : t("chatInput.compactContext");
-  const thinkingDisplayLabel = (() => {
-    const lvl = thinkingLevel ?? "auto";
-    if (lvl === "auto" || !thinkingLevelMap) return lvl;
-    return thinkingLevelMap[lvl] ?? lvl;
-  })();
-  const thinkingLevelOptions = React.useMemo(
-    () => selectableThinkingLevels(availableThinkingLevels),
-    [availableThinkingLevels],
-  );
-  // A run starting mid-interaction must not leave the reasoning menu
-  // open: the level only applies to the next prompt, and the trigger is
-  // disabled while streaming.
+  const thinkingDisplayLabel = displayThinkingLevel(thinkingLevel ?? "auto", thinkingLevelMap);
+  // Both choices belong to the next prompt; a running turn owns its model.
   useEffect(() => {
-    if (isStreaming) setThinkingDropdownOpen(false);
+    if (isStreaming) setModelDropdownOpen(false);
   }, [isStreaming]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!modelDropdownOpen) {
-      setModelSearchQuery("");
       if (!modelWasOpenRef.current) return;
       modelWasOpenRef.current = false;
-      requestAnimationFrame(() => {
-        const active = document.activeElement;
-        if (active instanceof HTMLElement && active !== document.body && active !== modelTriggerRef.current) return;
-        modelTriggerRef.current?.focus();
-      });
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== document.body && active !== modelTriggerRef.current) return;
+      modelTriggerRef.current?.focus();
       return;
     }
+    if (!modelPickerPositioned) return;
     modelWasOpenRef.current = true;
-    requestAnimationFrame(() => modelSearchInputRef.current?.focus());
-  }, [modelDropdownOpen]);
+    const panel = modelDropdownPanelRef.current;
+    const selected = panel?.querySelector<HTMLButtonElement>('[role="menuitemradio"][aria-checked="true"]:not(:disabled)');
+    (selected ?? panel?.querySelector<HTMLButtonElement>('[role="menuitemradio"]:not(:disabled)'))?.focus();
+  }, [modelDropdownOpen, modelPickerPositioned]);
   useEffect(() => {
     if (!plusMenuOpen) return;
     requestAnimationFrame(() => plusMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not([disabled])')?.focus());
   }, [plusMenuOpen]);
-  useEffect(() => {
-    if (!thinkingDropdownOpen) return;
-    requestAnimationFrame(() => thinkingDropdownRef.current?.querySelector<HTMLButtonElement>('[role="menuitemradio"]:not([disabled])')?.focus());
-  }, [thinkingDropdownOpen]);
   useLayoutEffect(() => {
     const wrap = contextWrapRef.current;
     if (!contextOpen || isMobile || !wrap) return;
@@ -2308,9 +2255,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         modelDropdownPanelRef.current && !modelDropdownPanelRef.current.contains(e.target as Node)
       ) {
         setModelDropdownOpen(false);
-      }
-      if (thinkingDropdownRef.current && !thinkingDropdownRef.current.contains(e.target as Node)) {
-        setThinkingDropdownOpen(false);
       }
       if (plusMenuRef.current && !plusMenuRef.current.contains(e.target as Node)) {
         setPlusMenuOpen(false);
@@ -2382,6 +2326,12 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       />
       <div style={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
         <ModelErrorBanner error={modelError} />
+        {composerModels.error && (
+          <div role="alert" style={{ padding: "8px 12px", color: "var(--status-error)", fontSize: 12 }}>
+            {t("modelsConfig.composerPickerSyncError")} {composerModels.error}{" "}
+            <button type="button" onClick={() => void composerModels.refresh()} disabled={composerModels.loading}>{t("chatWindow.retry")}</button>
+          </div>
+        )}
         <ComposerModeStatus goal={goalState} plan={activePlan} onGoalAction={onGoalAction} />
         {/* Retry banner */}
         {retryInfo && (() => {
@@ -2931,7 +2881,6 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
             promoteBlocked={submissionBlocked}
             onAction={handleQueueAction}
             onDelete={handleItemDelete}
-            onDismiss={onDismissQueueProgress}
           />
         )}
         {/* Live agent status bar — attached to composer's top edge */}
@@ -2965,6 +2914,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
           </div>
         )}
           <div
+            ref={composerShellRef}
             className="chat-input-shell"
             style={{
               display: "flex",
@@ -3226,8 +3176,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 </div>
               )}
             </div>
-            {/* Model selector — compact text button with dropdown */}
-            {(modelOptions.length > 0 || currentName || modelError || showModelsLoading) && onModelChange && (
+            {/* Model and reasoning share one trigger and a two-pane picker. */}
+            {((onModelChange && (modelOptions.length > 0 || currentName || modelError || showModelsLoading)) || onThinkingLevelChange) && (
               <div ref={dropdownRef} className="composer-model-control" style={{ position: "relative", minWidth: 0 }}>
                 <button
                   ref={modelTriggerRef}
@@ -3235,7 +3185,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   disabled={modelSelectorDisabled}
                   aria-label={`${t("chatInput.changeModel")}: ${currentName ?? (modelOptions.length > 0
                     ? t("chatInput.selectModel")
-                    : showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noModels"))}`}
+                    : showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noModels"))} · ${t("chatInput.reasoningLabel")}: ${thinkingDisplayLabel}`}
                   style={{
                     display: "flex", alignItems: "center", gap: 5,
                     height: "var(--control-height-sm)",
@@ -3261,171 +3211,74 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     e.currentTarget.style.background = modelDropdownOpen ? "var(--bg-hover)" : "none";
                     e.currentTarget.style.color = "var(--text-muted)";
                   }}
-                  title={modelOptions.length > 0
-                    ? t("chatInput.changeModel")
-                    : showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noAvailableModels")}
+                  title={`${t("chatInput.modelsAndReasoning")} · ${t("chatInput.changeReasoningTitle", { level: thinkingDisplayLabel })}`}
                   aria-expanded={modelDropdownOpen}
                   aria-haspopup="dialog"
                   aria-controls={modelPickerId}
                 >
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-                    <rect x="4" y="4" width="16" height="16" rx="2" />
-                    <rect x="9" y="9" width="6" height="6" />
-                    <line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" />
-                    <line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" />
-                    <line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" />
-                    <line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" />
-                  </svg>
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                  <ThinkingGlyph level={thinkingLevel ?? "auto"} />
+                  <span className="composer-model-name" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                     {currentName ?? (modelOptions.length > 0
                       ? t("chatInput.selectModel")
                       : showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noModels"))}
                   </span>
                   <ChevronDown size={12} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.7, transform: modelDropdownOpen ? "rotate(180deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} aria-hidden="true" />
                 </button>
-                {modelDropdownOpen && (
+                {modelDropdownOpen && modelPickerPosition && createPortal(
                   <div
                     id={modelPickerId}
                     role="dialog"
-                    aria-label={t("chatInput.modelsLabel")}
+                    aria-label={t("chatInput.modelsAndReasoning")}
                     ref={modelDropdownPanelRef}
-                    className="picker-panel"
+                    className="picker-panel picker-model-reasoning"
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setModelDropdownOpen(false);
+                      }
+                    }}
                     style={{
-                      position: isMobile ? "fixed" : "absolute",
-                      bottom: isMobile ? 8 : "calc(100% + 6px)",
-                      ...(isMobile
-                        ? { left: 8, right: 8, maxWidth: "calc(100vw - 16px)" }
-                        : { left: 0, width: "min(360px, calc(100vw - 32px))" }),
+                      position: "fixed",
+                      top: modelPickerPosition.top,
+                      left: modelPickerPosition.left,
+                      width: modelPickerPosition.width,
                       zIndex: 500,
                       display: "flex",
                       flexDirection: "column",
-                      height: isMobile ? undefined : "min(360px, calc(100dvh - 32px))",
-                      maxHeight: isMobile ? "calc(100dvh - 32px)" : undefined,
+                      height: modelPickerPosition.height,
+                      maxHeight: modelPickerPosition.height,
                     }}
                   >
                       <div className="picker-panel-header">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ color: "var(--text-muted)" }}>
-                          <rect x="4" y="4" width="16" height="16" rx="2" />
-                          <rect x="9" y="9" width="6" height="6" />
-                        </svg>
-                        <span className="picker-panel-title">{t("chatInput.modelsLabel")}</span>
+                        <ThinkingGlyph level={thinkingLevel ?? "auto"} />
+                        <span className="picker-panel-title">{t("chatInput.modelsAndReasoning")}</span>
                         <span className="picker-panel-count">{modelOptions.length}</span>
                       </div>
                       <ModelPickerPanel
                         modelOptions={modelOptions}
-                        filteredModelOptions={filteredModelOptions}
                         currentModel={model}
-                        modelSearchQuery={modelSearchQuery}
-                        onSearchQueryChange={setModelSearchQuery}
-                        searchInputRef={modelSearchInputRef}
                         showModelsLoading={showModelsLoading}
-                        isMobile={isMobile}
-                        onSelectModel={(provider, modelId) => {
+                        thinkingLevel={thinkingLevel}
+                        availableThinkingLevels={availableThinkingLevels}
+                        thinkingLevelMap={thinkingLevelMap}
+                        selectionPending={modelSelectionPending}
+                        onSelectModel={onModelChange ? (provider, modelId) => { void selectPickerModel(provider, modelId); } : undefined}
+                        onSelectThinkingLevel={onThinkingLevelChange ? (level) => {
+                          if (isStreaming || modelSelectionPending) return;
                           setModelDropdownOpen(false);
-                          if (provider !== model?.provider || modelId !== model?.modelId || isAutoModelSelection) {
-                            onModelChange(provider, modelId);
-                          }
-                        }}
-                        onClose={() => setModelDropdownOpen(false)}
-                        onOpenProviders={onOpenProviders ? () => {
-                          setModelDropdownOpen(false);
-                          onOpenProviders();
+                          if (level !== (thinkingLevel ?? "auto")) onThinkingLevelChange(level);
                         } : undefined}
+                        onClose={() => setModelDropdownOpen(false)}
                       />
-                    </div>
+                    </div>,
+                  document.body,
                 )}
               </div>
             )}
 
             <div className="composer-toolbar-spacer" style={{ marginLeft: "auto" }} />
 
-            {/* Thinking selector — compact, expressive, and consistent with models */}
-            {onThinkingLevelChange && (
-              <div ref={thinkingDropdownRef} className="composer-thinking-control" style={{ position: "relative", minWidth: 0 }}>
-                <button
-                  onClick={() => setThinkingDropdownOpen((v) => !v)}
-                  disabled={isStreaming}
-                  title={t("chatInput.changeReasoningTitle", { level: thinkingDisplayLabel })}
-                  aria-controls={thinkingMenuId}
-                  aria-label={`${t("chatInput.changeReasoning")}: ${thinkingDisplayLabel}`}
-                  aria-expanded={thinkingDropdownOpen}
-                  aria-haspopup="menu"
-                  style={{
-                    display: "flex", alignItems: "center", gap: 5,
-                    height: "var(--control-height-sm)", width: "100%", padding: "0 4px", background: thinkingDropdownOpen ? "var(--bg-hover)" : "none",
-                    border: "none", borderRadius: 7, color: "var(--text-muted)", cursor: isStreaming ? "not-allowed" : "pointer",
-                    opacity: isStreaming ? 0.5 : 1, fontSize: "var(--text-sm)",
-                    transition: "background var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)",
-                  }}
-                  onMouseEnter={(e) => { if (!isStreaming) { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; } }}
-                  onMouseLeave={(e) => { e.currentTarget.style.background = thinkingDropdownOpen ? "var(--bg-hover)" : "none"; e.currentTarget.style.color = "var(--text-muted)"; }}
-                >
-                  {/* TUI-style level glyph; wide toolbars also show the level
-                      name (label hidden by CSS on narrow toolbars) and the
-                      label always stays in title/aria. */}
-                  <ThinkingGlyph level={thinkingLevel ?? "auto"} />
-                  <span className="composer-thinking-label" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{thinkingDisplayLabel}</span>
-                  <ChevronDown size={12} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.7, transform: thinkingDropdownOpen ? "rotate(180deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} aria-hidden="true" />
-                </button>
-                {thinkingDropdownOpen && (
-                  <div
-                    id={thinkingMenuId}
-                    aria-label={t("chatInput.reasoningLabel")}
-                    className="picker-panel"
-                    role="menu"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") {
-                        event.stopPropagation();
-                        setThinkingDropdownOpen(false);
-                        requestAnimationFrame(() => thinkingDropdownRef.current?.querySelector<HTMLButtonElement>("button")?.focus());
-                        return;
-                      }
-                      moveMenuFocus(event);
-                    }}
-                    style={{
-                      position: "absolute", bottom: "calc(100% + 6px)", left: 0,
-                      zIndex: 100, width: 190, maxWidth: "calc(100vw - 32px)",
-                    }}
-                  >
-                    <div className="picker-panel-header">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ color: "var(--text-muted)" }}>
-                        <path d="M9.5 2A5.5 5.5 0 0 0 4 7.5c0 1.7.78 3.21 2 4.21V14a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-2.29c1.22-1 2-2.51 2-4.21A5.5 5.5 0 0 0 9.5 2z" />
-                        <line x1="7" y1="18" x2="12" y2="18" />
-                      </svg>
-                      <span className="picker-panel-title">{t("chatInput.reasoningLabel")}</span>
-                      <span className="picker-panel-count">{thinkingLevelOptions.length}</span>
-                    </div>
-                    <div className="picker-thinking-cards">
-                      {thinkingLevelOptions.map((lvl) => {
-                        const isActive = (thinkingLevel ?? "auto") === lvl;
-                        const mappedVal = (lvl !== "auto" && thinkingLevelMap) ? thinkingLevelMap[lvl] : undefined;
-                        const displayLabel = (mappedVal != null && mappedVal !== lvl) ? mappedVal : lvl;
-                        return (
-                          <button
-                            className="picker-row picker-thinking-card"
-                            data-active={isActive}
-                            role="menuitemradio"
-                            aria-checked={isActive}
-                            key={lvl}
-                            onClick={() => { setThinkingDropdownOpen(false); if (!isActive && !isStreaming) onThinkingLevelChange(lvl); }}
-                          >
-                            <span className="picker-check">
-                              {isActive && <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1.5 5 4 7.5 8.5 2.5" /></svg>}
-                            </span>
-                            <ThinkingGlyph level={lvl} />
-                            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textTransform: "capitalize" }}>{displayLabel}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                    <div className="picker-panel-footer">
-                      <span>{t("chatInput.appliesNextPrompt")}</span>
-                      <span style={{ fontWeight: 600, color: "var(--text-muted)", textTransform: "capitalize" }}>{thinkingDisplayLabel}</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* Fast toggle — only for models that support fast mode. Stays
                 visible while the agent runs (disabled) so it does not look
@@ -3466,7 +3319,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 active model. A `global` scope is a persisted omp setting
                 shared by every session; `session` is this session's flex
                 tier — the tooltip says which. */}
-            {slowModeSupported && onSlowModeChange && (
+            {slowModeControlVisible && slowModeSupported && onSlowModeChange && (
               <button
                 type="button"
                 className="composer-slow-control"

@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Command } from "cmdk";
 import { Check, MessageSquare, Monitor, Moon, Plus, Sparkles, Sun } from "lucide-react";
@@ -8,12 +8,15 @@ import type { SessionInfo } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { ALL_THEMES, useTheme } from "@/hooks/useTheme";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { comparableProjectPath } from "@/lib/comparable-path";
 type Props = {
   onSelectSession: (session: SessionInfo) => void;
   onNewSession: () => void;
   currentModel?: string | null;
   initialOpen?: boolean;
   openRequest?: number;
+  directorWorkspaceCwd?: string;
+  newSessionDisabled?: boolean;
 };
 
 function relativeTime(value: string, locale: string): string {
@@ -26,7 +29,7 @@ function relativeTime(value: string, locale: string): string {
   return new Intl.RelativeTimeFormat(locale, { numeric: "always" }).format(-Math.floor(hours / 24), "day");
 }
 
-export const CommandPalette = memo(function CommandPalette({ onSelectSession, onNewSession, currentModel, initialOpen = false, openRequest = 0 }: Props) {
+export const CommandPalette = memo(function CommandPalette({ onSelectSession, onNewSession, currentModel, initialOpen = false, openRequest = 0, directorWorkspaceCwd, newSessionDisabled = false }: Props) {
   const { t, locale } = useI18n();
   const { isDark, toggleTheme, setTheme, preference } = useTheme();
   const [open, setOpen] = useState(initialOpen);
@@ -34,6 +37,9 @@ export const CommandPalette = memo(function CommandPalette({ onSelectSession, on
     if (openRequest > 0) setOpen(true);
   }, [openRequest]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const visibleSessions = useMemo(() => directorWorkspaceCwd
+    ? sessions.filter((session) => (session.hostId ?? "local") !== "local" || comparableProjectPath(session.cwd) !== comparableProjectPath(directorWorkspaceCwd))
+    : sessions, [sessions, directorWorkspaceCwd]);
   const [loading, setLoading] = useState(false);
   const loadSeqRef = useRef(0);
   const lastFocusedElementRef = useRef<HTMLElement | null>(null);
@@ -97,10 +103,10 @@ export const CommandPalette = memo(function CommandPalette({ onSelectSession, on
         <Command.List style={{ padding: "8px", overflowY: "auto", maxHeight: "min(55vh, 440px)" }}>
           <Command.Empty style={{ padding: 20, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>{loading ? t("appShell.loading") : t("commandPalette.empty")}</Command.Empty>
           <Command.Group heading={t("commandPalette.sessions")}>
-            {sessions.map((session) => <Command.Item key={session.id} value={`${session.name ?? session.id} ${session.cwd}`} onSelect={() => choose(() => onSelectSession(session))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}><MessageSquare size={15} color="var(--accent)" /><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name || session.id}</span><span style={{ color: "var(--text-dim)", fontSize: 11 }}>{relativeTime(session.modified, locale)}</span></Command.Item>)}
+            {visibleSessions.map((session) => <Command.Item key={session.id} value={`${session.name ?? session.id} ${session.cwd}`} onSelect={() => choose(() => onSelectSession(session))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}><MessageSquare size={15} color="var(--accent)" /><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name || session.id}</span><span style={{ color: "var(--text-dim)", fontSize: 11 }}>{relativeTime(session.modified, locale)}</span></Command.Item>)}
           </Command.Group>
           <Command.Group heading={t("commandPalette.actions")}>
-            <Command.Item value={t("commandPalette.newSession")} onSelect={() => choose(onNewSession)} style={{ display: "flex", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}><Plus size={15} color="var(--accent)" />{t("commandPalette.newSession")}</Command.Item>
+            <Command.Item disabled={newSessionDisabled} value={t("commandPalette.newSession")} onSelect={() => choose(onNewSession)} style={{ display: "flex", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: newSessionDisabled ? "default" : "pointer", opacity: newSessionDisabled ? 0.5 : 1 }}><Plus size={15} color="var(--accent)" />{t("commandPalette.newSession")}</Command.Item>
             <Command.Item value={t("commandPalette.toggleTheme")} onSelect={() => choose(toggleTheme)} style={{ display: "flex", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}>{isDark ? <Sun size={15} color="var(--accent)" /> : <Moon size={15} color="var(--accent)" />}{t("commandPalette.toggleTheme")}</Command.Item>
           </Command.Group>
           <Command.Group heading={t("commandPalette.themes") || "Themes"}>

@@ -6,15 +6,13 @@ import { LOCALES, useI18n } from "@/lib/i18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useFixedMenuPosition } from "@/hooks/useFixedMenuPosition";
 
-/** Language toggle for the top bar. Renders the current language and opens a
- * small menu to pick any locale directly, with full keyboard support:
+/** Browser language picker for settings, with full keyboard support:
  *   - Enter / Space / ↓ : open
  *   - Arrow Up / Down    : move selection
  *   - Home / End         : first / last item
  *   - Enter              : choose focused item
- *   - Escape             : close, return focus to trigger
- * Styled to match the adjacent theme toggle button. */
-export function LanguageSwitcher() {
+ *   - Escape             : close, return focus to trigger */
+export function LanguageSwitcher(buttonProps: Pick<React.ButtonHTMLAttributes<HTMLButtonElement>, "id" | "aria-label" | "aria-labelledby" | "aria-describedby">) {
   const { locale, setLocale, t } = useI18n();
   const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
@@ -32,8 +30,7 @@ export function LanguageSwitcher() {
     if (!open) setActiveIndex(index);
   }, [index, open]);
 
-  // Fixed positioning escapes the compact top-bar overflow strip, whose
-  // horizontal scroller would otherwise clip the menu to its 48px height.
+  // Fixed positioning keeps the menu outside the scrolling settings panel.
   const menuPos = useFixedMenuPosition(open, triggerRef, 120);
   const menuShown = menuPos !== null;
 
@@ -107,6 +104,7 @@ export function LanguageSwitcher() {
       }}
     >
       <button
+        {...buttonProps}
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -151,6 +149,8 @@ export function LanguageSwitcher() {
             left: menuPos.left,
             zIndex: 600,
             minWidth: 120,
+            maxHeight: `calc(100vh / var(--ui-scale) - ${menuPos.top}px - 8px)`,
+            overflowY: "auto",
             margin: 0,
             padding: 4,
             listStyle: "none",

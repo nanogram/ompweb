@@ -8,6 +8,7 @@ import { invalidateSessionListCache } from "@/lib/session-reader";
 import { invalidateSessionFileListCache } from "@/lib/omp/session-files";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
+import { isDirectorWorkspace } from "@/lib/director-state";
 const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 
 // JSON escapes a session's newlines and quotes on the wire. Bound the request
@@ -79,6 +80,9 @@ export async function POST(req: Request) {
     }
     if (!cwd) {
       return Response.json({ error: "Not a valid omp session file (missing session header with cwd)", code: "invalid_session_file" }, { status: 400 });
+    }
+    if (isDirectorWorkspace(cwd)) {
+      return Response.json({ error: "The Director workspace is managed by its supervisor.", code: "director_managed" }, { status: 409 });
     }
 
     const allowedRoots = await getAllowedFileRoots();

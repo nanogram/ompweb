@@ -17,6 +17,9 @@ import {
   type AgentToolDeliverResult,
   type AgentToolSessionOps,
 } from "./agent-tools";
+import { getDirectorHostTools, isDirectorHostTool, directorCommandError } from "./director-policy";
+import { isDirectorControlTool } from "./director-control";
+import { isDirectorSession, isDirectorWorkspace } from "./director-state";
 import { markShuttingDown, recordRunningSessions, resumeOnHostLink, takeInterruptedSessions, type InterruptibleSession } from "./session-resume";
 import { RESUME_PROMPT } from "./hosts/host-resume";
 import { samePath } from "./paths";
@@ -58,6 +61,20 @@ export interface AgentEvent {
 
 type EventListener = (event: AgentEvent) => void;
 type UnsequencedAgentEvent = { type: string; [key: string]: unknown };
+
+/** Server-only original-command correlation; never an acknowledgement of the browser/host transport. */
+export type NativeMessageCommandEvent =
+  | { type: "dispatch"; command: object; id: string; nativeType: string }
+  | { type: "reply"; id: string; nativeType?: string; success: boolean; data?: unknown; error?: string };
+
+function notifyNativeMessageCommand(wrapper: AgentSessionWrapper, event: NativeMessageCommandEvent): void {
+  for (const tap of globalThis.__ompNativeMessageTaps ?? []) {
+    if (event.type === "dispatch") tap(wrapper, event); // A failed correlation commit must prevent the native write.
+    else {
+      try { tap(wrapper, event); } catch { /* Receipt observers cannot negate omp's actual response. */ }
+    }
+  }
+}
 
 interface CompactionResultLike {
   summary?: string;
@@ -1023,7 +1040,7 @@ export class AgentSessionWrapper {
       }
       // Frames omp sent during the handshake are live: its agent tool calls there run normally.
       this.proc.release();
-      if (this.hostOwnedLifecycle && loadWebServerSettings().agentToolsEnabled) {
+      if (this.hostOwnedLifecycle && (loadWebServerSettings().agentToolsEnabled || (this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd)))) {
         await this.dispatchCommand({ type: "set_host_tools", tools: this.registeredHostTools ?? [] });
       }
     } finally {
@@ -1120,6 +1137,8 @@ export class AgentSessionWrapper {
    * of the chat.
    */
   async generateTitle({ quiet = false }: { quiet?: boolean } = {}): Promise<string | null> {
+    const directorError = directorCommandError(this.sessionId, this.cwd, { type: "generate_title" }, this.host.id);
+    if (directorError) throw new WebRpcError(directorError, "director_read_only");
     if (this.restarting) throw new WebRpcError(RESTARTING_MESSAGE, "session_restarting");
     if (!this.isAlive()) throw new Error("Session is no longer running");
 
@@ -1173,6 +1192,7 @@ export class AgentSessionWrapper {
    * to name an untitled session, as omp's terminal UI does.
    */
   private autoTitle(): void {
+    if (this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd)) return;
     const sessionId = this._sessionId;
     if (!sessionId || this._sessionName || this.autoTitleInFlight) return;
     // Every server sharing the child sees the same turn end: only the elected notifier titles it.
@@ -1310,7 +1330,8 @@ export class AgentSessionWrapper {
       if (this.deliveredCallbacks.has(key)) return;
       this.deliveredCallbacks.add(key);
       // Only the read-only listing runs again (handled below); anything else may already have run.
-      if (this.replaying && !(event.type === "host_tool_call" && event.toolName === "list_sessions")) {
+      if (this.replaying && !(event.type === "host_tool_call" && (event.toolName === "list_sessions"
+        || ((event.toolName === "director_snapshot" || event.toolName === "director_sessions") && this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd))))) {
         this.proc.sendFrame(event.type === "host_tool_call"
           ? { type: "host_tool_result", id: event.id, isError: true, result: { content: [{ type: "text", text: AGENT_TOOL_UNKNOWN_OUTCOME }] } }
           : { type: "host_uri_result", id: event.id, isError: true, error: AGENT_TOOL_UNKNOWN_OUTCOME });
@@ -1433,6 +1454,12 @@ export class AgentSessionWrapper {
         notifyRunningChange();
         return;
       case "response": {
+        if (typeof event.id === "string" && typeof event.success === "boolean") {
+          notifyNativeMessageCommand(this, {
+            type: "reply", id: event.id, nativeType: typeof event.command === "string" ? event.command : undefined,
+            success: event.success, data: event.data, error: typeof event.error === "string" ? event.error : undefined,
+          });
+        }
         // Unsolicited failed responses surface async prompt failures (omp
         // reuses the original command id after the immediate ack). Some omp
         // versions omit `command` on that second response, so the active run
@@ -1479,6 +1506,12 @@ export class AgentSessionWrapper {
       case "host_tool_call": {
         const id = typeof event.id === "string" ? event.id : "";
         const toolName = typeof event.toolName === "string" ? event.toolName : "";
+        const director = this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd);
+        if (id && (isDirectorHostTool(toolName) || director)) {
+          if (director && isDirectorHostTool(toolName)) void this.answerServerAgentTool(event);
+          else this.rejectUnexpectedHostTool(event);
+          return;
+        }
         // Server-side agent tools (#275) are answered here, before any
         // browser routing, so they work with no tab open. A disabled gate
         // is an explicit error, not a silent hang and not a browser call.
@@ -2267,14 +2300,21 @@ export class AgentSessionWrapper {
     };
     try {
       const args = event.arguments && typeof event.arguments === "object" ? event.arguments as Record<string, unknown> : {};
-      const result = await executeAgentTool(toolName, args, createAgentToolOps(), {
-        sourceSessionId: this.sessionId,
-        sourceCwd: this.cwd,
-        sourceHostId: this.host.id,
-        enabled: loadWebServerSettings().agentToolsEnabled,
-        guard: getAgentToolGuard(),
-        confirm: (title) => this.confirmFromServer(title),
-      });
+      let result: unknown;
+      if (toolName === "director_snapshot") {
+        result = await (await import("./director")).getDirectorSnapshot();
+      } else if (isDirectorControlTool(toolName)) {
+        result = await (await import("./director-runtime")).executeDirectorRuntimeTool(this.sessionId, toolName, args);
+      } else {
+        result = await executeAgentTool(toolName, args, createAgentToolOps(), {
+          sourceSessionId: this.sessionId,
+          sourceCwd: this.cwd,
+          sourceHostId: this.host.id,
+          enabled: loadWebServerSettings().agentToolsEnabled,
+          guard: getAgentToolGuard(),
+          confirm: (title) => this.confirmFromServer(title),
+        });
+      }
       sendResult(typeof result === "string" ? result : JSON.stringify(result));
     } catch (error) {
       sendResult(error instanceof Error ? error.message : String(error), true);
@@ -2308,6 +2348,8 @@ export class AgentSessionWrapper {
   }
 
   private async runMcpCommand(action: "list" | "enable" | "disable" | "reload", name?: string, apply = false): Promise<string> {
+    const directorError = directorCommandError(this.sessionId, this.cwd, { type: "mcp" }, this.host.id);
+    if (directorError) throw new WebRpcError(directorError, "director_read_only");
     if (this.restarting) throw new WebRpcError(RESTARTING_MESSAGE, "session_restarting");
     if (!this.isAlive()) throw new Error("Session is no longer running");
     if (this.isRunning() || this.historyEditInFlight || this.pendingUiRequests.size > 0 || this.pendingHostTools.size > 0 || this.pendingHostUris.size > 0) throw new WebRpcError("Wait for the current operation to finish", "session_busy");
@@ -2608,6 +2650,14 @@ export class AgentSessionWrapper {
     }
   }
 
+  /** Refresh only the idle dedicated Director's role, retaining its native transcript. */
+  async reloadDirectorPolicy(): Promise<void> {
+    if (this.host.id !== LOCAL_HOST_ID || !isDirectorSession(this.sessionId, this.cwd)) {
+      throw new WebRpcError("Only the dedicated Director can reload its private policy", "director_read_only");
+    }
+    await this.withPendingCommand(() => this.restart(true));
+  }
+
   /** Full restart of the child process against the same session file. This is
    * omp-web's `reload`: extensions, skills, prompts, and tools are rediscovered
    * on boot, matching a fresh CLI launch. */
@@ -2732,8 +2782,10 @@ export class AgentSessionWrapper {
         if (requireIdle || this.hostOwnedLifecycle) {
           if (this.registeredHostTools !== null) {
             await this.dispatchCommand({ type: "set_host_tools", tools: this.registeredHostTools });
+          } else if (this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd)) {
+            await this.dispatchCommand({ type: "set_host_tools", tools: [] });
           } else if (loadWebServerSettings().agentToolsEnabled) {
-            // Like initial startup, a runtime that never accepted host tools may reject this optional registration.
+            // Optional for ordinary sessions on older runtimes, required for Director.
             await this.dispatchCommand({ type: "set_host_tools", tools: [] }).catch(() => {});
           }
           if (this.registeredHostUriSchemes !== null) {
@@ -2838,13 +2890,20 @@ export class AgentSessionWrapper {
       this.mcpOrphanGeneration = null;
       this.messageCommandGeneration += 1;
       this.pendingMessageCommands += 1;
-      if (origin) nativeWrites().add(origin);
     }
     const generation = this.messageCommandGeneration;
     try {
       const replacement = proof ?? this.messageReplacement;
-      const result = await this.proc.sendCommand<T>(command, timeoutMs, message && replacement
-        ? (_ok, id) => replacement.replied(proof ? command : origin ?? command, id)
+      const result = await this.proc.sendCommand<T>(command, timeoutMs, message
+        ? (success, id, data) => {
+          notifyNativeMessageCommand(this, { type: "reply", id, nativeType: command.type, success, data });
+          replacement?.replied(proof ? command : origin ?? command, id);
+        }
+        : undefined, message
+        ? (id) => {
+          notifyNativeMessageCommand(this, { type: "dispatch", command: origin ?? command, id, nativeType: command.type });
+          if (origin) nativeWrites().add(origin);
+        }
         : undefined);
       if (message && isRecord(result) && result.agentInvoked === false) {
         this.confirmMessageCommandGeneration(generation);
@@ -2866,6 +2925,8 @@ export class AgentSessionWrapper {
 
 
   async send(command: Record<string, unknown>): Promise<unknown> {
+    const directorError = directorCommandError(this.sessionId, this.cwd, command, this.host.id);
+    if (directorError) throw new WebRpcError(directorError, "director_read_only");
     // Display-only state never needs a reachable child, even during MCP work/restart.
     if (command.type === "dismiss_queue_progress") {
       this.publishQueueProgress(this.queueProgress.dismissFinished());
@@ -3255,7 +3316,8 @@ export class AgentSessionWrapper {
         // a no-tab session keeps them after its startup registration.
         // With the gate off the registration is exactly what the caller
         // asked for, so existing behavior and tests are unchanged.
-        const merged = loadWebServerSettings().agentToolsEnabled
+        const director = this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd);
+        const merged = director ? getDirectorHostTools() : loadWebServerSettings().agentToolsEnabled
           ? [...valid, ...AGENT_TOOL_DEFINITIONS.filter((t) => !valid.some((v) => v.name === t.name))]
           : valid;
         if (this.hostOwnedLifecycle) {
@@ -3267,7 +3329,7 @@ export class AgentSessionWrapper {
             this.hostToolNames = previousNames;
             throw error;
           }
-          this.registeredHostTools = valid.filter((tool) => !AGENT_TOOL_NAMES.has(tool.name as string));
+          this.registeredHostTools = director ? [] : valid.filter((tool) => !AGENT_TOOL_NAMES.has(tool.name as string));
           this.hostToolsUnknown = false;
           return null;
         }
@@ -3275,7 +3337,7 @@ export class AgentSessionWrapper {
         await this.proc.sendCommand({ type: "set_host_tools", tools: merged }, undefined, (success) => {
           if (!success) return;
           this.hostToolNames = new Set(merged.map((t) => t.name as string));
-          this.registeredHostTools = valid.filter((tool) => !AGENT_TOOL_NAMES.has(tool.name as string));
+          this.registeredHostTools = director ? [] : valid.filter((tool) => !AGENT_TOOL_NAMES.has(tool.name as string));
           // omp now knows exactly these: an adopted child's lost registration is replaced.
           this.hostToolsUnknown = false;
         });
@@ -3292,13 +3354,14 @@ export class AgentSessionWrapper {
       }
 
       case "set_host_uri_schemes": {
-        const schemes = Array.isArray(command.schemes) ? command.schemes as Array<{ scheme?: unknown; writable?: unknown; [key: string]: unknown }> : [];
+        const director = this.host.id === LOCAL_HOST_ID && isDirectorSession(this.sessionId, this.cwd);
+        const schemes = director ? [] : Array.isArray(command.schemes) ? command.schemes as Array<{ scheme?: unknown; writable?: unknown; [key: string]: unknown }> : [];
         if (this.hostOwnedLifecycle) {
           const previous = this.hostUriSchemes;
           this.hostUriSchemes = new Map(schemes.filter((entry) => typeof entry.scheme === "string" && entry.scheme).map((entry) => [entry.scheme as string, { writable: entry.writable === true }]));
           try {
             const tools = this.registeredHostTools ?? [];
-            const merged = loadWebServerSettings().agentToolsEnabled
+            const merged = director ? getDirectorHostTools() : loadWebServerSettings().agentToolsEnabled
               ? [...tools, ...AGENT_TOOL_DEFINITIONS.filter((tool) => !tools.some((entry) => entry.name === tool.name))]
               : tools;
             await this.proc.transport.setHostTools!(merged, [...this.hostUriSchemes].map(([scheme, { writable }]) => ({ scheme, writable: writable === true })));
@@ -3493,6 +3556,7 @@ declare global {
   var __ompFrameTaps: Set<(wrapper: AgentSessionWrapper, event: AgentEvent) => void> | undefined;
   var __ompSessionMoveListeners: Set<(from: string, to: string) => void> | undefined;
   var __ompNativeWrites: WeakSet<object> | undefined;
+  var __ompNativeMessageTaps: Set<(wrapper: AgentSessionWrapper, event: NativeMessageCommandEvent) => void> | undefined;
 }
 
 function nativeWrites(): WeakSet<object> {
@@ -3502,6 +3566,13 @@ function nativeWrites(): WeakSet<object> {
 /** True once some wrapper began writing this submitted command to omp's stdin; never before. */
 export function nativeWriteStarted(command: object): boolean {
   return nativeWrites().has(command);
+}
+
+/** A dispatch observer must commit correlation synchronously: throwing prevents the native write. */
+export function tapNativeMessageCommands(tap: (wrapper: AgentSessionWrapper, event: NativeMessageCommandEvent) => void): () => void {
+  const taps = (globalThis.__ompNativeMessageTaps ??= new Set());
+  taps.add(tap);
+  return () => { taps.delete(tap); };
 }
 
 function getExitedMap(): Map<string, ExitedRpcSession> {
@@ -3780,6 +3851,7 @@ function createAgentToolOps(): AgentToolSessionOps {
     },
 
     async createSession(input) {
+      if (input.hostId === LOCAL_HOST_ID && isDirectorWorkspace(input.cwd)) throw new Error("Use the dedicated Director entry instead of creating another Director chat.");
       const host = getHost(input.hostId);
       if (!host) throw new Error(`Unknown host: ${input.hostId}`);
       const preparing = !!(input.prompt || input.name || (input.provider && input.modelId));
@@ -3803,6 +3875,7 @@ function createAgentToolOps(): AgentToolSessionOps {
     },
 
     async deliver(input): Promise<AgentToolDeliverResult> {
+      if (isDirectorSession(input.sessionId, getRpcSession(input.sessionId)?.cwd)) throw new Error("The Director receives user chat and supervisor reviews, not worker messages.");
       const live = getRpcSession(input.sessionId);
       let wrapper = live?.isAlive() ? live : undefined;
       let cold = false;
@@ -3826,7 +3899,9 @@ function createAgentToolOps(): AgentToolSessionOps {
         }
         const terminalEndsNeeded = input.delivery === "followUp" && wasRunning ? 2 : 1;
         const waiter = input.wait ? target.waitForTurnEnd(input.waitTimeoutMs, terminalEndsNeeded) : null;
-        await target.send({ type: input.delivery, message: input.message });
+        await target.send(input.delivery === "followUp"
+          ? { type: "prompt", message: input.message, streamingBehavior: "followUp" }
+          : { type: input.delivery, message: input.message });
         return { waiter }; // Boxed: the lease ends at delivery, not at the turn's end.
       };
       const { waiter } = cold ? await wrapper.withPendingCommand(send, true) : await send();
@@ -3901,6 +3976,7 @@ export async function startRpcSession(
   host: Host = getHost(LOCAL_HOST_ID),
   preparingCommand = false,
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  if (host.id === LOCAL_HOST_ID && isDirectorSession(sessionId, cwd)) advisor = false;
   const registry = getRegistry();
   const locks = getLocks();
   const launch: SpawnRequest = { cwd, recordedCwd: recordedCwd ?? null, sessionFile, toolNames, advisor: advisor === true, spawnModel };
@@ -4001,14 +4077,14 @@ export async function startRpcSession(
       if (!sessionFile && created.sessionFile && await host.sessionFileExists(created.sessionFile)) {
         await created.send({ type: "new_session" });
       }
-      // Register server agent tools (#275) at startup when the gate is on,
-      // so a session works for agent-to-agent calls even when no browser
-      // tab ever registers host tools for it. send() merges these with any
-      // later UI registration, so this never drops the UI tools. Older omp
-      // builds without host tools simply reject the registration; ignore
-      // that the way the UI registration does.
-      if (!created.hostOwnedLifecycle && loadWebServerSettings().agentToolsEnabled) {
-        await created.send({ type: "set_host_tools", tools: AGENT_TOOL_DEFINITIONS }).catch(() => {});
+      if (!created.hostOwnedLifecycle) {
+        if (host.id === LOCAL_HOST_ID && isDirectorSession(created.sessionId, created.cwd)) {
+          // Director must retain its server-owned observation tool without a browser.
+          await created.send({ type: "set_host_tools", tools: getDirectorHostTools() });
+        } else if (loadWebServerSettings().agentToolsEnabled) {
+          // Older runtimes may reject optional agent tools for ordinary sessions.
+          await created.send({ type: "set_host_tools", tools: AGENT_TOOL_DEFINITIONS }).catch(() => {});
+        }
       }
     } catch (error) {
       // Await the child's full exit before the `finally` releases the startup

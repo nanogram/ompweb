@@ -30,6 +30,11 @@ export function selectableThinkingLevels(available: readonly string[] | null | u
   return [...ordered, ...remaining];
 }
 
+/** Aliases belong to explicit effort keys; provider levels may use names like "constructor". */
+export function displayThinkingLevel(level: string, aliases: Record<string, string | null> | null | undefined): string {
+  return level !== "auto" && aliases && Object.hasOwn(aliases, level) ? aliases[level] ?? level : level;
+}
+
 /** "off" is always a valid selector; concrete efforts come from the model. */
 export function thinkingLevelsForMeta(meta: ThinkingModelMeta): string[] {
   if (!meta.reasoning) return ["off"];

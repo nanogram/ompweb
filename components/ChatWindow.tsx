@@ -1,15 +1,16 @@
 "use client";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
-import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
-import { ArrowDown, ChevronDown, ChevronUp, CircleHelp, Layers, Paperclip, Square } from "lucide-react";
+import { Fragment, memo, useCallback, useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ArrowDown, ChevronDown, ChevronUp, Layers, Paperclip, Square } from "lucide-react";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { translate, useI18n } from "@/lib/i18n";
 import { collectToolResults, isGroupAnchor, planTranscriptRows, transcriptRowIndex, type ActivityPiece, type TranscriptPresentation, type TranscriptRow } from "@/lib/chat-transcript-plan";
+import { useAutoComposer } from "@/hooks/useAutoComposer";
 import { isReplyBlock } from "@/lib/message-display";
-import { resolveForkTargets } from "@/lib/chat-fork";
 import { HeldMessageView, MessageView } from "./MessageView";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
+import { HistoryMessage } from "./display/HistoryMessage";
 import { ExtensionDialog } from "./ExtensionDialog";
 import { SubagentTranscriptDialog } from "./SubagentTranscriptDialog";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
@@ -18,6 +19,7 @@ import { AssistantOutputStep } from "./TranscriptOutput";
 import { useChatMinimapPreference } from "@/hooks/useChatMinimapPreference";
 import { useTranscriptPreference } from "@/hooks/useTranscriptPreference";
 import { ComposerPanels } from "./ComposerPanels";
+import { composerPanelVisibility } from "@/lib/display/composer-activity";
 import { SkillDiagnosticsNotice } from "./SkillDiagnostics";
 import { BtwHistoryDialog, type BtwPanelProps } from "./BtwPanel";
 import OmpWebLogo from "./OmpWebLogo";
@@ -88,8 +90,6 @@ interface Props {
   /** Handles the open_url host tool; returns the result text for the agent. */
   onOpenUrl?: (url: string) => string;
   onGenerationSpeedChange?: (speed: GenerationSpeedInfo | null) => void;
-  /** Open Settings → API Keys & Providers (from the model picker). */
-  onOpenProviders?: () => void;
   /** The sidebar search query: its hits are highlighted ("" for none). */
   searchQuery?: string;
   /** A hit picked in the sidebar for this session: scrolled to and marked current. */
@@ -303,7 +303,6 @@ interface CommittedTranscriptProps {
   isNew: boolean;
   forkingEntryId: string | null;
   editingEntryId: string | null;
-  handleFork: (entryId: string, editPrompt: boolean) => void;
   handleEdit: (entryId: string, content: string) => Promise<boolean>;
   modelNames: Record<string, string>;
   messageCwd: string | undefined;
@@ -326,6 +325,8 @@ interface CommittedTranscriptProps {
   loadingOlder: boolean;
   olderHistoryError: boolean;
   handleLoadOlder: () => void;
+  /** Defer only initial historical Markdown, never the authoritative send gate. */
+  richHistoryReady?: boolean;
 }
 
 /**
@@ -336,14 +337,12 @@ interface CommittedTranscriptProps {
  */
 export const CommittedTranscript = memo(function CommittedTranscript({
   messages, rows, presentation, expandProcessDetails, revealFolded, selectedMessageIndex, entryIds, conversationMeta, messageRefs, isStreaming, sessionBusy, isCompacting, externalRunActive, isNew, forkingEntryId, editingEntryId,
-  handleFork, handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
+  handleEdit, modelNames, messageCwd, onOpenFile, sessionId,
   toolCallsDefaultCollapsed, hideToolActivity, expandThinkingByDefault, hideThinkingBlock, visibleCount, nearBottom, sentinelRef, handleLoadMoreClick,
-  hasOlder, loadingOlder, olderHistoryError, handleLoadOlder,
+  hasOlder, loadingOlder, olderHistoryError, handleLoadOlder, richHistoryReady = true,
 }: CommittedTranscriptProps) {
   const { t } = useI18n();
   const { toolResultsMap, lastAnchorIdx, visibleRefIndexByMessage } = conversationMeta;
-  // omp's `branch` command accepts a user entry only; see lib/chat-fork.ts.
-  const forkTargets = useMemo(() => resolveForkTargets(messages, entryIds), [messages, entryIds]);
 
   const attachVisibleRef = (idx: number, refIndex: number) => (el: HTMLDivElement | null) => {
     messageRefs.current[refIndex] = el;
@@ -369,11 +368,6 @@ export const CommittedTranscript = memo(function CommittedTranscript({
       }
     }
     if (options.showTimestamp !== undefined) showTimestamp = options.showTimestamp;
-    const forkTarget = forkTargets[idx];
-    // Assistant rows fork from reply text or a visible error, not from each thinking/tool step:
-    // every row of a turn forks at the same prompt, so the extra buttons were only clutter.
-    const forkableRow = msg.role !== "assistant" || !!msg.errorMessage?.trim() || (Array.isArray(msg.content) && msg.content.some(isReplyBlock));
-    const canOfferFork = !sessionBusy && !isNew && !!forkTarget && forkableRow;
     const canOfferEdit = !sessionBusy && !isCompacting && !isNew && msg.role === "user" && !msg.branchSummary && !!entryIds[idx];
     const historyMutationPending = forkingEntryId !== null || editingEntryId !== null;
     const view = (
@@ -385,11 +379,6 @@ export const CommittedTranscript = memo(function CommittedTranscript({
         cwd={messageCwd}
         onOpenFile={onOpenFile}
         entryId={entryIds[idx]}
-        forkEntryId={forkTarget?.entryId}
-        forkEditsPrompt={forkTarget?.editPrompt}
-        onFork={canOfferFork ? handleFork : undefined}
-        forking={forkingEntryId === forkTarget?.entryId}
-        forkDisabled={historyMutationPending}
         onEdit={canOfferEdit ? handleEdit : undefined}
         editing={editingEntryId === entryIds[idx]}
         editDisabled={historyMutationPending}
@@ -402,11 +391,12 @@ export const CommittedTranscript = memo(function CommittedTranscript({
         sourceBlockIndices={options.sourceBlockIndices}
       />
     );
-    if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx}>{view}</div>;
     return (
-      <div key={`${keyPrefix}-${messageKey}`} data-message-index={idx} ref={attachVisibleRef(idx, currentRefIdx)}>
+      <HistoryMessage key={`${keyPrefix}-${messageKey}`} messageIndex={idx}
+        messageRef={isVisible && options.attachRef !== false && currentRefIdx !== undefined ? attachVisibleRef(idx, currentRefIdx) : undefined}
+        ready={richHistoryReady} immediate={revealFolded || idx === selectedMessageIndex || idx >= Math.max(0, lastAnchorIdx) || (msg.role === "assistant" && !!msg.errorMessage)}>
         {view}
-      </div>
+      </HistoryMessage>
     );
   };
 
@@ -519,7 +509,7 @@ export const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, onOpenProviders, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
+export const ChatWindow = memo(function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatus: channelHostStatus, hostLabel, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, neverFoldActivity = false, showToolCallsUnfolded = false, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile: onOpenWorkspaceFile, onOpenUrl, searchQuery = "", searchTarget = null, onSearchTargetHandled }: Props) {
   const { t, tn } = useI18n();
   const { desktopMode, mobileFab } = useChatMinimapPreference();
   const { presentation, expandProcessDetails } = useTranscriptPreference();
@@ -586,7 +576,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     subagents, subagentEvents, subagentTranscriptVersions, activeSubagentCount, currentTodoPhase, todoPhases,
     isNew, hostStatus: frameHostStatus,
     sessionIdRef, messagesEndRef, scrollContainerRef, holdScrollPosition,
-    handleSend, handleAbort, handleFork, handleEdit, handleModelChange, retrySession,
+    handleSend, handleAbort, handleEdit, handleModelChange, retrySession,
     handleSteer, handleFollowUp, handleAbortCompaction, handleCompact,
     heldMessages, deleteHeldMessage,
     removeQueuedMessage, promoteQueuedToSteer,
@@ -594,12 +584,15 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     handleThinkingLevelChange, handleFastModeChange, handleSlowModeChange, handleCycleModel, handleCycleThinkingLevel, handleAbortRetry, loadSlashCommands,
     handleToolPresetChange,
     btw, askBtw,
-    goalState, handleGoalAction, queueProgress, handleDismissQueueProgress,
+    goalState, handleGoalAction, queueProgress,
   } = useAgentSession({
     session, newSessionCwd, newSessionHostId, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
     modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange,
     onOpenFile: onOpenWorkspaceFile, onOpenUrl,
   });
+  // Commit the real, validated composer with cheap source text first. Only the
+  // initial rich display is deferred; live messages and send authorization are not.
+  const richHistoryReady = useDeferredValue(!loading, false);
   useEffect(() => {
     if (!autoplayPendingRef.current) return;
     // A held reply is about to become its saved row: speak that one, so the
@@ -612,6 +605,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   const sessionBusy = agentRunning || bashRunning;
   // Dialog requests block for an answer; they do not pause native run ownership.
   const waitingForInput = extensionDialog !== null;
+  const composerActive = sessionBusy || isCompacting || streamState.isStreaming;
   const modelCapacity = useMemo(() => {
     if (!displayModelValue) return null;
     const model = modelList.find((entry) => entry.provider === displayModelValue.provider && entry.id === displayModelValue.modelId);
@@ -747,8 +741,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
   const openAgentLink = useCallback((candidateIds: string[]) => {
     setSelectedSubagent(agentLinkTarget(candidateIds, subagentsRef.current));
   }, []);
-  const [composerMinimized, setComposerMinimized] = useState(false);
-  const minimizedExpandRef = useRef<HTMLButtonElement | null>(null);
+  const { minimized: composerMinimized, expand: expandComposer } = useAutoComposer(sessionKeyForPaging, composerActive, waitingForInput);
   // True while the viewport is at/near the conversation bottom. Drives the
   // anchored render window in CommittedTranscript.
   const [nearBottom, setNearBottom] = useState(true);
@@ -829,29 +822,46 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     const el = scrollContainerRef.current;
     if (!el) return;
     let raf: number | null = null;
+    let resized = false;
+    let richChanged = false;
+    let height = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
     const update = () => {
       raf = null;
-      const next = el.scrollTop + el.clientHeight >= el.scrollHeight - 96;
+      const top = el.scrollTop;
+      const nextHeight = el.clientHeight;
+      const nextScrollHeight = el.scrollHeight;
+      // Follow delayed rich display and viewport sizing, not a tool the reader
+      // explicitly expanded. Native scroll anchoring preserves other views.
+      const follow = resized && (nextHeight !== height || richChanged) && top + height >= scrollHeight - 96;
+      resized = false;
+      richChanged = false;
+      height = nextHeight;
+      scrollHeight = nextScrollHeight;
+      if (follow) el.scrollTop = nextScrollHeight;
+      const next = follow || top + nextHeight >= nextScrollHeight - 96;
       setNearBottom((prev) => (prev === next ? prev : next));
     };
     const onScroll = () => {
+      // A manual scroll wins over a queued content-resize follow.
+      resized = false;
+      richChanged = false;
       if (raf === null) raf = requestAnimationFrame(update);
     };
-    // A scroller that shrinks (the phone keyboard opening, the composer or an
-    // ask panel growing) keeps its top edge, so the newest messages slide
-    // under the composer. Keep a reader whose old view reached the bottom there.
-    let height = el.clientHeight;
     const resize = new ResizeObserver(() => {
-      const wasAtBottom = el.scrollTop + height >= el.scrollHeight - 96;
-      height = el.clientHeight;
-      if (wasAtBottom) el.scrollTop = el.scrollHeight;
+      resized = true;
+      if (raf === null) raf = requestAnimationFrame(update);
     });
+    const enhancements = new MutationObserver(() => { richChanged = true; });
+    enhancements.observe(el, { subtree: true, attributes: true, attributeFilter: ["data-history-rendering"] });
     update();
     el.addEventListener("scroll", onScroll, { passive: true });
     resize.observe(el);
+    if (el.firstElementChild) resize.observe(el.firstElementChild);
     return () => {
       el.removeEventListener("scroll", onScroll);
       resize.disconnect();
+      enhancements.disconnect();
       if (raf !== null) cancelAnimationFrame(raf);
     };
   }, [loading, isEmptyNew, scrollContainerRef]);
@@ -1137,11 +1147,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     return agentPhase.tools.filter((tool) => !renderedIds.has(tool.id));
   }, [agentPhase, committedToolCallIds, streamState.streamingMessage]);
 
-  // Reset minimized state on session switch (session-scoped)
-  useEffect(() => { setComposerMinimized(false); }, [sessionKeyForPaging]);
-  // The extension dialog renders inside the collapsible composer wrapper;
-  // never let a pending approval prompt sit hidden behind the minimized pill.
-  useEffect(() => { if (extensionDialog) setComposerMinimized(false); }, [extensionDialog]);
   const messageCwd = session?.cwd ?? newSessionCwd ?? undefined;
   const activeBtwRecord = btw.records.find((record) => record.id === btw.activeId);
   const btwPanel: BtwPanelProps | null = activeBtwRecord ? {
@@ -1226,16 +1231,11 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     sendAgentCommand(sid, { type: "predict_word_feedback", text, cursor, suggestion, accepted }).catch(() => {});
   }, [session?.id, sessionIdRef]);
 
-  const handleMinimize = useCallback(() => {
-    setComposerMinimized(true);
-    /* Focus the pill's expand button after React commits the visibility change */
-    requestAnimationFrame(() => minimizedExpandRef.current?.focus());
-  }, []);
   const handleExpand = useCallback(() => {
-    setComposerMinimized(false);
+    expandComposer();
     /* Focus the textarea after React commits the visibility change */
     requestAnimationFrame(() => composerRef.current?.focus());
-  }, [composerRef]);
+  }, [expandComposer, composerRef]);
   const composerStatusText = useMemo(() => {
     if (waitingForInput) return t("chatWindow.waitingForInput");
     if (bashRunning && !pendingBash) {
@@ -1268,15 +1268,15 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     if (askOpen && active instanceof HTMLElement && hiddenComposerRef.current?.contains(active)) active.blur();
   }, [askOpen]);
   // The live status is merged into a ComposerPanels header row (#245)
-  // whenever one exists (todo or subagent row); only then is the
+  // whenever an active todo or subagent row is visible; only then is the
   // standalone ChatInput status bar suppressed. With no host row, or in
   // the minimized pill bar (which keeps composerStatusText below), the
   // bar stays so the status is never hidden.
-  const hasStatusHostRow = todoPhases.length > 0 || subagents.length > 0;
+  const visibleComposerPanels = composerPanelVisibility(todoPhases, subagents);
+  const hasStatusHostRow = visibleComposerPanels.tasks || visibleComposerPanels.subagents;
   const chatInputElement = (
     <ChatInput
       queueProgress={queueProgress}
-      onDismissQueueProgress={handleDismissQueueProgress}
       draftIdentityMove={composerIdentityMove}
       ref={composerRef}
       sessionInfoContainer={sessionInfoContainer}
@@ -1341,13 +1341,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       draftKey={draftKey}
       uploadHostId={session ? session.hostId : newSessionHostId}
       cwd={session?.cwd ?? newSessionCwd}
-      /* The pill bar and chevron only render in the non-empty layout; don't
-         accept Escape-to-minimize in the fresh-chat branch where there is
-         nothing to collapse. */
-      onMinimize={isEmptyNew ? undefined : handleMinimize}
       statusText={hasStatusHostRow ? null : composerStatusText}
       waitingForInput={waitingForInput}
-      onOpenProviders={onOpenProviders}
     />
   );
 
@@ -1383,6 +1378,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     <WorkspaceFileContext.Provider value={fileSource}>
     <div
       className="relative flex h-full flex-col overflow-hidden"
+      data-chat-window
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -1586,7 +1582,6 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               isNew={isNew || historyCached}
               forkingEntryId={forkingEntryId}
               editingEntryId={editingEntryId}
-              handleFork={handleFork}
               handleEdit={handleEdit}
               modelNames={modelNames}
               messageCwd={messageCwd}
@@ -1604,6 +1599,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               loadingOlder={loadingOlder}
               olderHistoryError={olderHistoryError}
               handleLoadOlder={handleLoadOlder}
+              richHistoryReady={richHistoryReady}
             />
             {/* Also while held: a finished reply stays until its saved row
                 replaces it in the same render (useAgentSession-stream). */}
@@ -1703,47 +1699,18 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
       {composerMinimized && (
         <MinimizedComposerBar
           draftKey={draftKey}
-          isStreaming={sessionBusy}
+          isStreaming={composerActive}
           isCompacting={isCompacting}
           statusText={composerStatusText}
-          waitingForInput={waitingForInput}
-          expandRef={minimizedExpandRef}
           onExpand={handleExpand}
           onAbort={handleAbort}
           onAbortCompaction={handleAbortCompaction}
         />
       )}
 
-      {/* Full composer - always mounted; hidden when minimized to preserve ref + state.
-          A flex column that may shrink: when the panels + widgets + input are
-          taller than the viewport (soft keyboard up, Tasks expanded), the
-          panels block below scrolls and the input stays reachable instead of
-          being clipped off the bottom. */}
-      <div className="relative" style={{ display: composerMinimized ? "none" : "flex", flexDirection: "column", minHeight: 0 }}>
-        {/* Minimize chevron above the composer area */}
-        <div style={{ padding: `0 ${CHAT_COLUMN_PADDING}px`, flexShrink: 0 }}>
-          <div style={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, margin: "0 auto", display: "flex", justifyContent: "center" }}>
-            <button
-              type="button"
-              onClick={handleMinimize}
-              title={t("chatWindow.minimizeComposer")}
-              aria-label={t("chatWindow.minimizeComposer")}
-              style={{
-                display: "flex", alignItems: "center", justifyContent: "center",
-                width: 44, height: 24,
-                background: "none", border: "none",
-                color: "var(--text-dim)",
-                cursor: "pointer", padding: 0,
-                borderRadius: 4,
-                transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-            >
-              <ChevronDown size={14} strokeWidth={1.8} />
-            </button>
-          </div>
-        </div>
+      {/* Keep activity overlays outside the widgets' clipping scrollers. The
+          bars and input stay fixed while expanded work covers the chat above. */}
+      <div className="relative" data-composer-area style={{ display: composerMinimized ? "none" : "flex", flexDirection: "column", minHeight: 0 }}>
         <div
           style={{
             padding: `0 ${CHAT_COLUMN_PADDING}px`,
@@ -1763,6 +1730,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               </div>
             )}
             <SkillDiagnosticsNotice snapshot={skillDiagnostics} onDisable={() => setSkillStartupDiagnostics(false)} />
+          </div>
+        </div>
+        <div style={{ padding: `0 ${CHAT_COLUMN_PADDING}px`, flexShrink: 0, position: "relative", zIndex: 2 }}>
+          <div style={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
             <ComposerPanels
               todoPhases={todoPhases}
               subagents={subagents}
@@ -1771,6 +1742,10 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
               liveStatus={composerStatusText}
               waitingForInput={waitingForInput}
             />
+          </div>
+        </div>
+        <div style={{ padding: `0 ${CHAT_COLUMN_PADDING}px`, minHeight: 0, overflowY: "auto" }}>
+          <div style={{ maxWidth: CHAT_COLUMN_MAX_WIDTH, margin: "0 auto" }}>
             <ExtensionWidgets widgets={belowEditorWidgets} />
           </div>
         </div>
@@ -1787,7 +1762,7 @@ export function ChatWindow({ session, newSessionCwd, newSessionHostId, hostStatu
     </GithubRepoContext.Provider>
     </SpeechSynthesisProvider>
   );
-}
+});
 
 function ExtensionStatusBar({ statuses }: { statuses: Array<{ key: string; text: string }> }) {
   if (statuses.length === 0) return null;
@@ -2121,13 +2096,11 @@ function ExtensionCustomPanel({
 }
 
 /** Slim pill bar replacing the full composer when minimized. */
-const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, waitingForInput = false, expandRef, onExpand, onAbort, onAbortCompaction }: {
+const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isStreaming, isCompacting, statusText, onExpand, onAbort, onAbortCompaction }: {
   draftKey?: string;
   isStreaming: boolean;
   isCompacting?: boolean;
   statusText?: string | null;
-  waitingForInput?: boolean;
-  expandRef?: Ref<HTMLButtonElement>;
   onExpand: () => void;
   onAbort: () => void;
   onAbortCompaction?: () => void;
@@ -2156,7 +2129,6 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
         >
           {/* Expand button - fills remaining space */}
           <button
-            ref={expandRef}
             type="button"
             onClick={onExpand}
             title={t("chatWindow.expandComposer")}
@@ -2180,7 +2152,7 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
               <Paperclip size={13} strokeWidth={1.8} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
             )}
             {statusText ? (
-              <span title={waitingForInput ? statusText : undefined} style={{
+              <span style={{
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 7,
@@ -2189,12 +2161,8 @@ const MinimizedComposerBar = memo(function MinimizedComposerBar({ draftKey, isSt
                 fontSize: 13,
                 color: "var(--text-muted)",
               }}>
-                {waitingForInput ? (
-                  <CircleHelp size={14} strokeWidth={1.8} style={{ color: "var(--status-warning)", flexShrink: 0 }} aria-hidden="true" />
-                ) : (
-                  <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
-                )}
-                <span className={waitingForInput ? "sr-only" : undefined} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span aria-hidden className="live-status-dot live-pulse inline-block h-2 w-2 shrink-0 rounded-full bg-accent" />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {statusText}
                 </span>
               </span>

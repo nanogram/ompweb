@@ -40,7 +40,7 @@ function release(record) { return { channel: record.channel, version: record.ver
 function sameInstall(a, b) { return a.channel === b.channel && a.packageDir === b.packageDir && a.revision === b.revision && a.version === b.version; }
 
 /** Owns only the web child. Host daemons and their OMP processes are never children of this supervisor. */
-async function createChannelManager({ managerRoot, args, port, hostname, channelsRoot, preparePackage = prepareChannelPackage, readyTimeoutMs = 60_000, onUnexpectedExit }) {
+async function createChannelManager({ managerRoot, args, port, hostname, channelsRoot, forkCommand, preparePackage = prepareChannelPackage, readyTimeoutMs = 60_000, onUnexpectedExit }) {
   managerRoot = fs.realpathSync(managerRoot);
   if (!channelsRoot) {
     const { getAgentDir } = await module.require("jiti").createJiti(__filename).import(path.join(managerRoot, "lib", "omp", "paths.ts"));
@@ -114,7 +114,10 @@ async function createChannelManager({ managerRoot, args, port, hostname, channel
   }
   async function startChild(installation) {
     const env = { ...process.env, OMP_WEB_CHANNEL_CHILD: "1", OMP_WEB_CHANNEL_CONTROL_URL: controlUrl, OMP_WEB_CHANNEL_CONTROL_TOKEN: token, OMP_WEB_CHANNEL_CURRENT: installation.channel, OMP_WEB_CHANNEL_MANAGER_ROOT: managerRoot, OMP_WEB_PACKAGE_DIR: installation.packageDir };
-    const started = spawn(process.execPath, [path.join(installation.packageDir, "bin", "omp-web.js"), ...args], { cwd: installation.packageDir, env, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+    const command = installation.channel === "fork" && forkCommand
+      ? forkCommand
+      : [process.execPath, path.join(installation.packageDir, "bin", "omp-web.js"), ...args];
+    const started = spawn(command[0], command.slice(1), { cwd: installation.packageDir, env, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
     child = started;
     started.stderr.pipe(process.stderr, { end: false });
     started.stdout.pipe(process.stdout, { end: false });

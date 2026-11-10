@@ -13,6 +13,8 @@ const SHARED_FILES = [
   "lib/app-channel.ts",
   "lib/app-channel-update-route.ts",
   "app/api/app-channel/route.ts",
+  "lib/windows-service.ts",
+  "app/api/windows-service/route.ts",
 ];
 const LOCALES = ["en", "ja", "zh-CN", "zh-TW"];
 const SETTINGS_IMPORT = 'import { ToggleSwitch } from "@/components/ui/ToggleSwitch";';
@@ -106,12 +108,6 @@ async function applyMainOverlay({ managerRoot, sourceRoot }, inputs) {
     'export const OMP_WEB_SECRET_ENV_VARS: readonly string[] = [\n  "OMP_WEB_CHANNEL_CONTROL_TOKEN",',
     "child credential boundary"));
 
-  const servicePath = "lib/windows-service.ts";
-  const service = await fs.readFile(path.join(sourceRoot, servicePath), "utf8");
-  writes.set(servicePath, replaceOnce(service,
-    "export function getRepoRoot(): string {",
-    'export function getRepoRoot(): string {\n  if (process.env.OMP_WEB_CHANNEL_MANAGER_ROOT && existsSync(process.env.OMP_WEB_CHANNEL_MANAGER_ROOT)) {\n    return process.env.OMP_WEB_CHANNEL_MANAGER_ROOT;\n  }',
-    "stable service manager root"));
 
   for (const locale of LOCALES) {
     const relative = `lib/i18n/locales/${locale}.json`;

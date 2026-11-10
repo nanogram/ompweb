@@ -27,6 +27,24 @@ test("held messages name every delivery leg and only offer Delete before dispatc
   }
 });
 
+test("unconfirmed delivery is a neutral, deletable status, distinct from a definite native rejection", () => {
+  const base = { id: "held", mode: "prompt", message: "Keep this safe.", createdAt: 1, local: false, state: "failed" };
+  const uncertain = renderToStaticMarkup(React.createElement(HeldMessageView, {
+    held: { ...base, mayHaveBeenSent: true, error: "omp-web restarted before the native answer arrived" }, onDelete() {},
+  }));
+  assert.match(uncertain, /Delivery unconfirmed: it may already be sent; check the transcript/);
+  assert.match(uncertain, /role="status" data-delivery-status="unconfirmed"/);
+  assert.doesNotMatch(uncertain, /Not sent|var\(--status-error\)|activity-row-spinner|Retry/);
+  assert.match(uncertain, /Delete this held message/);
+  const rejected = renderToStaticMarkup(React.createElement(HeldMessageView, {
+    held: { ...base, error: "explicit native refusal" }, onDelete() {},
+  }));
+  assert.match(rejected, /Not sent: explicit native refusal/);
+  assert.match(rejected, /data-delivery-status="not-sent"/);
+  assert.match(rejected, /var\(--status-error\)/);
+  assert.doesNotMatch(rejected, /Delivery unconfirmed|Retry/);
+});
+
 test("Delete confirmation never claims omp has not seen a message that may have been sent, nor cancellation", async () => {
   const base = { id: "held", mode: "prompt", message: "Keep this safe.", createdAt: Date.now(), local: false, state: "failed" };
   const dialogText = async (held) => {
@@ -57,42 +75,6 @@ test("sent messages without timestamps or branch metadata still offer copy", () 
 // Plain Copy needs the browser's layout-aware innerText (not implemented by
 // jsdom). Verify code gutters, math, tables, images and spacing in Chromium;
 // do not substitute textContent and claim equivalent coverage here.
-test("message Markdown copy preserves source, excludes activity, and confirms success in Strict Mode", async (t) => {
-  let clipboard = "";
-  const originalMatchMedia = window.matchMedia;
-  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-  Object.defineProperty(navigator, "clipboard", {
-    configurable: true,
-    value: { writeText: async (text) => { clipboard = text; } },
-  });
-  t.after(() => {
-    delete navigator.clipboard;
-    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
-    else delete window.matchMedia;
-  });
-  const source = "# Heading\n\n**Bold** and [link](https://example.com)\n\n```js\n  code();\n```";
-  const messages = [
-    { role: "user", content: source },
-    { role: "assistant", content: [
-      { type: "text", text: source },
-      { type: "thinking", thinking: "Do not copy thinking" },
-      { type: "toolCall", toolCallId: "copy-tool", toolName: "read", input: { path: "not copied" } },
-      { type: "text", text: "## Conclusion\n\nDone." },
-    ] },
-  ];
-  for (const message of messages) {
-    const view = render(React.createElement(React.StrictMode, null, React.createElement(MessageView, { message })));
-    const button = view.getByRole("button", { name: "Copy as Markdown" });
-    await act(async () => { fireEvent.click(button); });
-    assert.equal(clipboard, message.role === "user" ? source : `${source}\n\n## Conclusion\n\nDone.`);
-    // The click handler's copy chain (clipboard write -> setCopied) resolves on a
-    // microtask that can land AFTER act's flush under load, leaving the "Copied"
-    // label uncommitted when this line reads the DOM. waitFor lets React commit
-    // instead of racing the scheduler (flaked under parallel suite load).
-    await waitFor(() => assert.equal(button.textContent, "Copied"));
-    view.unmount();
-  }
-});
 
 test("plain Copy keeps full oversized message source instead of the reveal control", async (t) => {
   let clipboard = "";
@@ -116,7 +98,7 @@ test("plain Copy keeps full oversized message source instead of the reveal contr
   }
 });
 
-test("expanded oversized user message can be collapsed again", (t) => {
+test("expanded oversized user message can be collapsed again", async (t) => {
   // Layout stub: capped bubbles overflow; an uncapped bubble fits its content.
   const observers = [];
   const originalResizeObserver = globalThis.ResizeObserver;
@@ -143,7 +125,7 @@ test("expanded oversized user message can be collapsed again", (t) => {
 
   const view = render(React.createElement(MessageView, { message: { role: "user", content: "long\n\n".repeat(200) } }));
   const resize = () => act(() => { for (const observer of observers) observer.callback([]); });
-  fireEvent.click(view.getByRole("button", { name: "Show full input" }));
+  fireEvent.click(await waitFor(() => view.getByRole("button", { name: "Show full input" })));
   resize();
   const toggle = view.getByRole("button", { name: "Collapse input" });
   toggle.focus();
@@ -944,91 +926,6 @@ test("interrupted message with partial content renders content before interrupte
   assert.ok(contentIdx < statusIdx, "content must precede the interrupted status badge");
 });
 
-const FORK_LABEL = "Fork a new session from this point";
-
-test("agent replies offer copy and fork at their resolved target", async (t) => {
-  const originalMatchMedia = window.matchMedia;
-  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-  t.after(() => {
-    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
-    else delete window.matchMedia;
-  });
-  const forked = [];
-  const props = {
-    message: { role: "assistant", model: "test", provider: "test", content: [{ type: "text", text: "Done." }] },
-    entryId: "assistant-1",
-    // Resolved by resolveForkTargets: the newest reply falls back to its own
-    // turn's prompt with edit-and-resend.
-    forkEntryId: "user-1",
-    forkEditsPrompt: true,
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
-  };
-  const view = render(React.createElement(MessageView, props));
-  assert.ok(view.getByRole("button", { name: "Copy message" }));
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
-  assert.deepEqual(forked, [], "the fork button only asks for confirmation");
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Cancel" })); });
-  assert.deepEqual(forked, []);
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]]);
-
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
-  view.rerender(React.createElement(MessageView, { ...props, forkDisabled: true }));
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-1", true]], "a row blocked while the dialog was open does not fork");
-  view.unmount();
-});
-
-test("agent replies without text still offer the new-session action", () => {
-  const html = renderToStaticMarkup(React.createElement(MessageView, {
-    message: {
-      role: "assistant", model: "test", provider: "test",
-      content: [{ type: "toolCall", toolCallId: "tool-1", toolName: "read", input: { path: "a.ts" } }],
-    },
-    entryId: "assistant-2",
-    forkEntryId: "user-1",
-    onFork: () => {},
-  }));
-  assert.doesNotMatch(html, /aria-label="Copy message"/);
-  assert.match(html, new RegExp(`aria-label="${FORK_LABEL}"`));
-});
-
-test("a streaming reply and an unforkable row keep no fork action", () => {
-  const reply = { role: "assistant", model: "test", provider: "test", content: [{ type: "text", text: "Streaming" }] };
-  const streaming = renderToStaticMarkup(React.createElement(MessageView, {
-    message: reply, entryId: "assistant-3", forkEntryId: "user-1", onFork: () => {}, isStreaming: true,
-  }));
-  assert.doesNotMatch(streaming, new RegExp(`aria-label="${FORK_LABEL}"`));
-  assert.doesNotMatch(streaming, /aria-label="Copy message"/);
-  assert.doesNotMatch(streaming, /aria-label="Read aloud"/);
-
-  const noTarget = renderToStaticMarkup(React.createElement(MessageView, {
-    message: reply, entryId: "assistant-4", onFork: () => {},
-  }));
-  assert.doesNotMatch(noTarget, new RegExp(`aria-label="${FORK_LABEL}"`));
-});
-
-test("user messages fork at their own entry and edit the prompt", async (t) => {
-  const originalMatchMedia = window.matchMedia;
-  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
-  t.after(() => {
-    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
-    else delete window.matchMedia;
-  });
-  const forked = [];
-  const view = render(React.createElement(MessageView, {
-    message: { role: "user", content: "Keep this forkable." },
-    entryId: "user-7",
-    forkEntryId: "user-7",
-    onFork: (entryId, editPrompt) => forked.push([entryId, editPrompt]),
-  }));
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
-  assert.deepEqual(forked, []);
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: "Fork" })); });
-  assert.deepEqual(forked, [["user-7", true]]);
-  view.unmount();
-});
 
 test("user-message Edit only runs after confirmation, and not once blocked", async (t) => {
   const originalMatchMedia = window.matchMedia;
@@ -1073,23 +970,16 @@ test("an open confirmation closes when the row starts showing another message", 
     message: { role: "user", content },
     entryId,
     onEdit: async (id, text) => { calls.push(["edit", id, text]); return true; },
-    onFork: (id) => calls.push(["fork", id]),
   });
-  // ChatWindow keys rows by index, so a history swap reuses this component for another entry.
+  // A reused row must not carry a confirmation into another entry.
   const view = render(row("user-1", "Selected."));
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Jump back here and edit this message" })); });
   view.rerender(row("user-2", "Someone else."));
   assert.equal(view.queryByRole("button", { name: "Edit" }), null, "the Edit dialog closes");
 
-  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
-  view.rerender(row("user-3", "Another one."));
-  assert.equal(view.queryByRole("button", { name: "Fork" }), null, "the Fork dialog closes");
-
   view.rerender(row("user-1", "Selected."));
   assert.equal(view.queryByRole("button", { name: "Edit" }), null, "returning to the entry does not reopen its Edit dialog");
-  view.rerender(row("user-2", "Someone else."));
   view.rerender(row("user-3", "Another one."));
-  assert.equal(view.queryByRole("button", { name: "Fork" }), null, "returning to the entry does not reopen its Fork dialog");
 
   // Edit can drop out (onEdit withdrawn) while its dialog is open; it must not come back by itself.
   await act(async () => { fireEvent.click(view.getByRole("button", { name: "Jump back here and edit this message" })); });

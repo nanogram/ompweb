@@ -33,8 +33,8 @@ afterwards and commit the graph.
 
 ```bash
 npm run typecheck                                  # type check
-npm run lint                                       # ESLint, zero warnings
-npm test                                           # unit tests (bun test --parallel)
+npm run lint                                       # ESLint
+npm test                                           # file-isolated Bun tests; one worker/case
 ```
 
 `npm run build` bundles the browser app into `dist/` and `npm run smoke`

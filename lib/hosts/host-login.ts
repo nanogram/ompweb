@@ -196,6 +196,22 @@ export async function removeHostLink(url: string): Promise<void> {
   });
 }
 
+/** Preview cleanup cannot remove the current primary or the daemon's last link.
+ * Check under the same lease as the write: login may change while cleanup waits. */
+export async function removeSecondaryHostLink(url: string): Promise<boolean> {
+  let removed = false;
+  await mutateConfig((saved) => {
+    const target = trimUrl(url);
+    if (typeof saved.url === "string" && trimUrl(saved.url) === target) return;
+    const links = configLinks(saved);
+    const kept = links.filter((link) => trimUrl(link.url) !== target);
+    if (kept.length === 0 || kept.length === links.length) return;
+    saved.links = kept;
+    removed = true;
+  });
+  return removed;
+}
+
 /** Replace the primary, retaining secondary links and unknown settings. Tokens never use argv. */
 export async function loginHost(input: HostLink): Promise<void> {
   const link = normalizeLink(input);

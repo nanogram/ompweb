@@ -98,6 +98,14 @@ export async function register(): Promise<void> {
     console.warn(`[omp-web] message outbox not started: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  // One installation-owned observe-only chat, after host/resume/outbox setup.
+  // Startup only subscribes; disabled installations never spawn or spend.
+  void import("@/lib/director").then(({ startDirectorSupervisor }) => {
+    startDirectorSupervisor();
+  }).catch((error) => {
+    console.warn(`[omp-web] Director supervisor not started: ${error instanceof Error ? error.message : String(error)}`);
+  });
+
   // Crash/stall journal: a long-running server that dies or wedges while the
   // user is away leaves no trace in a terminal that no longer exists (CLI runs
   // are killed with their terminal; pages then show endless loading until the

@@ -819,7 +819,7 @@ export function useDictation({ onTranscript, onError, scope, identityMove }: Use
     } finally {
       isStartingRef.current = false;
     }
-  }, [isRecording, isTranscribing, cleanup, clearMaxTimeout, runTranscription, onError, finishCapture]);
+  }, [isRecording, isTranscribing, cleanup, clearMaxTimeout, runTranscription, onError, finishCapture, setupPreviewAudio, teardownPreviewAudio]);
 
   const togglePause = useCallback(() => {
     const recorder = mediaRecorderRef.current;

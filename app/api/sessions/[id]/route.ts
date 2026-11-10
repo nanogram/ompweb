@@ -6,6 +6,7 @@ import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-fo
 import { clearExitedRpcSession, clearRpcSessionActivity, getLiveRpcSessionIds, getRpcSession, WebRpcError } from "@/lib/rpc-manager";
 
 import { historyJsonResponse } from "@/lib/history-response";
+import { isDirectorSession } from "@/lib/director-state";
 
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
@@ -88,6 +89,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (isDirectorSession(id)) return Response.json({ error: "The dedicated Director chat keeps its name.", code: "director_managed" }, { status: 409 });
   try {
     const { name } = await parseJsonWithinLimit<{ name?: string }>(req, 64 * 1024);
     if (typeof name !== "string" || !name.trim()) {
@@ -134,6 +136,7 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
+  if (isDirectorSession(id)) return Response.json({ error: "Pause the Director from its monitoring controls instead of deleting its dedicated chat.", code: "director_managed" }, { status: 409 });
   try {
     const resolved = await resolveSessionHostOr404(id);
     if ("response" in resolved) return resolved.response;

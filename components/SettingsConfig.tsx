@@ -3,7 +3,7 @@
 import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
-import { getSubmitDuringRunBehavior, getWordCompletionMode, setSubmitDuringRunBehavior, setWordCompletionMode, type SubmitDuringRunBehavior, type WordCompletionMode } from "@/lib/composer-prefs";
+import { getSubmitDuringRunBehavior, getWordCompletionMode, setSubmitDuringRunBehavior, setWordCompletionMode, setSlowModeControlVisible, useSlowModeControlVisible, type SubmitDuringRunBehavior, type WordCompletionMode } from "@/lib/composer-prefs";
 import { getRestoreLastChat, setRestoreLastChat } from "@/lib/workspace-memory";
 import dynamic from "@/lib/dynamic";
 import { ArrowDown, ArrowLeft, ArrowUp, Copy, Download, RefreshCw, RotateCcw, Search, Monitor, Play, Square, Trash2, X } from "lucide-react";
@@ -18,6 +18,9 @@ import { SettingsTabs, type SettingsTab, SETTINGS_CATEGORIES, getNormalizedActiv
 import { copyText } from "@/lib/clipboard";
 import type { AppUpdateInfo } from "./AppUpdateDialog";
 import { AppChannelSelector } from "./AppChannelSelector";
+import { LanguageSwitcher } from "./LanguageSwitcher";
+import { ThemeSwitcher } from "./ThemeSwitcher";
+import { UiCustomizationStatus } from "./UiCustomizationStatus";
 import { useFontSize, type FontSizePreference } from "@/hooks/useFontSize";
 import { useUiScale, type UiScalePreference } from "@/hooks/useUiScale";
 import { useTouchTargets, type TouchTargetsPreference } from "@/hooks/useTouchTargets";
@@ -57,7 +60,7 @@ type WindowsServiceStatus = {
   isRunning: boolean;
   port: number;
   hostname: string;
-  mode: "start" | "dev";
+  mode: "start" | "dev" | "ui";
   desktopShortcutExists: boolean;
   startMenuShortcutExists: boolean;
   startupShortcutExists: boolean;
@@ -162,6 +165,8 @@ type SettingIndexEntry = {
 
 const SETTING_INDEX: SettingIndexEntry[] = [
   // Interface & Behavior
+  { id: "theme", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.theme", descKey: "settingsConfig.themeDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Theme", fallbackDesc: "Choose this browser's color theme or follow your system.", scope: "UI" },
+  { id: "language", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.language", descKey: "settingsConfig.languageDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Language", fallbackDesc: "Choose the display language for this browser.", scope: "UI" },
   { id: "skill-startup-notices", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.skillStartupNotices", descKey: "settingsConfig.skillStartupNoticesDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Skill startup notices", fallbackDesc: "Show conflicts and redundant skill copies when an OMP session starts.", scope: "Native OMP" },
   { id: "completion-sound", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.completionSound", descKey: "settingsConfig.completionSoundDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Completion sound", fallbackDesc: "Play a tone when the agent completes a run.", scope: "UI" },
   { id: "keep-tool-calls-collapsed", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.keepToolCallsCollapsed", descKey: "settingsConfig.keepToolCallsCollapsedDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Keep tool calls collapsed", fallbackDesc: "Show only compact headers while tools execute.", scope: "UI" },
@@ -183,6 +188,7 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   { id: "ui-scale", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.uiScale", descKey: "settingsConfig.uiScaleDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Interface Scale", fallbackDesc: "Adjust overall UI zoom and display density across sidebars, dialogs, buttons, and toolbars.", scope: "UI" },
   { id: "touch-targets", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.touchTargets", descKey: "settingsConfig.touchTargetsDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Touch Targets", fallbackDesc: "Adjust interactive target sizes for buttons and toolbar controls.", scope: "UI" },
   { id: "message-during-active-run", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.messageDuringActiveRun", descKey: "settingsConfig.messageDuringActiveRunDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Message during active run", fallbackDesc: "What composer does on submit while agent runs. Steer interrupts; Queue follow-up delivers after finish.", scope: "UI" },
+  { id: "slow-mode-control", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.slowModeControl", descKey: "settingsConfig.slowModeControlDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Show slow-mode button", fallbackDesc: "Show the snail control in this browser's message composer. Hidden by default; hiding it does not change native slow mode.", scope: "UI" },
   { id: "word-completion", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.wordCompletion", descKey: "settingsConfig.wordCompletionDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Word completion", fallbackDesc: "Ghost text from omp's word prediction; Tab or → accepts. Auto enables it only with a mouse or trackpad (not on touch keyboards).", scope: "UI" },
   { id: "browser-transport", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.browserTransport", descKey: "settingsConfig.browserTransportDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Browser connection", fallbackDesc: "How browsers receive live updates and send chat commands: one WebSocket that picks up where it left off after a dropped connection (the default), or server-sent events + HTTP. A browser whose proxy blocks WebSockets falls back to server-sent events on its own. Every open browser switches within a few seconds.", scope: "UI" },
   { id: "connection-diagnostics", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.connectionDiagnostics", descKey: "settingsConfig.connectionDiagnosticsDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Show connection diagnostics", fallbackDesc: "Adds a Connection tab to the right panel showing the connection this browser uses (WebSocket or server-sent events), its status and delivery latency statistics. Applies to this browser only.", scope: "UI" },
@@ -227,6 +233,7 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   { id: "cache-savings", tab: "usage", sectionKey: "settingsTabs.usage.label", labelKey: "usageConfig.cacheSavings", descKey: "usageConfig.costQuality", fallbackSection: "Usage", fallbackLabel: "Cache Savings", fallbackDesc: "Prompt caching savings and cost quality breakdown", scope: "UI" },
   { id: "model-breakdown", tab: "usage", sectionKey: "settingsTabs.usage.label", labelKey: "usageConfig.breakdown", descKey: "usageConfig.model", fallbackSection: "Usage", fallbackLabel: "Model Breakdown", fallbackDesc: "Historical token usage and cost per model, day, and project", scope: "UI" },
   // Windows Background Service & System Tray
+  ...(process.env.OMP_WEB_PUBLIC_UI_CUSTOMIZATION === "1" ? [{ id: "ui-customization", tab: "system" as const, sectionKey: "settingsConfig.systemUpdates", labelKey: "uiCustomization.title", descKey: "uiCustomization.deferredExplanation", fallbackSection: "System", fallbackLabel: "GUI live customization", fallbackDesc: "Live GUI revision, applied and deferred files, source and errors.", scope: "UI" as const }] : []),
   { id: "auto-resume-sessions", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.autoResumeSessions", descKey: "settingsConfig.autoResumeSessionsDesc", fallbackSection: "System", fallbackLabel: "Resume running sessions after a restart", fallbackDesc: "When omp-web restarts while agents are working, restart those sessions and tell each agent: \"Session interrupted and resumed. Continue as you would have done without the interruption.\" Work in progress at the moment of the restart, such as a running command, is lost." },
   { id: "agent-tools-cross-session", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.agentTools", descKey: "settingsConfig.agentToolsDesc", fallbackSection: "System", fallbackLabel: "Agent tools (cross-session)", fallbackDesc: "Allow agents to call list_sessions, new_session and send_to_session to reach other omp-web sessions, even with no browser tab open. Delivered messages are prefixed with the sending session's ID." },
   { id: "upload-retention", tab: "system", sectionKey: "settingsConfig.systemUpdates", labelKey: "settingsConfig.uploadRetention", descKey: "settingsConfig.uploadRetentionDesc", fallbackSection: "System", fallbackLabel: "Delete sent uploads after", fallbackDesc: "Files attached As file are deleted from each session's local://uploads folder on every host, archived sessions included, once they are this old. Never keeps them for ever." },
@@ -442,6 +449,16 @@ export function RestoreLastChatSetting() {
   return (
     <NativeSetting searchId="restore-last-chat" label={t("settingsConfig.restoreLastChat")} description={t("settingsConfig.restoreLastChatDesc")} scope="UI">
       <ToggleSwitch checked={enabled} onChange={(next) => { setEnabled(next); setRestoreLastChat(next); }} />
+    </NativeSetting>
+  );
+}
+
+export function SlowModeControlSetting() {
+  const { t } = useI18n();
+  const visible = useSlowModeControlVisible();
+  return (
+    <NativeSetting searchId="slow-mode-control" label={t("settingsConfig.slowModeControl")} description={t("settingsConfig.slowModeControlDesc")} scope="UI">
+      <ToggleSwitch checked={visible} onChange={setSlowModeControlVisible} />
     </NativeSetting>
   );
 }
@@ -1313,6 +1330,12 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                   <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: "var(--text-md)", color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.interfaceBehaviorDesc")}</p>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+                  <NativeSetting searchId="theme" label={t("settingsConfig.theme")} description={t("settingsConfig.themeDesc")} scope="UI">
+                    <ThemeSwitcher />
+                  </NativeSetting>
+                  <NativeSetting searchId="language" label={t("settingsConfig.language")} description={t("settingsConfig.languageDesc")} scope="UI">
+                    <LanguageSwitcher />
+                  </NativeSetting>
                   <NativeSetting searchId="keep-tool-calls-collapsed" label={t("settingsConfig.keepToolCallsCollapsed")} description={t("settingsConfig.keepToolCallsCollapsedDesc")} scope="UI">
                     <ToggleSwitch checked={toolCallsDefaultCollapsed} onChange={onToolCallsDefaultCollapsedChange} />
                   </NativeSetting>
@@ -1485,6 +1508,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                       <option value="queue" style={nativeOptionStyle}>{t("settingsConfig.queueFollowUp")}</option>
                     </select>
                   </NativeSetting>
+                  <SlowModeControlSetting />
                   <NativeSetting searchId="word-completion" label={t("settingsConfig.wordCompletion")} description={t("settingsConfig.wordCompletionDesc")} scope="UI">
                     <select
                       style={nativeSelectStyle}
@@ -1900,6 +1924,10 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
                 <AgentEnvSetting />
 
+                {process.env.OMP_WEB_PUBLIC_UI_CUSTOMIZATION === "1" && (
+                  <UiCustomizationStatus highlighted={highlightId === "ui-customization"} />
+                )}
+
                 {/* ompweb app update card */}
                 <section style={{ padding: 14, border: appUpdateIsAvailable ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -1998,6 +2026,9 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 500, color: windowsService.isRunning ? "var(--accent)" : "var(--text-muted)" }}>
                           <span style={{ width: 8, height: 8, borderRadius: "50%", background: windowsService.isRunning ? "var(--accent)" : "var(--border)" }} />
                           {windowsService.isRunning ? t("settingsConfig.windowsServiceRunning", { port: windowsService.port }) : t("settingsConfig.windowsServiceStopped")}
+                        </div>
+                        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                          {t("settingsConfig.windowsServiceMode")}: {t(windowsService.mode === "ui" ? "settingsConfig.windowsServiceModeUi" : windowsService.mode === "dev" ? "settingsConfig.windowsServiceModeDev" : "settingsConfig.windowsServiceModeStart")}
                         </div>
                       </div>
 

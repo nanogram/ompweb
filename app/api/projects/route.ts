@@ -6,6 +6,7 @@ import { listProjectsAllHosts } from "@/lib/hosts/session-index";
 import type { ProjectUpdate } from "@/lib/hosts/session-ops";
 import { isReservedLaunchArg, ProjectPathError } from "@/lib/project-registry";
 import type { ProjectLaunchConfig } from "@/lib/types";
+import { isDirectorWorkspace } from "@/lib/director-state";
 const MAX_EXTRA_ARGS = 32;
 const MAX_EXTRA_ARG_LENGTH = 256;
 
@@ -59,6 +60,7 @@ export async function POST(req: Request) {
     const target = resolveHostOrError(body.hostId);
     if ("response" in target) return target.response;
     const { host } = target;
+    if (host.id === LOCAL_HOST_ID && isDirectorWorkspace(cwd)) return Response.json({ error: "The Director's private workspace is managed by its supervisor.", code: "director_managed" }, { status: 409 });
     const result = await host.sessionOps.addProject(cwd, launchConfig);
     if (!result.ok) return opErrorResponse(result);
     if (host.id !== LOCAL_HOST_ID) return Response.json({ project: { ...result.value, hostId: host.id } });
@@ -121,6 +123,7 @@ export async function PATCH(req: Request) {
 
     const target = resolveHostOrError(body.hostId);
     if ("response" in target) return target.response;
+    if (target.host.id === LOCAL_HOST_ID && parsed.some((project) => isDirectorWorkspace(project.cwd))) return Response.json({ error: "The Director's private workspace is managed by its supervisor.", code: "director_managed" }, { status: 409 });
     const result = await target.host.sessionOps.updateProject(parsed);
     if (!result.ok) return opErrorResponse(result);
     // Only after a successful save: a failed write must not leave an orphaned
@@ -148,6 +151,7 @@ export async function DELETE(req: Request) {
     }
     const target = resolveHostOrError(body.hostId);
     if ("response" in target) return target.response;
+    if (target.host.id === LOCAL_HOST_ID && isDirectorWorkspace(cwd)) return Response.json({ error: "The Director's private workspace is managed by its supervisor.", code: "director_managed" }, { status: 409 });
     const result = await target.host.sessionOps.hideProject(cwd);
     if (!result.ok) return opErrorResponse(result);
     return Response.json({ success: true });

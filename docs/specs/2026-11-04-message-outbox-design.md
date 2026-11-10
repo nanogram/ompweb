@@ -4,6 +4,8 @@ Date: 2026-11-04. Status: proposed, not implemented.
 Builds on: `docs/specs/2026-11-01-browser-link-design.md` (sequenced lines, `rid` dedupe), `docs/specs/2026-10-31-websocket-link-design.md` (host link seq/ack, outbox, hello), `docs/specs/2026-10-28-remote-hosts-design.md` ("Transport down is not exited").
 Replaces, once shipped: the composer's "Sending…" row (`sendQueued` in `components/ChatInput.tsx`).
 
+Implementation note (2026-11-09): the proposal's **Not sent** label for uncertain delivery is now **Delivery unconfirmed**. **Not sent** is reserved for definite failures. Uncertain entries remain visible and are never automatically resent; matching transcript text alone cannot prove acceptance. See `AGENTS.md` for the current implementation contract.
+
 ## Why
 
 When a message cannot reach omp, the user finds out late and in the wrong place. Today:

@@ -8,7 +8,7 @@ import { indexWorkspaceFiles } from "../file-index";
 import { inspectUploadTargets, validateUploadFileNames } from "../file-upload";
 import type { StagedUploads } from "./uploads";
 import { MAX_RESULT_LIMIT } from "../file-fuzzy";
-import { documentPreviewKind, getAudioMime, getDocumentMime, getFileLanguage, getImageMime, TEXT_PREVIEW_MAX_BYTES } from "../file-types";
+import { documentPreviewKind, getAudioMime, getDocumentMime, getFileLanguage, getImageMime, getVideoMime, TEXT_PREVIEW_MAX_BYTES } from "../file-types";
 import { MAX_INLINE_BASH_OUTPUT_BYTES, openRegularFileNoFollow, readUtf8FileWithinLimit, resolveBashOutputPath } from "../bash-output";
 import { isBashOutputPathReferencedBySession } from "../session-file-references";
 import { isRecord } from "../type-guards";
@@ -56,7 +56,7 @@ async function worktreeMutation<T>(action: () => Promise<T>): Promise<T> {
 function fileInfo(filePath: string, stat: fs.Stats): WorkspaceFileInfo {
   return { path: filePath, name: path.basename(filePath), size: stat.size, mtimeMs: stat.mtimeMs,
     isDirectory: stat.isDirectory(), language: getFileLanguage(filePath),
-    mime: getImageMime(filePath) ?? getAudioMime(filePath) ?? getDocumentMime(filePath) ?? "text/plain",
+    mime: getImageMime(filePath) ?? getVideoMime(filePath) ?? getAudioMime(filePath) ?? getDocumentMime(filePath) ?? "text/plain",
     previewKind: documentPreviewKind(filePath) };
 }
 async function access(input: WorkspaceFileRequest, reference: boolean) {

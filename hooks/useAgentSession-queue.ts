@@ -21,9 +21,8 @@ export function isQueuedWhileShellRunning(reply: unknown): boolean {
   return value.queued === true && value.queue === "followUp" && value.reason === "shellRunning";
 }
 
-/** A message omp-web holds until omp has it (docs/specs/2026-11-04-message-outbox-design.md O1): this browser's
- * (`local`, still on its first leg) or the web server's. The one exception to omp-owned queue state: omp does not
- * have these yet. */
+/** An outbox message awaiting handoff, or a retained definite/uncertain failure. Unknown dispatches may already
+ * belong to omp: only a correlated server receipt retires them, never a same-text transcript message. */
 export interface HeldMessage {
   id: string;
   mode: OutboxMode;

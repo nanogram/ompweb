@@ -10,7 +10,7 @@
 .PARAMETER Hostname
     Bind address (default 127.0.0.1).
 .PARAMETER Mode
-    Execution mode: "start" (production) or "dev" (development). Default "start".
+    Execution mode: "start" (production), "dev" (development), or "ui" (source GUI). Default "start".
 .PARAMETER Startup
     Switch indicating invocation from Windows Startup (prevents opening browser).
 .PARAMETER OpenBrowser
@@ -37,6 +37,7 @@ Add-Type -AssemblyName System.Drawing
 # 1. Configuration & Resolution
 # -----------------------------------------------------------------------------
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
+. (Join-Path $PSScriptRoot "web-service-ui.ps1")
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
@@ -54,19 +55,30 @@ $DefaultAutostart = $true
 $DefaultOpenBrowserOnLaunch = $false
 $DefaultAutoRestart = $true
 
-# Read existing config file if present
-$Config = $null
-if (Test-Path $ConfigPath) {
-    try {
-        $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-    } catch { }
+function Resolve-ServiceConfig {
+    $script:Config = $null
+    if (Test-Path -LiteralPath $ConfigPath) {
+        try {
+            $script:Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { throw "Cannot read web service configuration '${ConfigPath}': $($_.Exception.Message)" }
+    }
+    # CLI parameters take precedence, including on an in-tray restart.
+    $script:EffectivePort = if ($Port -gt 0) { $Port } elseif ($Config -and $Config.port) { [int]$Config.port } else { $DefaultPort }
+    $script:EffectiveHostname = if (![string]::IsNullOrWhiteSpace($Hostname)) { $Hostname } elseif ($Config -and $Config.hostname) { [string]$Config.hostname } else { $DefaultHostname }
+    $script:EffectiveMode = if (![string]::IsNullOrWhiteSpace($Mode)) { $Mode } elseif ($Config -and $Config.mode) { [string]$Config.mode } else { $DefaultMode }
+    $script:EffectiveAutoRestart = if ($Config -and ($null -ne $Config.autoRestart)) { [bool]$Config.autoRestart } else { $DefaultAutoRestart }
+    if ($EffectiveMode -cnotin @("start", "dev", "ui")) { throw "Unsupported web service mode '$EffectiveMode'; expected start, dev or ui." }
+    $script:UiSettings = if ($EffectiveMode -eq "ui") { Resolve-WebServiceUiConfig $Config $EffectiveHostname $EffectivePort } else { $null }
+    # Keep the existing start-to-dev fallback exclusive to start mode.
+    if ($EffectiveMode -eq "start" -and !(Test-Path (Join-Path $RepoRoot "dist\index.html"))) {
+        $script:EffectiveMode = "dev"
+        if ($EffectivePort -eq 30177) { $script:EffectivePort = 30178 }
+    }
+    $browserHost = if ($EffectiveHostname -eq "0.0.0.0" -or $EffectiveHostname -eq "::" -or [string]::IsNullOrWhiteSpace($EffectiveHostname)) { "localhost" } elseif ($EffectiveHostname.Contains(":")) { "[$EffectiveHostname]" } else { $EffectiveHostname }
+    $script:HealthUrl = "http://${browserHost}:$EffectivePort"
+    $script:ServerUrl = if ($UiSettings -and $UiSettings.PublicUrl) { $UiSettings.PublicUrl } else { $HealthUrl }
 }
-
-# Resolve effective settings (CLI parameters take precedence over config file)
-$EffectivePort = if ($Port -gt 0) { $Port } elseif ($Config -and $Config.port) { [int]$Config.port } else { $DefaultPort }
-$EffectiveHostname = if (![string]::IsNullOrWhiteSpace($Hostname)) { $Hostname } elseif ($Config -and $Config.hostname) { [string]$Config.hostname } else { $DefaultHostname }
-$EffectiveMode = if (![string]::IsNullOrWhiteSpace($Mode)) { $Mode } elseif ($Config -and $Config.mode) { [string]$Config.mode } else { $DefaultMode }
-$EffectiveAutoRestart = if ($Config -and ($null -ne $Config.autoRestart)) { [bool]$Config.autoRestart } else { $DefaultAutoRestart }
+Resolve-ServiceConfig
 
 # Open browser determination
 $ShouldOpenBrowser = $false
@@ -76,32 +88,16 @@ if ($OpenBrowser) {
     $ShouldOpenBrowser = $true
 }
 
-# Fallback: if in start mode but the client build (dist\index.html) does not exist, fall back to dev mode
-$BuildIndex = Join-Path $RepoRoot "dist\index.html"
-if ($EffectiveMode -eq "start" -and !(Test-Path $BuildIndex)) {
-    $EffectiveMode = "dev"
-    if ($EffectivePort -eq 30177) {
-        $EffectivePort = 30178
-    }
-}
-
-$ServerUrl = if ($EffectiveHostname -eq "0.0.0.0" -or $EffectiveHostname -eq "::" -or [string]::IsNullOrWhiteSpace($EffectiveHostname)) {
-    "http://localhost:$EffectivePort"
-} else {
-    "http://${EffectiveHostname}:${EffectivePort}"
-}
 
 # -----------------------------------------------------------------------------
 # 2. Single-Instance Enforcement via Mutex
 # -----------------------------------------------------------------------------
-$MutexName = "Local\OmpWebTray_Instance_Mutex"
+$MutexName = Get-WebServiceMutexName $ConfigPath
 $createdNew = $false
 try {
-    $script:AppMutex = New-Object System.Threading.Mutex($true, $MutexName, [ref]$createdNew)
-} catch {
-    # If mutex creation fails, continue as single instance
-    $createdNew = $true
-}
+    $script:AppMutex = New-Object System.Threading.Mutex($false, $MutexName)
+    try { $createdNew = $script:AppMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $createdNew = $true }
+} catch { throw "Cannot acquire the web service configuration mutex: $($_.Exception.Message)" }
 
 if (!$createdNew) {
     # Another instance is already running
@@ -116,7 +112,7 @@ if (!$createdNew) {
 # -----------------------------------------------------------------------------
 # 3. Logging & Rotation
 # -----------------------------------------------------------------------------
-$LogDir = Join-Path $env:USERPROFILE ".omp\agent\logs"
+$LogDir = Join-Path (Split-Path -Parent ([System.IO.Path]::GetFullPath($ConfigPath))) "logs"
 if (!(Test-Path $LogDir)) {
     New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
 }
@@ -218,6 +214,12 @@ function Start-WebServer {
     if ($script:ChildProcess -and !$script:ChildProcess.HasExited) {
         return
     }
+    try { Resolve-ServiceConfig } catch {
+        $script:State = "Error"
+        Write-ServiceLog "Web service configuration error: $($_.Exception.Message)"
+        Update-TrayUI
+        return
+    }
 
     $script:State = "Starting"
     Update-TrayUI
@@ -245,11 +247,14 @@ function Start-WebServer {
     if ($EffectiveMode -eq "start") {
         $launcherJs = Join-Path $RepoRoot "bin\omp-web.js"
         $inner = "`"$NodeExe`" `"$launcherJs`" -p $EffectivePort -H $EffectiveHostname --no-open"
+    } elseif ($EffectiveMode -eq "ui") {
+        $inner = Set-WebServiceUiCommand $psi $UiSettings $NodeExe $RepoRoot $EffectiveHostname $EffectivePort $ConfigPath
     } else {
         $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" --hot server\dev.ts -H $EffectiveHostname -p $EffectivePort"
     }
     $psi.FileName = $env:ComSpec
-    $psi.Arguments = "/d /s /c `"$inner >> `"$childOutLog`" 2>&1`""
+    $psi.EnvironmentVariables["OMP_WEB_SERVICE_LOG"] = $childOutLog
+    $psi.Arguments = "/d /v:off /s /c `"$inner >> `"%OMP_WEB_SERVICE_LOG%`" 2>&1`""
 
     # Environment variables
     $psi.EnvironmentVariables["OMP_WEB_PORT"] = [string]$EffectivePort
@@ -322,11 +327,7 @@ function Test-ServerHealth {
         return $false
     }
     try {
-        $probeUrl = if ($EffectiveHostname -eq "0.0.0.0" -or $EffectiveHostname -eq "::" -or [string]::IsNullOrWhiteSpace($EffectiveHostname)) {
-            "http://127.0.0.1:$EffectivePort/api/home"
-        } else {
-            "http://${EffectiveHostname}:${EffectivePort}/api/home"
-        }
+        $probeUrl = "$HealthUrl/api/home"
         $req = [System.Net.WebRequest]::Create($probeUrl)
         $req.Method = "GET"
         $req.Timeout = 2000
@@ -362,7 +363,7 @@ function Set-AutostartShortcut([bool]$enable) {
             if (!(Test-Path $wscriptExe)) { $wscriptExe = "wscript.exe" }
             $shortcut = $wsh.CreateShortcut($startupLnk)
             $shortcut.TargetPath = $wscriptExe
-            $shortcut.Arguments = "`"$launchVbs`" -Startup"
+            $shortcut.Arguments = "`"$launchVbs`" -Startup -ConfigPath `"$ConfigPath`""
             $shortcut.WorkingDirectory = $RepoRoot
             if (Test-Path $IcoPath) {
                 $shortcut.IconLocation = "$IcoPath,0"
@@ -382,8 +383,8 @@ function Set-AutostartShortcut([bool]$enable) {
 
     # Update config file
     try {
-        $agentDir = Join-Path $env:USERPROFILE ".omp\agent"
-        if (!(Test-Path $agentDir)) { New-Item -Path $agentDir -ItemType Directory -Force | Out-Null }
+        $configDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($ConfigPath))
+        if (!(Test-Path -LiteralPath $configDir)) { New-Item -Path $configDir -ItemType Directory -Force | Out-Null }
         $currentCfg = @{
             port = $EffectivePort
             hostname = $EffectiveHostname
@@ -392,19 +393,18 @@ function Set-AutostartShortcut([bool]$enable) {
             openBrowserOnLaunch = $DefaultOpenBrowserOnLaunch
             autoRestart = $EffectiveAutoRestart
         }
-        if (Test-Path $ConfigPath) {
-            try {
-                $existing = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-                if ($existing.port) { $currentCfg.port = $existing.port }
-                if ($existing.hostname) { $currentCfg.hostname = $existing.hostname }
-                if ($existing.mode) { $currentCfg.mode = $existing.mode }
-                if ($null -ne $existing.openBrowserOnLaunch) { $currentCfg.openBrowserOnLaunch = $existing.openBrowserOnLaunch }
-                if ($null -ne $existing.autoRestart) { $currentCfg.autoRestart = $existing.autoRestart }
-            } catch { }
+        if ($UiSettings) {
+            $currentCfg.uiSource = $UiSettings.Source
+            if ($UiSettings.PublicUrl) { $currentCfg.uiPublicUrl = $UiSettings.PublicUrl }
+            if ($null -ne $UiSettings.ProxyPort) { $currentCfg.uiProxyPort = $UiSettings.ProxyPort }
+        }
+        if (Test-Path -LiteralPath $ConfigPath) {
+            $existing = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            foreach ($property in $existing.PSObject.Properties) { $currentCfg[$property.Name] = $property.Value }
         }
         $currentCfg.autostart = $enable
-        $currentCfg | ConvertTo-Json -Depth 4 | Set-Content -Path $ConfigPath -Force
-    } catch { }
+        [System.IO.File]::WriteAllText($ConfigPath, ($currentCfg | ConvertTo-Json -Depth 32), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { Write-ServiceLog "Failed to update autostart configuration: $($_.Exception.Message)" }
 }
 
 # -----------------------------------------------------------------------------
@@ -492,7 +492,7 @@ $contextMenu.Items.Add($script:MenuItemViewLogs) | Out-Null
 $script:MenuItemConfig = New-Object System.Windows.Forms.ToolStripMenuItem
 $script:MenuItemConfig.Text = "Edit Configuration"
 $script:MenuItemConfig.add_Click({
-    if (!(Test-Path $ConfigPath)) {
+    if (!(Test-Path -LiteralPath $ConfigPath)) {
         Set-AutostartShortcut (Check-AutostartShortcut)
     }
     try { Start-Process "notepad.exe" "`"$ConfigPath`"" } catch { }

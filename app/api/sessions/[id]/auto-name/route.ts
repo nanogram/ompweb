@@ -4,6 +4,7 @@ import { invalidateHostSessionList, sessionSpawnTarget } from "@/lib/hosts/sessi
 import { HostOpError } from "@/lib/hosts/link-protocol";
 import { invalidateSessionCaches } from "@/lib/session-reader";
 import { apiErrorResponse, opErrorResponse, resolveSessionHostOr404 } from "@/lib/api-utils";
+import { isDirectorSession } from "@/lib/director-state";
 
 /**
  * POST /api/sessions/[id]/auto-name
@@ -21,6 +22,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params;
+  if (isDirectorSession(id)) return Response.json({ error: "The dedicated Director chat keeps its name.", code: "director_managed" }, { status: 409 });
 
   try {
     // This runs before the path check because omp does not create the session

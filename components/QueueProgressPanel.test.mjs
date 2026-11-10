@@ -4,101 +4,77 @@ import test, { afterEach } from "node:test";
 import React from "react";
 const { cleanup, render, within } = await import("@testing-library/react/pure.js");
 const { default: userEvent } = await import("@testing-library/user-event");
-
 const { QueueProgressPanel } = await import("./QueueProgressPanel.tsx");
+const { QueueProgressLedger, buildQueuePanelItems } = await import("../lib/queue-progress.ts");
 
 afterEach(cleanup);
 
-const item = (text, status, extra = {}) => ({
-  id: `id-${text}`, text, queue: "followUp", status, queuedAt: 0, actionable: status === "queued", ...extra,
-});
-
+const queue = (followUp = [], steering = []) => ({ followUp, steering });
 function panel(items, props = {}) {
   const calls = [];
-  const view = render(React.createElement(QueueProgressPanel, {
-    items,
-    actionPending: false,
-    canRemove: true,
-    canPromote: true,
-    promoteBlocked: false,
-    onAction: (entry, action) => calls.push([action, entry.text]),
-    onDelete: (entry) => calls.push(["delete", entry.text]),
-    onDismiss: () => calls.push(["dismiss"]),
+  const defaults = {
+    actionPending: false, canRemove: true, canPromote: true, promoteBlocked: false,
+    onAction: (entry, action) => calls.push([action, entry.kind, entry.text]),
+    onDelete: (entry) => calls.push(["delete", entry.kind, entry.text]),
     ...props,
-  }));
-  return { ...view, calls };
+  };
+  const view = render(React.createElement(QueueProgressPanel, { ...defaults, items }));
+  return { ...view, calls, update: (next) => view.rerender(React.createElement(QueueProgressPanel, { ...defaults, items: next })) };
 }
 
-const statusOf = (container) => [...container.querySelectorAll("[data-queue-item]")].map((row) => `${row.textContent.match(/(two|three|four)/)?.[0]}:${row.dataset.queueItem}`);
-
-test("header counts done items; the list shows each status with durations and actions only for pending items", async () => {
+test("native pending follow-ups can be edited, deleted and steered; steers cannot be promoted again", async () => {
   const user = userEvent.setup();
-  const items = [
-    item("two", "done", { startedAt: 1_000, finishedAt: 13_000 }),
-    item("three", "running", { startedAt: 13_000 }),
-    item("four", "queued"),
-  ];
-  const { container, calls } = panel(items);
+  const { container, calls } = panel(buildQueuePanelItems(null, queue(["follow"], ["steer"])));
   const queries = within(container);
-  assert.match(container.querySelector("[data-queue-progress]").textContent, /^1 of 3 done$/);
-  // Collapsed, the header previews the running item.
-  assert.equal(container.querySelectorAll("[data-queue-item]").length, 0);
-  assert.match(container.textContent, /three/);
-  assert.ok(container.querySelector('[data-queue-status="running"] .animate-spin'), "the running item spins");
-
+  assert.ok(container.querySelector("button[aria-expanded]").textContent.includes("steer"), "the preview follows native steering priority");
+  assert.equal(container.querySelector("button[aria-expanded]").textContent.includes("follow"), false);
   await user.click(queries.getByRole("button", { name: /Show all queued prompts/ }));
-  assert.deepEqual(statusOf(container), ["two:done", "three:running", "four:queued"]);
-  assert.ok(queries.getByRole("img", { name: "Done" }));
-  assert.ok(queries.getByRole("img", { name: "Pending" }));
-  assert.equal(queries.getByTitle("Took 12s").textContent, "12s");
-  // Edit/Delete/Steer exist for the pending item only.
-  assert.equal(queries.getAllByRole("button", { name: "Edit", exact: true }).length, 1);
-  await user.click(queries.getByRole("button", { name: "Delete", exact: true }));
-  await user.click(queries.getByRole("button", { name: "Steer", exact: true }));
-  assert.deepEqual(calls, [["delete", "four"], ["steer", "four"]]);
-  assert.equal(queries.queryByRole("button", { name: /Dismiss/ }), null, "no dismiss while the batch runs");
+  const rows = [...container.querySelectorAll("[data-queue-item]")];
+  assert.equal(rows.length, 2);
+  const steer = within(rows.find((row) => row.textContent.includes("steer")));
+  const follow = within(rows.find((row) => row.textContent.includes("follow")));
+  assert.equal(steer.queryByRole("button", { name: "Steer", exact: true }), null);
+  await user.click(steer.getByRole("button", { name: "Edit", exact: true }));
+  await user.click(follow.getByRole("button", { name: "Delete", exact: true }));
+  await user.click(follow.getByRole("button", { name: "Steer", exact: true }));
+  assert.deepEqual(calls, [["edit", "steer", "steer"], ["delete", "follow-up", "follow"], ["steer", "follow-up", "follow"]]);
 });
 
-test("failed and cancelled items are counted; a finished batch collapses to a dismissible summary", async () => {
+test("native consumption removes a steer from the panel and the last consumed message hides it despite ledger history", async () => {
+  let id = 0;
+  const ledger = new QueueProgressLedger({ epoch: "panel", createId: () => String(++id) });
+  ledger.observeQueue(queue(["later"], ["consumed steer"]), 1);
+  const { container, update } = panel(buildQueuePanelItems(ledger.snapshot(), queue(["later"], ["consumed steer"])));
   const user = userEvent.setup();
-  const running = [item("two", "done", { startedAt: 0, finishedAt: 5_000 }), item("three", "running"), item("four", "queued")];
-  const { container, calls, rerender } = panel(running);
-  const queries = within(container);
-  await user.click(queries.getByRole("button", { name: /Show all queued prompts/ }));
-  assert.equal(container.querySelectorAll("[data-queue-item]").length, 3);
-
-  const finished = [item("two", "done", { startedAt: 0, finishedAt: 5_000 }), item("three", "failed"), item("four", "cancelled")];
-  rerender(React.createElement(QueueProgressPanel, {
-    items: finished, actionPending: false, canRemove: true, canPromote: true, promoteBlocked: false,
-    onAction() {}, onDelete() {}, onDismiss: () => calls.push(["dismiss"]),
-  }));
-  assert.equal(container.querySelectorAll("[data-queue-item]").length, 0, "the summary replaces the open list");
-  assert.equal(container.querySelector("[data-queue-progress]").textContent, "1 of 3 done · 1 failed · 1 cancelled");
-  await user.click(queries.getByRole("button", { name: /Dismiss/ }));
-  assert.deepEqual(calls, [["dismiss"]]);
-
-  // The header itself still opens the list (Dismiss replaced the Show-all text button).
-  await user.click(container.querySelector("button[aria-expanded]"));
-  assert.deepEqual(statusOf(container), ["two:done", "three:failed", "four:cancelled"]);
-  assert.ok(queries.getByRole("img", { name: "Failed" }));
-  assert.ok(queries.getByRole("img", { name: "Cancelled" }));
+  await user.click(within(container).getByRole("button", { name: /Show all queued prompts/ }));
+  assert.ok(within(container).getByText("consumed steer"));
+  // The native queue frame can precede its ledger update and transcript echo.
+  update(buildQueuePanelItems(ledger.snapshot(), queue(["later"])));
+  assert.equal(within(container).queryByText("consumed steer"), null);
+  assert.ok(within(container).getByText("later"));
+  ledger.observeQueue(queue(["later"]), 2);
+  ledger.observeUserMessage("consumed steer", 3);
+  update(buildQueuePanelItems(ledger.snapshot(), queue(["later"])));
+  assert.equal(within(container).queryByText("consumed steer"), null);
+  ledger.observeQueue(queue(), 4);
+  ledger.observeUserMessage("later", 5);
+  ledger.observeRunEnd("completed", 6);
+  update(buildQueuePanelItems(ledger.snapshot(), queue()));
+  assert.equal(container.querySelector('[aria-label="Queued prompts"]'), null);
 });
 
-test("a single item shows inline: pending with its actions, finished with dismiss", () => {
-  const { container, rerender } = panel([item("two", "queued")]);
-  const queries = within(container);
-  assert.deepEqual(statusOf(container), ["two:queued"]);
-  assert.ok(queries.getByRole("button", { name: "Edit", exact: true }));
-  rerender(React.createElement(QueueProgressPanel, {
-    items: [item("two", "done", { startedAt: 0, finishedAt: 2_000 })], actionPending: false, canRemove: true, canPromote: true,
-    promoteBlocked: false, onAction() {}, onDelete() {}, onDismiss() {},
-  }));
-  assert.deepEqual(statusOf(container), ["two:done"]);
-  assert.equal(queries.queryByRole("button", { name: "Edit", exact: true }), null);
-  assert.ok(queries.getByRole("button", { name: /Dismiss/ }));
+test("equal pending occurrences are retained, but only the first can invoke text-based queue commands", async () => {
+  const user = userEvent.setup();
+  const { container, calls } = panel(buildQueuePanelItems(null, queue(["again", "again"])));
+  await user.click(within(container).getByRole("button", { name: /Show all queued prompts/ }));
+  assert.equal(within(container).getAllByText("again").length, 2);
+  assert.equal(within(container).getAllByRole("button", { name: "Delete", exact: true }).length, 1);
+  await user.click(within(container).getByRole("button", { name: "Delete", exact: true }));
+  assert.deepEqual(calls, [["delete", "follow-up", "again"]]);
 });
 
-test("a pending item omp no longer holds cannot be edited", () => {
-  const { container } = panel([item("two", "queued", { actionable: false })]);
-  assert.equal(within(container).queryByRole("button", { name: "Edit", exact: true }), null);
+test("queue actions remain disabled while a native mutation is pending", () => {
+  const { container } = panel(buildQueuePanelItems(null, queue(["pending"])), { actionPending: true });
+  const queries = within(container);
+  for (const name of ["Edit", "Delete", "Steer"]) assert.equal(queries.getByRole("button", { name, exact: true }).disabled, true);
 });

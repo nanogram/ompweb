@@ -6,15 +6,20 @@ import { pushUploadRetention } from "@/lib/hosts/upload-retention-sync";
 import { browserTransportState, loadWebServerSettings, saveWebServerSettings, type WebServerSettings } from "@/lib/web-settings";
 import { isRecord } from "@/lib/type-guards";
 import { isUploadRetentionDays } from "@/lib/upload-limits";
+import { isComposerModelKeys } from "@/lib/composer-model-visibility";
 
 /** GET/PUT /api/web-settings - omp-web's own server-side settings. */
 export async function GET() {
-  return Response.json(readSettings());
+  try {
+    return Response.json(readSettings(), { headers: { "Cache-Control": "no-store" } });
+  } catch {
+    return Response.json({ error: "Could not read web settings. Existing preferences have not been changed.", code: "web_settings_unavailable" }, { status: 503 });
+  }
 }
 
 /** Never surface a variable lib/omp/agent-env.ts would refuse to spawn with. */
 function readSettings(): WebServerSettings {
-  const settings = loadWebServerSettings();
+  const settings = loadWebServerSettings(true);
   return { ...settings, agentEnv: sanitizeAgentEnvValues(settings.agentEnv).values };
 }
 
@@ -30,6 +35,20 @@ export async function PUT(req: Request) {
   }
   const payload = body as Partial<Record<keyof WebServerSettings, unknown>>;
   const patch: Partial<WebServerSettings> = {};
+
+  if (payload.composerModelKeys !== undefined) {
+    if (!isComposerModelKeys(payload.composerModelKeys)) {
+      return Response.json({ error: "composerModelKeys must be null or an array of provider:model keys", code: "invalid_settings" }, { status: 400 });
+    }
+    patch.composerModelKeys = payload.composerModelKeys;
+  }
+  const composerModelKeysIfUnset = body.composerModelKeysIfUnset === true;
+  if (body.composerModelKeysIfUnset !== undefined && (
+    !composerModelKeysIfUnset || !Array.isArray(patch.composerModelKeys)
+    || Object.keys(body).some((key) => key !== "composerModelKeys" && key !== "composerModelKeysIfUnset")
+  )) {
+    return Response.json({ error: "composerModelKeysIfUnset requires only a legacy model-key array", code: "invalid_settings" }, { status: 400 });
+  }
 
   // Both keys are optional so a caller can update one without reading the other;
   // anything present is still validated.
@@ -86,9 +105,16 @@ export async function PUT(req: Request) {
     patch.agentEnv = parsed.values;
   }
 
-  const previousTransport = JSON.stringify(browserTransportState());
-  const previousRetention = loadWebServerSettings().uploadRetentionDays;
-  const settings = saveWebServerSettings(patch);
+  let previous: WebServerSettings;
+  let settings: WebServerSettings;
+  try {
+    previous = loadWebServerSettings(true);
+    settings = saveWebServerSettings(patch, composerModelKeysIfUnset);
+  } catch {
+    return Response.json({ error: "Could not save web settings. Existing preferences have not been changed.", code: "web_settings_save_failed" }, { status: 500 });
+  }
+  const previousTransport = JSON.stringify(browserTransportState(previous));
+  const previousRetention = previous.uploadRetentionDays;
   // Apply to sessions that are already running, not only the next run. Only when the
   // flag was part of this save — an agentEnv-only write must not touch live sessions.
   if (resumeProvided) syncInterruptibleSessions();

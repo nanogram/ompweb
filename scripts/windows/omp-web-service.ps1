@@ -12,6 +12,7 @@ param(
 )
 
 $RepoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
+. (Join-Path $PSScriptRoot "web-service-ui.ps1")
 $PkgJsonPath = Join-Path $RepoRoot "package.json"
 $PkgVersion = "0.0.0"
 if (Test-Path $PkgJsonPath) {
@@ -22,29 +23,35 @@ $DefaultHostname = "127.0.0.1"
 $DefaultMode = "start"
 $DefaultAutoRestart = $true
 
-$Config = $null
-if (Test-Path $ConfigPath) { try { $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json } catch { } }
-
-$EffectivePort = if ($Port -gt 0) { $Port } elseif ($Config -and $Config.port) { [int]$Config.port } else { $DefaultPort }
-$EffectiveHostname = if (![string]::IsNullOrWhiteSpace($Hostname)) { $Hostname } elseif ($Config -and $Config.hostname) { [string]$Config.hostname } else { $DefaultHostname }
-$EffectiveMode = if (![string]::IsNullOrWhiteSpace($Mode)) { $Mode } elseif ($Config -and $Config.mode) { [string]$Config.mode } else { $DefaultMode }
-$EffectiveAutoRestart = if ($Config -and ($null -ne $Config.autoRestart)) { [bool]$Config.autoRestart } else { $DefaultAutoRestart }
-
-$BuildIndex = Join-Path $RepoRoot "dist\index.html"
-if ($EffectiveMode -eq "start" -and !(Test-Path $BuildIndex)) {
-    $EffectiveMode = "dev"
-    if ($EffectivePort -eq 30177) { $EffectivePort = 30178 }
+function Resolve-ServiceConfig {
+    $script:Config = $null
+    if (Test-Path -LiteralPath $ConfigPath) { try { $script:Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { throw "Cannot read web service configuration '${ConfigPath}': $($_.Exception.Message)" } }
+    $script:EffectivePort = if ($Port -gt 0) { $Port } elseif ($Config -and $Config.port) { [int]$Config.port } else { $DefaultPort }
+    $script:EffectiveHostname = if (![string]::IsNullOrWhiteSpace($Hostname)) { $Hostname } elseif ($Config -and $Config.hostname) { [string]$Config.hostname } else { $DefaultHostname }
+    $script:EffectiveMode = if (![string]::IsNullOrWhiteSpace($Mode)) { $Mode } elseif ($Config -and $Config.mode) { [string]$Config.mode } else { $DefaultMode }
+    $script:EffectiveAutoRestart = if ($Config -and ($null -ne $Config.autoRestart)) { [bool]$Config.autoRestart } else { $DefaultAutoRestart }
+    if ($EffectiveMode -cnotin @("start", "dev", "ui")) { throw "Unsupported web service mode '$EffectiveMode'; expected start, dev or ui." }
+    $script:UiSettings = if ($EffectiveMode -eq "ui") { Resolve-WebServiceUiConfig $Config $EffectiveHostname $EffectivePort } else { $null }
+    if ($EffectiveMode -eq "start" -and !(Test-Path (Join-Path $RepoRoot "dist\index.html"))) {
+        $script:EffectiveMode = "dev"
+        if ($EffectivePort -eq 30177) { $script:EffectivePort = 30178 }
+    }
+    $browserHost = if ($EffectiveHostname -eq "0.0.0.0" -or $EffectiveHostname -eq "::" -or [string]::IsNullOrWhiteSpace($EffectiveHostname)) { "localhost" } elseif ($EffectiveHostname.Contains(":")) { "[$EffectiveHostname]" } else { $EffectiveHostname }
+    $script:ServerUrl = "http://${browserHost}:$EffectivePort"
 }
-$ServerUrl = if ($EffectiveHostname -eq "0.0.0.0" -or $EffectiveHostname -eq "::" -or [string]::IsNullOrWhiteSpace($EffectiveHostname)) { "http://localhost:$EffectivePort" } else { "http://${EffectiveHostname}:$EffectivePort" }
+Resolve-ServiceConfig
 
 # Mutex to prevent duplicate service instances
-$MutexName = "Local\OmpWebService_Instance_Mutex"
+$MutexName = Get-WebServiceMutexName $ConfigPath
 $createdNew = $false
-try { $script:AppMutex = New-Object System.Threading.Mutex($true, $MutexName, [ref]$createdNew) } catch { $createdNew = $true }
+try {
+    $script:AppMutex = New-Object System.Threading.Mutex($false, $MutexName)
+    try { $createdNew = $script:AppMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $createdNew = $true }
+} catch { throw "Cannot acquire the web service configuration mutex: $($_.Exception.Message)" }
 if (!$createdNew) { Exit 0 }
 
 # Logging
-$LogDir = Join-Path $env:USERPROFILE ".omp\agent\logs"
+$LogDir = Join-Path (Split-Path -Parent ([System.IO.Path]::GetFullPath($ConfigPath))) "logs"
 if (!(Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 $LogFile = Join-Path $LogDir "omp-web-service.log"
 $OldLogFile = Join-Path $LogDir "omp-web-service.old.log"
@@ -109,6 +116,10 @@ function Set-ChildCredential($psi, [string]$name) {
 
 function Start-WebServer {
     if ($script:ChildProcess -and !$script:ChildProcess.HasExited) { return }
+    try { Resolve-ServiceConfig } catch {
+        Write-ServiceLog "Web service configuration error: $($_.Exception.Message)"
+        return
+    }
     Write-ServiceLog "Starting web server in $EffectiveMode mode on ${EffectiveHostname}:$EffectivePort..."
     # Child output goes to a file through cmd; the async OutputDataReceived
     # callbacks run on a thread-pool thread with no runspace and terminate this
@@ -127,11 +138,14 @@ function Start-WebServer {
     if ($EffectiveMode -eq "start") {
         $launcherJs = Join-Path $RepoRoot "bin\omp-web.js"
         $inner = "`"$NodeExe`" `"$launcherJs`" -p $EffectivePort -H $EffectiveHostname --no-open"
+    } elseif ($EffectiveMode -eq "ui") {
+        $inner = Set-WebServiceUiCommand $psi $UiSettings $NodeExe $RepoRoot $EffectiveHostname $EffectivePort $ConfigPath
     } else {
         $inner = "`"$NodeExe`" `"$(Join-Path $RepoRoot 'bin\bun-runtime.js')`" --hot server\dev.ts -H $EffectiveHostname -p $EffectivePort"
     }
     $psi.FileName = $env:ComSpec
-    $psi.Arguments = "/d /s /c `"$inner >> `"$childOutLog`" 2>&1`""
+    $psi.EnvironmentVariables["OMP_WEB_SERVICE_LOG"] = $childOutLog
+    $psi.Arguments = "/d /v:off /s /c `"$inner >> `"%OMP_WEB_SERVICE_LOG%`" 2>&1`""
     $psi.EnvironmentVariables["OMP_WEB_PORT"] = [string]$EffectivePort
     $psi.EnvironmentVariables["OMP_WEB_HOSTNAME"] = [string]$EffectiveHostname
     $psi.EnvironmentVariables["OMP_WEB_SERVICE"] = "1"

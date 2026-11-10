@@ -2392,19 +2392,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice]);
 
-  /** Clear the finished queue-progress items for every tab on the session;
-   *  the panel follows the server's next `queue_progress` frame. */
-  const handleDismissQueueProgress = useCallback(async () => {
-    const sid = sessionIdRef.current;
-    if (!hookAliveRef.current || !sid) return;
-    try {
-      await sendAgentCommand(sid, { type: "dismiss_queue_progress" });
-    } catch (error) {
-      if (!hookAliveRef.current || sessionIdRef.current !== sid) return;
-      addNotice({ type: "error", message: error instanceof Error ? error.message : String(error) });
-    }
-  }, [addNotice]);
-
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
       case "session_history_changed": {
@@ -4823,7 +4810,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleCompact, handleHandoff, handleSteer, handleFollowUp, handleAbortCompaction, handleGoalAction,
     heldMessages, deleteHeldMessage,
     handleBuiltinSlashCommand, togglePreCompactionHistory,
-    handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, handleDismissQueueProgress, setActiveLeafId, setData, setMessages,
+    handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, removeQueuedMessage, promoteQueuedToSteer, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
     btw, askBtw,
     bashRunning, pendingBash, deferredBash,

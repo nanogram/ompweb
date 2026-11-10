@@ -6,6 +6,7 @@ const dom = new JSDOM("<!doctype html><html><head></head><body></body></html>", 
   url: "https://omp.test/",
   pretendToBeVisual: true,
 });
+dom.window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
 const globals = {
   window: dom.window,
   document: dom.window.document,
@@ -25,7 +26,7 @@ const globals = {
   MutationObserver: dom.window.MutationObserver,
   localStorage: dom.window.localStorage,
   sessionStorage: dom.window.sessionStorage,
-  matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+  matchMedia: dom.window.matchMedia,
   getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
   requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
   cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),

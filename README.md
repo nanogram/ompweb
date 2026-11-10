@@ -18,6 +18,9 @@ installed-app name identify the fork. An explicit `OMP_WEB_NAME` still wins.
 The npm name `@kahme247/ompweb` is retained for compatibility, but its registry
 releases are upstream builds, **not this fork**.
 
+See the [November 10 release notes](notes/session-logs/2026-11-10-ompweb-main-release.md)
+for the GUI customization, Director, responsiveness and composer changes.
+
 Registry application and daemon updates cannot replace these patches. In
 **Settings → System → ompweb application**, choose **Main (upstream)** or
 **nanogram fork**. The app stages/builds the selected version in the background;
@@ -126,14 +129,73 @@ it never restores live controls or authorizes sending before revalidation.
 `/goal` uses OMP's native goal state, with pause, resume and drop controls shared
 across clients. Native slash commands require support from the installed OMP;
 an unsupported command reports an error rather than creating a browser-only goal.
-Queue progress follows OMP's own queue. Finished display records are bounded;
-pending messages are never discarded by the display limit.
+The composer queue shows only messages still waiting in OMP. Once consumed,
+a steer or follow-up leaves that panel and appears in the chat transcript,
+without a second running/completed copy above the input. A later message with
+the same text remains a separate queued submission.
+
+The slow-mode snail button is hidden by default. Enable **Settings → Interface
+& Behavior → Show slow-mode button** for this browser. Hiding it does not turn
+off native slow mode or hide provider usage-limit warnings.
+
+The composer combines models and reasoning in one picker. Its button shows the
+current effort circle beside the model name. Models appear on the left and the
+selected model's supported reasoning levels on the right, on desktop and mobile.
+Choosing a model keeps the picker open; effort selection waits for OMP to confirm
+the model change. Choose a level to close it, or press Escape without changing it.
+The picker uses your saved model visibility selection, without a search box,
+repeated model caption, prompt hint or provider footer. Manage providers and
+visible models in Settings. Opening the picker focuses the selected model;
+arrow keys move between models and reasoning.
+The popup sits above the entire input box, not its lower model button. It follows
+composer resizing and shrinks to the space above it on short/mobile viewports.
 
 Native clients can discover capabilities at `/api/app-info`, request a heartbeat
 on their event stream, and search local user/assistant messages with
 `/api/sessions/messages/search?q=...&limit=...&cursor=...`. Search is bounded and
 cursor-paged, excluding linked hosts, reasoning, tool output, lines above 1 MiB
 and files above 64 MiB; inspect `partial`, `cursor` and `skippedFiles`.
+
+## Director
+
+The **Director** entry above Workspaces opens one persistent, real OMP chat.
+Its first opening selects the current project. The management panel starts collapsed
+on desktop and mobile; click or tap its mode/status row to expand it. **Watched
+projects** changes scope, and **Pause / Resume** and **Review now** control
+automation. Errors remain visible even while the management panel is collapsed.
+
+The web server watches selected sessions without an open browser. Completion,
+errors, pending input and a possible 15-minute lack of progress can trigger
+recommendations in the Director chat. It reads bounded status metadata and small
+assistant excerpts from already-running sessions, not full worker histories.
+Tell the Director your goals and constraints in that chat.
+
+Director starts **observe-only**. Enable **Control sessions in watched projects**
+in its chat to grant it server-owned `director_sessions` and `director_control`
+tools. It can discover every selected session through bounded pagination, open
+an existing native runtime, send a new instruction, steer a running turn, queue a
+follow-up or stop the current turn. These tools work without a browser.
+
+Control is checked against the saved project/host scope before each operation.
+Pause blocks control, and turning the switch off revokes it without stopping
+workers. Pending questions require the human; Director cannot answer approvals,
+run shell commands, directly edit files, create/delete chats or control itself.
+Its private workspace still disables native tools, extensions and context files
+on creation and resume. The global cross-session tools setting is unchanged.
+
+Automatic reviews keep a five-minute cooldown by default; Review now bypasses
+pause/cooldown. There is no daily review-count or dollar cap. Today's review
+count and OMP-reported cost remain informational, and unavailable cost accounting
+does not stop reviews. Quota/error pauses, selected-project authorization and
+duplicate-review protection still apply.
+
+Identity, scope and review reservations live under
+`<agent-dir>/omp-web/director/`. Web-only restarts rejoin the same native chat;
+keep the host daemon and desktop awake. An obsolete Director role reloads only
+its own idle native child, retaining its conversation and waiting for pending
+preparation or a running turn. Worker sessions and the daemon are not restarted.
+An ambiguous creation or delivery is preserved without spawning a replacement
+or blindly replaying a review or control command.
 
 ## Notifications
 
@@ -605,6 +667,9 @@ Notes:
   @-mentions and live file watching use the owning machine's daemon, including
   This machine. Explorer uploads accept up to 2 GiB per file with no 100 MiB batch
   cap; preview limits remain 256 KiB for text and 10 MiB for images/DOCX.
+  Video previews stream MP4/M4V, MOV, WebM and OGV with byte-range support instead
+  of using the text limit. Playback depends on browser codec support; downloads
+  remain available when a format cannot play.
   File tabs retain their source host when you switch chats. An unavailable or
   older daemon reports offline or asks for an update; main never substitutes its
   own filesystem.
@@ -741,13 +806,15 @@ Stop it with `Stop-ScheduledTask ompweb-host`, then end the running host with
 ## Features
 
 - **Interactive Chat**: Real-time streaming conversation with your local `omp` agent — tool calls, thinking levels, token counts, cost, context gauge, queue controls, and interrupt & retry.
-- **Message Copy**: Copy user messages and completed assistant replies as rendered plain text or original Markdown using the buttons below each message. Thinking, tool output, and message controls are excluded. Oversized messages that use the raw-text viewer copy their full source in either format.
+- **Message Copy**: Copy user messages and completed assistant replies as rendered plain text using the Copy button below each message. Thinking, tool output, and message controls are excluded. Oversized messages that use the raw-text viewer copy their full source.
 - **Queue Deletion Confirmation**: Preview and confirm before cancelling queued follow-ups or steered messages in OMP. Requires native `remove_queued_message` support; already-delivered messages cannot be recalled.
 - **Session Management**: Browse past conversations by project, fork sessions, branch within a session, archive/restore, import session files, and deep-link via URL.
 - **Draft Recovery**: Unsent text stays scoped to its conversation or new-session workspace and is restored after Back/Forward navigation or reload in the same tab when browser storage is available (up to 50 drafts). Images and file attachments remain in memory only.
-- **Live Plans & Subagents**: Collapsible panels pinned above the composer track live todo phases and running subagents (status, tool, retries, tokens/cost, nested tasks) with transcript dialogs and history recovery.
+- **Automatic Composer**: Running sessions use a compact status/Stop bar by default; idle sessions and pending questions/approvals show the full input area. Click the compact bar to write a follow-up. Expansion lasts for that run, and drafts/attachments remain mounted through visibility changes. No manual collapse arrow is needed.
+- **Live Plans & Subagents**: Collapsible panels pinned above the composer track live todo phases and running subagents (status, tool, retries, tokens/cost, nested tasks) with transcript dialogs and history recovery. Their summary bars stay bottom-aligned while details expand upward; active panels share the row, and a sole panel fills it.
 - **Tool Preset Picker**: Choose the toolset for new sessions in the composer — `none` / `default` (`read,bash,edit,write`) / `full` (all tools including subagents). Persists to localStorage.
-- **File Explorer & Previews**: Browse workspaces side-by-side with chat; preview code, markdown, Mermaid, images, audio, PDFs, and diffs with allow-listed access.
+- **File Explorer & Previews**: Browse workspaces side-by-side with chat; preview code, markdown, Mermaid, images, audio, video, PDFs, DOCX, and diffs with allow-listed access.
+- **Desktop File Actions**: Right-click supported local document/media links in chat, tool rows or Markdown file previews to choose **Open in system app**, **Preview in OMPweb**, or **Download file**. File viewers also have a system-app toolbar button. Native opening uses the default application on the computer running OMPweb—not a remote browser's device—and requires a graphical desktop/file association. Linked-host files and executable/script/shortcut types cannot use native opening. Shift-right-click preserves the browser menu; phone links keep their normal behavior.
 - **Git Worktree Support**: Create, switch, and manage Git worktrees directly from the sidebar; sessions and file roots stay grouped by project.
 - **Remote Hosts**: Link other machines (for example a MacBook) and run sessions there from one ompweb. The sidebar groups sessions by host. See [Run sessions on another machine](#run-sessions-on-another-machine).
 - **Usage & Analytics**: Dashboard in **Settings → Usage** for tokens, costs, cache savings, and breakdowns by provider / model / day / project with SQLite persistence.
@@ -898,18 +965,194 @@ npm run dev
 
 The dev server runs at [http://127.0.0.1:30178](http://127.0.0.1:30178).
 
-A dev server does not take over the local daemon: only the production web
-server writes the daemon's `host.json`, so "This machine" shows offline in dev
-and the daemon stays linked to your installed ompweb.
+A normal dev server does not take over the local daemon: only the production web
+server writes the daemon's `host.json`, so "This machine" shows offline in `npm run dev`
+and the daemon stays linked to your installed ompweb. The explicit GUI-only
+workflow below adds a secondary link instead.
 
 `npm run dev` runs the server with Bun hot reload. `npm run build` bundles the browser app into `dist/`, and `npm start` serves it on port 30177 (`npm run smoke` checks the result). `npm run dev:lan` binds the dev server to all interfaces. `npm run build:binary` builds the [single binary](#single-binary) for this machine into `release/` (`-- --target bun-linux-arm64` and the like for another platform; `npm run smoke -- --binary release/ompweb-linux-x64/ompweb` checks it).
+
+### Live GUI customization without interrupting sessions
+
+With the normal web server and its separate host daemon already running, use a
+full source checkout with dependencies installed:
+
+```bash
+npm run dev:ui
+# Optional: another checkout or free loopback port
+npm run dev:ui -- --source /path/to/ompweb --port 30179
+```
+
+Open the printed preview URL (default `http://127.0.0.1:30178`). It shares the
+existing daemon and native sessions; it does not start, restart or stop either.
+The installed production web app stays untouched.
+
+For phone access through an HTTPS VPN endpoint, name its exact trusted origin:
+
+```bash
+npm run dev:ui -- --public-url https://ompweb.example.ts.net:8446 --proxy-port 30179
+# Route that HTTPS endpoint to http://127.0.0.1:30179, not the Bun port 30178.
+```
+
+The optional loopback ingress admits only that Host. It translates same-origin
+headers only for Bun's reserved `/_bun/` assets and HMR socket, working around
+[Bun 1.4.4's named-host restriction](https://github.com/oven-sh/bun/issues/47325).
+API authentication, cookies and CSRF checks retain the original public Host and
+Origin. Other browser origins
+cannot use the privileged HMR translation. The default ingress port is the
+preview port plus one (65534 when the preview uses 65535).
+
+The trusted ingress streams gzip for Bun's JavaScript and CSS assets instead of
+transferring the uncompressed development bundle to phones. Browser-cached assets
+revalidate against Bun's current ETag: unchanged files return 304 without another
+body, while changed GUI revisions load immediately. This does not cache API
+responses, buffer whole bundles per client, or change HMR socket/origin checks.
+
+Keep the endpoint on a trusted VPN with the same access protections as
+production. Development assets expose source code; never expose this workflow
+to the public internet or configure a wildcard public origin.
+
+The launcher makes a private, temporary source snapshot, links installed
+dependencies and coalesces filesystem changes at 750 ms intervals, without
+recursively rescanning an idle checkout. Only these display paths
+are published as complete, staged files into the running preview:
+
+- CSS under `app/` (except `app/api/`), `components/` and `public/`.
+- `components/MarkdownBody.tsx`, `MarkdownCode.tsx`, `MessageView.tsx`,
+  `MessageView-*.tsx`, `MessageView-tool-format.ts`, `MessageCopyActions.tsx`
+  and `ChatInput-banners.tsx`, plus `ComposerPanels.tsx` and `TodoList.tsx`.
+- `lib/markdown.ts` and `lib/syntax-highlight.ts`.
+- New or existing `components/display/**/*.{ts,tsx,js,jsx,css}` and
+  `lib/display/**/*.{ts,tsx,js,jsx}`.
+
+This covers new **display syntax**: put its parser/formatter in `lib/display/`,
+its presentation in `components/display/`, and import it statically from an
+allowed renderer. Keep the existing Markdown sanitization and link policies.
+Changing OMP's commands, events, protocol or execution semantics is **not** a
+display change.
+
+API, RPC, host/session execution, transport/workers, outbox, hooks, shell,
+composer input/control, package/config and all other modules remain frozen at startup.
+**Settings → System → GUI live customization** lists applied revisions,
+source-copy errors and deferred files; it only polls while that settings panel
+is open and visible. Deferred changes require explicitly stopping and restarting
+only this preview; nothing automatically restarts. Bun reports display compile
+errors in its normal browser overlay; fix the source to recover.
+Replacing a top-level runtime source directory, or losing its watcher, stops only
+the preview with an explanation; explicitly restart the preview to reattach it.
+
+Replacement normally uses one atomic rename. When Windows/Bun holds a mapped
+module, the launcher moves the old complete file aside before publishing the
+new one, restoring it if publication fails. That Windows fallback has a brief
+missing-path window; it never truncates a served module or restarts the backend.
+
+UI mode serializes asynchronous CSS replacements per stylesheet, respecting
+[Firefox's CSSOM modification lock](https://bugzilla.mozilla.org/show_bug.cgi?id=1932508#c3)
+during rapid hot updates. Genuine stylesheet errors remain visible, and production
+mode does not patch browser stylesheet APIs.
+
+Bun's browser HMR runs **without `--hot` or `--watch`** on the server. Existing
+draft storage owns unsent text and attachments; an HMR-scoped guard preserves
+composer focus, selection and scroll across eligible React remounts without
+sending or cancelling anything. Arbitrary React edits can still force a full
+page reload, which loses memory-only images, text-file attachments and unfinished
+uploads. Finish or remove those attachments before a deliberate full reload.
+
+Stop with Ctrl+C: cleanup removes only this secondary link, web subtree and
+temporary snapshot. The production link, daemon, native tasks, checkout and
+dependencies remain. A forced kill can leave a disposable snapshot or secondary
+link; do not remove a primary link to clean it up.
+
+This is a trusted-developer workflow, not a code sandbox. Source symlinks,
+traversal, test artifacts, private state files and `.env` files are not copied.
+It requires the full checkout, not an npm package or single-binary archive.
+Production builds keep this mode off. Never rebuild `dist/` inside a running
+installation to publish GUI edits; review and deploy the finished changes
+separately.
+
+### Automating the Windows GUI service
+
+Run these commands from a full checkout with Node.js 24+, installed dependencies,
+and the .NET 8 SDK when rebuilding the native tray:
+
+```bash
+npm run ui:build -- --verify     # Native/client build, typecheck, lint, tests and smoke
+npm run ui:stage                # Build and create a verified, content-addressed package
+npm run ui:deploy -- --dry-run  # Inspect promotion without changing the running app
+npm run ui:deploy              # Promote this checkout as the normal GUI service
+npm run ui:status              # Health, active channel, source and installed package
+npm run ui:launch              # Launch saved configuration; already-running is a no-op
+npm run ui:rollback -- --dry-run
+npm run ui:rollback            # Restore the previous web-only deployment
+```
+
+The normal service must already have its independent host daemon and valid
+primary link. Deployment reuses that exact link/token without modifying it,
+saves `mode: "ui"` and this checkout's `uiSource` in `web-service.json`, and
+replaces only the matching web supervisor. The daemon, native OMP processes and
+host autostart task are not stopped or reinstalled. The first cutover still
+requires browsers to refresh once; eligible later GUI edits use HMR.
+
+For an **existing** trusted Tailscale Serve HTTPS endpoint:
+
+```bash
+npm run ui:deploy -- --public-url https://ompweb.example.ts.net:8445 --proxy-port 30179 --dry-run
+npm run ui:deploy -- --public-url https://ompweb.example.ts.net:8445 --proxy-port 30179
+```
+
+Only that endpoint's existing loopback root proxy is changed; unrelated routes
+are preserved and Funnel is refused. The ingress survives Main/fork switches.
+Main remains the normal upstream build, while the fork uses GUI HMR. Saved mode,
+source, bind and ingress settings survive ordinary tray, in-app and logon
+restarts. Only a complete checkout can be `uiSource`; keep it and its installed
+dependencies available while the service uses them.
+The saved `autoRestart` policy still handles web-process failures; eligible GUI
+edits themselves never restart that process. A failure-triggered service restart,
+like an explicit restart, takes a new snapshot of the checkout.
+
+`ui:deploy` builds before touching live state, stages a hashed runtime outside the
+checkout, retargets the existing global package **junction**, and updates only
+matching web shortcuts/task registrations. It refuses an ordinary directory
+instead of deleting it. Private per-profile receipts retain the previous
+configuration, registrations and route for guarded automatic/manual rollback.
+Rollback refuses to overwrite subsequent unrelated changes.
+
+Use `--config <absolute-file>` for a different profile. A custom-config deploy
+also requires `--service-root <owned-package-junction>` so a fixture cannot
+silently replace the normal global installation. `ui:launch`/`ui:status` accept
+the same explicit junction. Rollback gets its junction from its receipt;
+`--deployment <receipt-id>` selects an older receipt.
+
+Native builds are reused only when their inputs and executable hashes match.
+Build/stage receipts and intermediate files live under ignored
+`build/ui-release/`; release checks run in an isolated temporary profile.
+Staged runtime files are immutable, but `node_modules` deliberately shares this
+checkout's dependency directory. Do not change dependencies in a running
+installation. Forced Windows process termination can leave a disposable GUI
+snapshot; never remove an active snapshot or a primary host link to clean it up.
+
+Publishing is a separate, explicit operation:
+
+```bash
+npm run ui:publish -- --dry-run
+# Review and commit source plus the rebuilt tracked tray executable first.
+npm run ui:publish -- --reviewed-head <full-commit-sha>
+```
+
+Publication always runs the complete checks, requires an unchanged clean commit,
+and pushes only that commit to `main` in the GitHub fork declared by
+`package.json`. An upstream `origin` is never used as the destination. An
+explicit `--remote` must match the declared fork. It does not commit, force-push,
+create tags, publish to npm, or deploy. All `--dry-run` commands leave files,
+services, routes and publication untouched.
+
 
 ### Checks
 
 ```bash
 npm run typecheck   # Type check (TypeScript)
 npm run lint        # ESLint
-npm test            # Run test suite (bun test)
+npm test            # File-isolated Bun tests, one worker and one concurrent case
 ```
 
 ## License & Credits

@@ -26,16 +26,13 @@ const ALL_OPTIONS: ReadonlyArray<ThemeOption> = [
   { value: "system", name: "System", bg: "transparent", accent: "var(--accent)", category: "system" as const },
 ];
 
-/** Theme picker for the top bar. Shows the current mode icon and opens a
- * small menu to pick light / dark / omp midnight / system directly, with
- * full keyboard support:
+/** Browser theme picker for settings, with full keyboard support:
  *   - Enter / Space / ↓ : open
  *   - Arrow Up / Down    : move selection
  *   - Home / End         : first / last item
  *   - Enter              : choose focused item
- *   - Escape             : close, return focus to trigger
- * Styled to match the adjacent language switcher. */
-export function ThemeSwitcher() {
+ *   - Escape             : close, return focus to trigger */
+export function ThemeSwitcher(buttonProps: Pick<React.ButtonHTMLAttributes<HTMLButtonElement>, "id" | "aria-label" | "aria-labelledby" | "aria-describedby">) {
   const { isDark, preference, setTheme } = useTheme();
   const { t } = useI18n();
   const isMobile = useIsMobile();
@@ -52,8 +49,7 @@ export function ThemeSwitcher() {
     if (!open) setActiveIndex(index);
   }, [index, open]);
 
-  // Fixed positioning escapes the compact top-bar overflow strip, whose
-  // horizontal scroller would otherwise clip the menu to its 48px height.
+  // Fixed positioning keeps the menu outside the scrolling settings panel.
   const menuPos = useFixedMenuPosition(open, triggerRef, isMobile ? 220 : 350);
   const menuShown = menuPos !== null;
 
@@ -144,6 +140,7 @@ export function ThemeSwitcher() {
       }}
     >
       <button
+        {...buttonProps}
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -209,10 +206,8 @@ export function ThemeSwitcher() {
               flexDirection: isMobile ? "column" : undefined,
               gridTemplateColumns: isMobile ? undefined : "1fr 1fr",
               gap: isMobile ? 4 : 8,
-              // Desktop previously had no cap, so on short viewports the
-              // fixed-position menu clipped its bottom themes with no way
-              // to scroll to them. Cap against the viewport, as on mobile.
-              maxHeight: isMobile ? 380 : "calc(100vh - 56px)",
+              // Reserve space below the settings trigger, not the whole viewport.
+              maxHeight: `min(${isMobile ? "380px" : "100vh"}, calc(100vh / var(--ui-scale) - ${menuPos.top}px - 24px))`,
               overflowY: "auto",
             }}
           >

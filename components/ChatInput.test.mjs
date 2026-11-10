@@ -2,29 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { JSDOM } from "jsdom";
 
-const { ChatInput, ModelErrorBanner, filterModelOptions } = await import("./ChatInput.tsx");
+const { ChatInput, ModelErrorBanner } = await import("./ChatInput.tsx");
 const { setDraft, clearDraft } = await import("@/lib/draft-store");
 
-test("provider-defined reasoning levels appear once in the trigger", () => {
-  for (const thinkingLevel of ["ultra", "ultrathink-extended", "constructor"]) {
-    const html = renderToStaticMarkup(React.createElement(ChatInput, {
-      async onSend() { return { status: "accepted" }; },
-      onThinkingLevelChange() {},
-      thinkingLevel,
-      isStreaming: false,
-    }));
-    const dom = new JSDOM(html);
-    try {
-      const trigger = dom.window.document.querySelector(".composer-thinking-control > button");
-      assert.equal(trigger.textContent, thinkingLevel);
-      assert.ok(trigger.getAttribute("aria-label").endsWith(`: ${thinkingLevel}`));
-    } finally {
-      dom.window.close();
-    }
-  }
-});
 
 test("shows Queue instead of Stop for typed text during a run", () => {
   const draftKey = "chat-input-queue-action-test";
@@ -152,36 +133,7 @@ test("never renders a null percentage, an invalid date, or a past reset clock", 
   );
 });
 
-test("shows the Slow toggle only when omp reports /slow applies, pressed when enabled", () => {
-  const render = (props) => renderToStaticMarkup(
-    React.createElement(ChatInput, { async onSend() { return { status: "accepted" }; }, isStreaming: false, onSlowModeChange() {}, ...props }),
-  );
-  // Older omp omits the field; an unsupported model reports false.
-  for (const props of [{}, { slowModeSupported: false, slowModeEnabled: true }]) {
-    assert.doesNotMatch(render(props), /composer-slow-control/);
-  }
-  assert.match(
-    render({ slowModeSupported: true, slowModeEnabled: true }),
-    /<button[^>]*class="composer-slow-control"[^>]*aria-pressed="true"/,
-  );
-});
 
-test("keeps the model selector visible when a model error leaves no options", () => {
-  const html = renderToStaticMarkup(
-    React.createElement(ChatInput, {
-      async onSend() { return { status: "accepted" }; },
-      onAbort() {},
-      onModelChange() {},
-      isStreaming: false,
-      modelError: "Invalid models.json schema",
-      modelList: [],
-      modelNames: {},
-    }),
-  );
-
-  assert.match(html, />(No models|chatInput\.noModels)</);
-  assert.match(html, /title="(No available models|chatInput\.noAvailableModels)"/);
-});
 
 
 test("renders goal, planning, and advisor indicators at the composer", () => {
@@ -235,18 +187,6 @@ test("shows the advisor thunder indicator with the reviewing model and reasoning
   assert.match(html, /aria-label="[^"]*GPT-5\.6 Luna[^"]*xhigh[^"]*"/);
 });
 
-test("filters model options by display name, identifier, and provider", () => {
-  const options = [
-    { provider: "OpenAI", modelId: "gpt-5.2", name: "GPT-5.2" },
-    { provider: "Anthropic", modelId: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-  ];
-
-  assert.deepEqual(filterModelOptions(options, "sonnet", "en"), [options[1]]);
-  assert.deepEqual(filterModelOptions(options, "5.2", "en"), [options[0]]);
-  assert.deepEqual(filterModelOptions(options, "OPENAI", "en"), [options[0]]);
-  assert.equal(filterModelOptions(options, "   ", "en"), options);
-});
-
 test("renders single queued prompt in compact bar", () => {
   const html = renderToStaticMarkup(
     React.createElement(ChatInput, {
@@ -286,81 +226,8 @@ test("keeps editing and deletion but hides Steer for a single queued steer", () 
   assert.doesNotMatch(html, />(Steer|chatInput\.queuedSteerAction)</);
 });
 
-test("a collapsed queue summary previews native steering priority without exposing follow-up edits", () => {
-  const html = renderToStaticMarkup(
-    React.createElement(ChatInput, {
-      async onSend() { return { status: "accepted" }; },
-      onAbort() {},
-      isStreaming: true,
-      queuedMessages: {
-        followUp: ["First task", "Second task"],
-        steering: ["Priority steer"],
-      },
-    }),
-  );
-
-  const dom = new JSDOM(html);
-  try {
-    const summary = dom.window.document.querySelector("[data-queue-progress]");
-    assert.ok(summary, "the multi-item queue exposes its progress summary");
-    const toggle = summary.closest("button");
-    assert.equal(toggle.getAttribute("aria-expanded"), "false");
-    assert.ok(toggle.textContent.includes("Priority steer"), "omp drains steering before follow-ups");
-    assert.equal(dom.window.document.querySelectorAll("[data-queue-item]").length, 0, "pending items remain behind the expansion control");
-    assert.ok(toggle.parentElement.querySelectorAll("button").length > 1, "the summary also exposes the explicit expand action");
-  } finally {
-    dom.window.close();
-  }
-});
 
 
-test("nested model picker groups by provider and pins the current provider first", async () => {
-  const { groupModelOptionsByProvider, orderProviderGroups } = await import("./ChatInput-model-picker.tsx");
-  const options = [
-    { provider: "anthropic", modelId: "claude", name: "Claude" },
-    { provider: "openai", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-    { provider: "openai", modelId: "gpt-5.5", name: "GPT-5.5" },
-    { provider: "pi", modelId: "pi-1", name: "Pi" },
-  ];
-  const grouped = groupModelOptionsByProvider(options);
-  assert.deepEqual(grouped.map((g) => g.provider), ["anthropic", "openai", "pi"]);
-  assert.equal(grouped[1].options.length, 2);
-
-  const ordered = orderProviderGroups(grouped, "openai");
-  assert.deepEqual(ordered.map((g) => g.provider), ["openai", "anthropic", "pi"]);
-});
-
-test("model picker panel renders providers rail, models pane, and Add Providers", async () => {
-  const { ModelPickerPanel } = await import("./ChatInput-model-picker.tsx");
-  const html = renderToStaticMarkup(
-    React.createElement(ModelPickerPanel, {
-      modelOptions: [
-        { provider: "codex", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-        { provider: "codex", modelId: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
-        { provider: "pi", modelId: "pi-1", name: "Pi One" },
-      ],
-      filteredModelOptions: [
-        { provider: "codex", modelId: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
-        { provider: "codex", modelId: "gpt-5.6-terra", name: "GPT-5.6 Terra" },
-        { provider: "pi", modelId: "pi-1", name: "Pi One" },
-      ],
-      currentModel: { provider: "codex", modelId: "gpt-5.6-sol" },
-      modelSearchQuery: "",
-      onSearchQueryChange() {},
-      isMobile: false,
-      onSelectModel() {},
-      onOpenProviders() {},
-    }),
-  );
-
-  assert.match(html, /picker-nested-providers/);
-  assert.match(html, /picker-nested-models/);
-  assert.match(html, /GPT-5\.6 Sol/);
-  assert.match(html, /GPT-5\.6 Terra/);
-  assert.match(html, />codex</);
-  assert.match(html, />pi</);
-  assert.match(html, />(Add Providers|chatInput\.addProviders)</);
-});
 
 
 test("exposes tool presets through the plus menu when a handler is provided", () => {

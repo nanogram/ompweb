@@ -1,9 +1,10 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
-import { Check, ChevronLeft, ChevronRight, Plus, Search } from "lucide-react";
+import React, { useCallback, useLayoutEffect, useMemo, useRef } from "react";
+import { Check } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
-import { providerInitials } from "./ModelsConfig-types";
+import { displayThinkingLevel, selectableThinkingLevels } from "@/lib/thinking-levels";
+import { ThinkingGlyph } from "./ThinkingGlyph";
 import type { ModelOption } from "./ChatInput-model-options";
 
 export interface ProviderModelGroup {
@@ -26,10 +27,10 @@ export function groupModelOptionsByProvider(options: ModelOption[]): ProviderMod
   return groups;
 }
 
-/** Current model's provider first so the picker opens on what you're already using. */
+/** Keep the current provider's models nearest the start of the list. */
 export function orderProviderGroups(groups: ProviderModelGroup[], currentProvider: string | null | undefined): ProviderModelGroup[] {
   if (!currentProvider) return groups;
-  const index = groups.findIndex((g) => g.provider === currentProvider);
+  const index = groups.findIndex((group) => group.provider === currentProvider);
   if (index <= 0) return groups;
   const next = [...groups];
   const [active] = next.splice(index, 1);
@@ -37,224 +38,107 @@ export function orderProviderGroups(groups: ProviderModelGroup[], currentProvide
   return next;
 }
 
-export function ProviderBadge({ id, size = 16 }: { id: string; size?: number }) {
-  return (
-    <span
-      aria-hidden="true"
-      style={{
-        width: size,
-        height: size,
-        border: "1px solid var(--border)",
-        borderRadius: 4,
-        color: "var(--text-dim)",
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        flexShrink: 0,
-        fontSize: Math.max(8, Math.floor(size * 0.42)),
-        fontWeight: 700,
-        lineHeight: 1,
-      }}
-    >
-      {providerInitials(id)}
-    </span>
-  );
-}
-
 export interface ModelPickerPanelProps {
-  /** All visible options (already filtered by composer-picker visibility). */
   modelOptions: ModelOption[];
-  /** Options matching the current search query. */
-  filteredModelOptions: ModelOption[];
   currentModel?: { provider: string; modelId: string } | null;
-  modelSearchQuery: string;
-  onSearchQueryChange: (query: string) => void;
-  searchInputRef?: React.RefObject<HTMLInputElement | null>;
   showModelsLoading?: boolean;
-  isMobile?: boolean;
-  onSelectModel: (provider: string, modelId: string) => void;
-  onOpenProviders?: () => void;
+  onSelectModel?: (provider: string, modelId: string) => void;
+  thinkingLevel?: string;
+  availableThinkingLevels?: string[] | null;
+  thinkingLevelMap?: Record<string, string | null> | null;
+  onSelectThinkingLevel?: (level: string) => void;
+  selectionPending?: boolean;
   onClose?: () => void;
 }
 
-/**
- * Codex-style nested model picker: providers on the right rail, that
- * provider's models on the left. Search flattens across providers.
- */
 export function ModelPickerPanel({
-  modelOptions,
-  filteredModelOptions,
-  currentModel,
-  modelSearchQuery,
-  onSearchQueryChange,
-  searchInputRef,
-  showModelsLoading,
-  isMobile,
-  onSelectModel,
-  onOpenProviders,
+  modelOptions, currentModel, showModelsLoading,
+  onSelectModel, thinkingLevel = "auto", availableThinkingLevels,
+  thinkingLevelMap, onSelectThinkingLevel, selectionPending = false,
   onClose,
 }: ModelPickerPanelProps) {
   const { t } = useI18n();
-  const searching = modelSearchQuery.trim().length > 0;
+  const modelsRef = useRef<HTMLDivElement>(null);
+  const reasoningRef = useRef<HTMLDivElement>(null);
+  const wasPending = useRef(selectionPending);
   const groups = useMemo(
     () => orderProviderGroups(groupModelOptionsByProvider(modelOptions), currentModel?.provider),
     [modelOptions, currentModel?.provider],
   );
-  const filteredGroups = useMemo(
-    () => orderProviderGroups(groupModelOptionsByProvider(filteredModelOptions), currentModel?.provider),
-    [filteredModelOptions, currentModel?.provider],
-  );
+  const levels = useMemo(() => selectableThinkingLevels(availableThinkingLevels), [availableThinkingLevels]);
 
-  // Provider selection is explicit. Hover-driven pane changes make the list
-  // flicker while the pointer crosses the picker.
-  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
-  const selectedProviderAvailable = groups.some((group) => group.provider === selectedProvider);
-  const currentProviderAvailable = groups.some((group) => group.provider === currentModel?.provider);
-  const activeProvider = selectedProviderAvailable
-    ? selectedProvider
-    : currentProviderAvailable
-      ? currentModel?.provider ?? null
-      : groups[0]?.provider ?? null;
-
-  const leftModels = searching
-    ? filteredModelOptions
-    : (groups.find((group) => group.provider === activeProvider)?.options ?? []);
-
-  const leftGroups = searching ? filteredGroups : null;
-  const showProviderRail = !searching && (!isMobile || selectedProvider === null);
-  const showModelPane = searching || !isMobile || selectedProvider !== null;
-
-  const selectModel = (opt: ModelOption) => {
-    onSelectModel(opt.provider, opt.modelId);
-  };
-
-  const renderModelRow = (opt: ModelOption, opts?: { showProvider?: boolean }) => {
-    const isActive = Boolean(currentModel)
-      && opt.modelId === currentModel?.modelId
-      && opt.provider === currentModel?.provider;
-    return (
-      <button
-        className="picker-row"
-        data-active={isActive}
-        type="button"
-        key={`${opt.provider}:${opt.modelId}`}
-        role="menuitemradio"
-        aria-checked={isActive}
-        onClick={() => selectModel(opt)}
-      >
-        <span className="picker-check">{isActive && <Check size={11} strokeWidth={2.4} aria-hidden="true" />}</span>
-        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {opt.name || opt.modelId}
-        </span>
-        {opts?.showProvider && (
-          <span className="picker-row-meta">{opt.provider}</span>
-        )}
-      </button>
-    );
+  const focusPane = useCallback((pane: HTMLDivElement | null) => {
+    const options = Array.from(pane?.querySelectorAll<HTMLButtonElement>('button[role="menuitemradio"]:not(:disabled)') ?? []);
+    const selected = options.find((option) => option.getAttribute("aria-checked") === "true");
+    (selected ?? options[0])?.focus();
+  }, []);
+  useLayoutEffect(() => {
+    const completed = wasPending.current && !selectionPending;
+    wasPending.current = selectionPending;
+    const active = document.activeElement;
+    if (completed && (active === document.body || (active && modelsRef.current?.contains(active)))) {
+      focusPane(reasoningRef.current);
+    }
+  }, [selectionPending, focusPane]);
+  const navigate = (event: React.KeyboardEvent<HTMLDivElement>, pane: HTMLDivElement | null) => {
+    const options = Array.from(pane?.querySelectorAll<HTMLButtonElement>('button[role="menuitemradio"]:not(:disabled)') ?? []);
+    const index = options.indexOf(event.target as HTMLButtonElement);
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      focusPane(event.key === "ArrowRight" ? reasoningRef.current : modelsRef.current);
+    } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1
+        : event.key === "ArrowDown" ? (index + 1) % options.length : (index - 1 + options.length) % options.length;
+      options[next]?.focus();
+    }
   };
 
   return (
-    <>
-      <label className="picker-search">
-        <Search size={13} strokeWidth={1.8} color="var(--text-dim)" aria-hidden="true" />
-        <input
-          ref={searchInputRef}
-          type="search"
-          autoComplete="off"
-          spellCheck={false}
-          value={modelSearchQuery}
-          onChange={(e) => onSearchQueryChange(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              onClose?.();
-            }
-          }}
-          placeholder={t("chatInput.searchModels")}
-          aria-label={t("chatInput.searchModels")}
-        />
-      </label>
-
-      <div className="picker-nested" data-searching={searching ? "true" : "false"}>
-        {showProviderRail && (
-          <div className="picker-nested-providers" role="group" aria-label={t("chatInput.providersLabel")}>
-            {groups.length === 0 ? (
-              <div className="picker-empty">
-                {showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noAvailableModels")}
-              </div>
-            ) : groups.map((group) => {
-              const isCurrent = currentModel?.provider === group.provider;
-              const isActive = activeProvider === group.provider;
-              return (
-                <button
-                  key={group.provider}
-                  type="button"
-                  className="picker-row picker-provider-row"
-                  data-active={isActive}
-                  data-current={isCurrent}
-                  onClick={() => setSelectedProvider(group.provider)}
-                  aria-current={isCurrent ? "true" : undefined}
-                  aria-controls="model-picker-options"
-                >
-                  <ProviderBadge id={group.provider} size={15} />
-                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {group.provider}
-                  </span>
-                  <ChevronRight size={12} strokeWidth={1.8} style={{ marginLeft: "auto", flexShrink: 0, opacity: 0.55 }} aria-hidden="true" />
-                </button>
-              );
+    <div className="picker-model-reasoning-content" onKeyDown={(event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onClose?.();
+      }
+    }}>
+      {selectionPending && <div className="picker-update-status" role="status">{t("chatInput.updatingModel")}</div>}
+      <div className="picker-nested" aria-busy={selectionPending}>
+        <div ref={modelsRef} className="picker-nested-models" role="menu" aria-label={t("chatInput.modelsLabel")}
+          onKeyDown={(event) => navigate(event, modelsRef.current)}>
+          <div className="picker-pane-title">{t("chatInput.modelsLabel")}</div>
+          {groups.length === 0 ? <div className="picker-empty">{showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noAvailableModels")}</div>
+            : groups.map((group) => <React.Fragment key={group.provider}>
+              <div className="picker-group-label">{group.provider}</div>
+              {group.options.map((option) => {
+                const active = option.provider === currentModel?.provider && option.modelId === currentModel?.modelId;
+                return <button key={`${option.provider}:${option.modelId}`} type="button" className="picker-row"
+                  role="menuitemradio" aria-checked={active} data-active={active}
+                  disabled={selectionPending || !onSelectModel}
+                  onClick={() => { if (!selectionPending) onSelectModel?.(option.provider, option.modelId); }}>
+                  <span className="picker-check">{active && <Check size={11} strokeWidth={2.4} aria-hidden="true" />}</span>
+                  <span className="picker-option-label" title={option.name || option.modelId}>{option.name || option.modelId}</span>
+                </button>;
+              })}
+            </React.Fragment>)}
+        </div>
+        <div ref={reasoningRef} className="picker-nested-reasoning" role="menu" aria-label={t("chatInput.reasoningLabel")}
+          onKeyDown={(event) => navigate(event, reasoningRef.current)}>
+          <div className="picker-pane-title">{t("chatInput.reasoningLabel")}</div>
+          {!onSelectThinkingLevel ? <div className="picker-empty">{t("chatInput.reasoningUnavailable")}</div>
+            : levels.map((level) => {
+              const active = level === thinkingLevel;
+              const label = displayThinkingLevel(level, thinkingLevelMap);
+              return <button key={level} type="button" className="picker-row" role="menuitemradio"
+                aria-checked={active} data-active={active} disabled={selectionPending}
+                onClick={() => { if (!selectionPending) onSelectThinkingLevel(level); }}>
+                <span className="picker-check">{active && <Check size={11} strokeWidth={2.4} aria-hidden="true" />}</span>
+                <ThinkingGlyph level={level} />
+                <span className="picker-option-label" title={label}>{label}</span>
+              </button>;
             })}
-          </div>
-        )}
-        {showModelPane && (
-          <div id="model-picker-options" className="picker-nested-models" role="group" aria-label={t("chatInput.modelsLabel")}>
-            {isMobile && !searching && selectedProvider !== null && (
-              <button
-                type="button"
-                className="picker-row"
-                onClick={() => setSelectedProvider(null)}
-                style={{ color: "var(--text-muted)" }}
-              >
-                <ChevronLeft size={13} strokeWidth={1.8} aria-hidden="true" />
-                <span>{activeProvider}</span>
-              </button>
-            )}
-            {searching ? (
-              leftGroups && leftGroups.length > 0 ? (
-                leftGroups.map((group) => (
-                  <div key={group.provider}>
-                    <div className="picker-group-label">{group.provider}</div>
-                    {group.options.map((opt) => renderModelRow(opt))}
-                  </div>
-                ))
-              ) : (
-                <div className="picker-empty">
-                  {showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noMatchingModels")}
-                </div>
-              )
-            ) : leftModels.length === 0 ? (
-              <div className="picker-empty">
-                {showModelsLoading ? t("chatInput.loadingModels") : t("chatInput.noAvailableModels")}
-              </div>
-            ) : (
-              leftModels.map((opt) => renderModelRow(opt))
-            )}
-          </div>
-        )}
+        </div>
       </div>
-
-      {onOpenProviders && (
-        <button
-          type="button"
-          className="picker-row picker-add-providers"
-          onClick={() => {
-            onOpenProviders();
-          }}
-        >
-          <Plus size={13} strokeWidth={1.8} aria-hidden="true" />
-          <span>{t("chatInput.addProviders")}</span>
-        </button>
-      )}
-    </>
+    </div>
   );
 }

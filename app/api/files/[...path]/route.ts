@@ -8,12 +8,14 @@ import {
   getAudioMime,
   getDocumentMime,
   getImageMime,
+  getVideoMime,
 } from "@/lib/file-types";
 import { parseUploadConflictStrategy } from "@/lib/file-upload";
 import { parseJsonWithinLimit } from "@/lib/bounded-form-data";
 import { publishWorkspaceUpload, uploadErrorResponse } from "@/lib/uploads";
 import { requestOwner } from "@/lib/web-auth";
 import { isRecord } from "@/lib/type-guards";
+import { openNativeFile } from "@/lib/native-file-open";
 
 
 const FILE_REQUEST_TYPES = ["list", "read", "download", "meta", "preview"] as const;
@@ -32,14 +34,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ pat
     const directory = filePathFromSegments(segments);
     const { searchParams } = new URL(request.url);
     const type = searchParams.get("type") ?? "upload";
-    if (type !== "upload" && type !== "upload-check") return Response.json({ error: "Invalid upload request type", code: "invalid_upload_type" }, { status: 400 });
-    const body: unknown = await parseJsonWithinLimit(request, MAX_UPLOAD_CHECK_REQUEST_BYTES);
+    if (type !== "upload" && type !== "upload-check" && type !== "open-native") return Response.json({ error: "Invalid file action", code: "invalid_upload_type" }, { status: 400 });
+    const body: unknown = await parseJsonWithinLimit(request, type === "open-native" ? 8192 : MAX_UPLOAD_CHECK_REQUEST_BYTES);
     if (!isRecord(body) || (body.hostId !== undefined && typeof body.hostId !== "string")) return Response.json({ error: "Invalid upload request", code: "invalid_request" }, { status: 400 });
     const queryHost = searchParams.get("hostId");
     if (queryHost && body.hostId && queryHost !== body.hostId) return Response.json({ error: "Host mismatch", code: "workspace_host_mismatch" }, { status: 409 });
     const resolved = await resolveWorkspaceHost(queryHost ?? body.hostId as string | undefined, searchParams.get("sessionId"));
     if ("response" in resolved) return resolved.response;
     const { host } = resolved;
+    if (type === "open-native") {
+      if (host.id !== "local") return Response.json({ error: "System applications can only open files on the computer running OMPweb, not on a linked host", code: "native_open_remote_host" }, { status: 403 });
+      const checked = await host.workspaceOps.fileInfo({ segments, sessionId: resolved.sessionId, sessionFile: resolved.sessionFile });
+      if (!checked.ok) return opErrorResponse(checked);
+      await openNativeFile(checked.value);
+      return Response.json({ opened: true }, { headers: { "Cache-Control": "no-store" } });
+    }
     let names: string[];
     const files = body.uploads;
     if (type === "upload-check") {
@@ -153,11 +162,12 @@ export async function GET(
     if (!checked.ok) return opErrorResponse(checked);
     const info = checked.value;
     if (info.isDirectory) return Response.json({ error: "Not a file", code: "not_a_file" }, { status: 400 });
-    if (type === "meta") return Response.json({ size: info.size, language: info.language, mime: info.mime, previewKind: info.previewKind });
     const image = getImageMime(info.path);
+    const video = getVideoMime(info.path);
     const audio = getAudioMime(info.path);
     const document = getDocumentMime(info.path);
-    if (type === "read" && !image && !audio && !document) {
+    if (type === "meta") return Response.json({ size: info.size, language: info.language, mime: image ?? video ?? audio ?? document ?? info.mime, previewKind: info.previewKind });
+    if (type === "read" && !image && !video && !audio && !document) {
       const result = await host.workspaceOps.readTextFile(input);
       return result.ok ? Response.json(result.value) : opErrorResponse(result);
     }
@@ -181,7 +191,7 @@ export async function GET(
         "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
       } });
     }
-    return streamWorkspaceFile(host, opened.value, image ?? audio ?? document ?? "application/octet-stream", request.headers.get("range"), type === "download");
+    return streamWorkspaceFile(host, opened.value, image ?? video ?? audio ?? document ?? "application/octet-stream", request.headers.get("range"), type === "download");
   } catch (error) {
     return apiErrorResponse(error);
   }

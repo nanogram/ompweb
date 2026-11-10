@@ -10,6 +10,8 @@ type Props = {
   onSelectSession: (session: SessionInfo) => void;
   onNewSession: () => void;
   currentModel?: string | null;
+  directorWorkspaceCwd?: string;
+  newSessionDisabled?: boolean;
 };
 
 /**

@@ -64,7 +64,7 @@ export function joinFilePath(parent: string, child: string): string {
 }
 export function getFileApiUrl(
   filePath: string,
-  type: "list" | "read" | "download" | "meta" | "preview",
+  type: "list" | "read" | "download" | "meta" | "preview" | "open-native",
   hostId: string,
   sourceSessionId?: string | null,
   params: Record<string, string | number | undefined> = {},

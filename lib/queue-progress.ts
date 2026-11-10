@@ -457,19 +457,17 @@ function publicItem(entry: Entry): QueueProgressItem {
 }
 
 export interface QueuePanelItem extends QueueProgressItem {
+  status: "queued";
   /** The first chip with its text in omp's queue, so Edit/Delete/Steer act on it. */
   actionable: boolean;
 }
 
 /**
- * What the composer's queue panel lists: the ledger's batch, with omp's own
- * queue snapshot deciding which pending items can still be edited. A chip the
- * ledger has not reported yet (HTTP and SSE can reorder) still shows, so the
- * panel never hides something omp will run.
- *
- * omp's queue commands carry only the text and act on the first match, so of
- * several identical pending items only the first offers them; a departed item
- * left omp's queue and never claims a chip.
+ * The composer lists only messages omp still holds. Progress supplies stable
+ * IDs, not a second copy of consumed/running/finished transcript messages.
+ * Native snapshots win when queue and ledger frames arrive in either order.
+ * Equal texts remain separate occurrences; only the first is actionable
+ * because omp's queue commands remove/promote the first matching text.
  */
 export function buildQueuePanelItems(progress: QueueProgressSnapshot | null, queue: QueuedMessages | null): QueuePanelItem[] {
   const chips: Record<QueueName, readonly string[]> = { steering: queue?.steering ?? [], followUp: queue?.followUp ?? [] };
@@ -478,13 +476,14 @@ export function buildQueuePanelItems(progress: QueueProgressSnapshot | null, que
     followUp: chips.followUp.map(() => false),
   };
   const firstOfText = (name: QueueName, index: number) => chips[name].indexOf(chips[name][index]) === index;
-  const items: QueuePanelItem[] = (progress?.items ?? []).map((item) => {
-    if (item.status !== "queued" || item.departed) return { ...item, actionable: false };
+  const items: QueuePanelItem[] = [];
+  for (const item of progress?.items ?? []) {
+    if (item.status !== "queued" || item.departed) continue;
     const index = chips[item.queue].findIndex((text, position) => !claimed[item.queue][position] && text === item.text);
-    if (index < 0) return { ...item, actionable: false };
+    if (index < 0) continue;
     claimed[item.queue][index] = true;
-    return { ...item, actionable: firstOfText(item.queue, index) };
-  });
+    items.push({ ...item, status: "queued", actionable: firstOfText(item.queue, index) });
+  }
   for (const name of QUEUES) {
     chips[name].forEach((text, index) => {
       if (claimed[name][index]) return;

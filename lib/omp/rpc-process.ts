@@ -142,7 +142,7 @@ export class RpcProcess {
   private nextId = 1;
   // An adopted child may still answer the previous server's commands; a fresh prefix per process keeps those
   // late answers from settling this process's commands with the same number.
-  private readonly idPrefix = `w${crypto.randomUUID().slice(0, 8)}-`;
+  private readonly idPrefix = `w${crypto.randomUUID()}-`;
   private stderrTail = "";
   private exited = false;
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
@@ -341,8 +341,9 @@ export class RpcProcess {
    * cap pass `timeoutMs` (>0); when set, the timer is unref'd so it never
    * keeps the event loop alive on its own. `onReply` runs synchronously when
    * the response is read, before any frame after it is dispatched; it is told whether the command succeeded and its
-   * wire id (what omp's `prompt_result` names). */
-  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, onReply?: (success: boolean, id: string, data: unknown) => void): Promise<T> {
+   * wire id (what omp's `prompt_result` names). `onDispatch` runs before the frame can be written;
+   * throwing from it prevents the write (durable callers must persist correlation first). */
+  sendCommand<T = unknown>(command: { type: string; [key: string]: unknown }, timeoutMs?: number, onReply?: (success: boolean, id: string, data: unknown) => void, onDispatch?: (id: string) => void): Promise<T> {
     if (this.exited) {
       return Promise.reject(new Error("omp RPC process has exited"));
     }
@@ -362,6 +363,7 @@ export class RpcProcess {
       this.recentCommandTypes.delete(oldestQueryId ?? this.recentCommandTypes.keys().next().value!);
     }
     return new Promise<T>((resolve, reject) => {
+      onDispatch?.(id);
       const entry: PendingCommand = {
         command: command.type,
         resolve: resolve as (data: unknown) => void,

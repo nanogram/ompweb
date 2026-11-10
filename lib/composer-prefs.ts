@@ -3,6 +3,8 @@
  * native OMP config because they are ompweb UI behaviors.
  */
 
+import { useSyncExternalStore } from "react";
+
 export type SubmitDuringRunBehavior = "steer" | "queue";
 
 const SUBMIT_DURING_RUN_KEY = "omp-web:submit-during-run";
@@ -74,4 +76,46 @@ export function setWordCompletionMode(mode: WordCompletionMode): void {
 export function isWordCompletionEnabled(mode: WordCompletionMode = getWordCompletionMode()): boolean {
   if (mode !== "auto") return mode === "on";
   return typeof window !== "undefined" && window.matchMedia("(pointer: fine)").matches;
+}
+
+const SLOW_MODE_CONTROL_KEY = "omp-web:slow-mode-control-visible";
+let unsavedSlowModeControl: boolean | null = null;
+
+/** Browser UI visibility only; never changes OMP's native /slow setting. */
+export function getSlowModeControlVisible(): boolean {
+  if (typeof window === "undefined") return false;
+  if (unsavedSlowModeControl !== null) return unsavedSlowModeControl;
+  try {
+    return window.localStorage.getItem(SLOW_MODE_CONTROL_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+export function setSlowModeControlVisible(visible: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(SLOW_MODE_CONTROL_KEY, visible ? "on" : "off");
+    unsavedSlowModeControl = null;
+  } catch {
+    // Match other visibility preferences: retain the choice for this page load.
+    unsavedSlowModeControl = visible;
+  }
+  window.dispatchEvent(new Event(SLOW_MODE_CONTROL_KEY));
+}
+
+function subscribeSlowModeControl(onChange: () => void): () => void {
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === null || event.key === SLOW_MODE_CONTROL_KEY) onChange();
+  };
+  window.addEventListener(SLOW_MODE_CONTROL_KEY, onChange);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(SLOW_MODE_CONTROL_KEY, onChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
+export function useSlowModeControlVisible(): boolean {
+  return useSyncExternalStore(subscribeSlowModeControl, getSlowModeControlVisible, () => false);
 }

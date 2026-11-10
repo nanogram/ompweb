@@ -12,7 +12,7 @@ import { STAGED_MAX_AGE_MS } from "./hosts/uploads";
 import { validateAgentImages, MAX_AGENT_COMMAND_REQUEST_BYTES, MAX_ATTACHED_IMAGE_BYTES, MAX_TOTAL_ATTACHED_IMAGE_BYTES, MAX_ATTACHED_IMAGES, getBase64DecodedByteLength } from "./image-attachments";
 import { listArchivedSessions } from "./omp/archive";
 import { getAgentDir } from "./omp/paths";
-import { getRpcSession, getRpcSessionKeys, nativeWriteStarted, onSessionMove, tapSessionFrames, type AgentEvent, type AgentSessionWrapper } from "./rpc-manager";
+import { getRpcSession, getRpcSessionKeys, nativeWriteStarted, onSessionMove, tapNativeMessageCommands, tapSessionFrames, type AgentEvent, type AgentSessionWrapper, type NativeMessageCommandEvent } from "./rpc-manager";
 import { isRecord } from "./type-guards";
 import type { OutboxEntry, OutboxMode } from "./types";
 import { MAX_UPLOADS_PER_MESSAGE, UPLOAD_ID_RE } from "./upload-limits";
@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS entries (
   created_at INTEGER NOT NULL,
   dispatch_pid INTEGER,
   payload_bytes INTEGER NOT NULL DEFAULT 0,
+  native_command_id TEXT,
+  native_host_id TEXT,
+  native_command TEXT,
+  native_acknowledged INTEGER NOT NULL DEFAULT 0,
   previous_entry_ids TEXT,
   done_at INTEGER
 );
@@ -57,7 +61,7 @@ CREATE INDEX IF NOT EXISTS entries_session ON entries (session_id, state);
 CREATE TABLE IF NOT EXISTS completed_uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, receipt TEXT NOT NULL, at INTEGER NOT NULL);
 `;
 
-const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor, state, error, may_have_been_sent, created_at, upload_receipts, previous_entry_ids, source_session_id";
+const COLUMNS = "id, session_id, mode, message, images, uploads, owner, advisor, state, error, may_have_been_sent, created_at, upload_receipts, previous_entry_ids, source_session_id, native_command_id, native_host_id, native_command, native_acknowledged";
 
 /** `owner`: the web session whose uploads the entry attaches; `advisor`: the chat's spawn flag at Send. */
 interface Row {
@@ -76,6 +80,10 @@ interface Row {
   may_have_been_sent: number;
   created_at: number;
   previous_entry_ids: string | null;
+  native_command_id: string | null;
+  native_host_id: string | null;
+  native_command: string | null;
+  native_acknowledged: number;
 }
 
 declare global {
@@ -115,7 +123,7 @@ function db(): Database {
     database.transaction(() => {
       database.exec(SCHEMA);
       const columns = database.prepare("PRAGMA table_info(entries)").all() as { name: string }[];
-      for (const [name, type] of [["dispatch_pid", "INTEGER"], ["upload_receipts", "TEXT"], ["payload_bytes", "INTEGER NOT NULL DEFAULT 0"], ["previous_entry_ids", "TEXT"], ["source_session_id", "TEXT"]]) {
+      for (const [name, type] of [["dispatch_pid", "INTEGER"], ["upload_receipts", "TEXT"], ["payload_bytes", "INTEGER NOT NULL DEFAULT 0"], ["previous_entry_ids", "TEXT"], ["source_session_id", "TEXT"], ["native_command_id", "TEXT"], ["native_host_id", "TEXT"], ["native_command", "TEXT"], ["native_acknowledged", "INTEGER NOT NULL DEFAULT 0"]]) {
         if (!columns.some((column) => column.name === name)) database.exec(`ALTER TABLE entries ADD COLUMN ${name} ${type}`);
       }
       const uploadColumns = database.prepare("PRAGMA table_info(completed_uploads)").all() as { name: string }[];
@@ -298,8 +306,10 @@ function setState(id: string, state: OutboxEntry["state"], error: string | null 
 
 /** Delivered, or removed by the user: the id stays (without the message) so a late resend of it (keepalive, Background
  * Sync) is answered instead of added again. */
-function retire(id: string): void {
-  db().prepare("UPDATE entries SET state = 'delivered', message = '', images = NULL, uploads = NULL, upload_receipts = NULL, previous_entry_ids = NULL, error = NULL, done_at = ? WHERE id = ?").run(Date.now(), id);
+function retire(id: string, native?: { id: string; acknowledged: boolean }): boolean {
+  const guard = native ? ` AND native_command_id = ? AND native_acknowledged ${native.acknowledged ? "= 1" : ">= 0"} AND (state = 'delivering' OR (state = 'failed' AND may_have_been_sent = 1))` : "";
+  return db().prepare(`UPDATE entries SET state = 'delivered', message = '', images = NULL, uploads = NULL, upload_receipts = NULL, previous_entry_ids = NULL, native_command_id = NULL, native_host_id = NULL, native_command = NULL, native_acknowledged = 0, may_have_been_sent = 0, dispatch_pid = NULL, error = NULL, done_at = ? WHERE id = ? AND state != 'delivered'${guard}`)
+    .run(Date.now(), id, ...(native ? [native.id] : [])).changes > 0;
 }
 
 const invalid = (error: string) => Response.json({ error, code: "invalid_outbox_entry" }, { status: 400 });
@@ -370,7 +380,7 @@ export async function runOutboxCommand(sessionId: string, command: Record<string
       if (total.bytes + payloadBytes > MAX_OUTBOX_BYTES - 64 * 1024) return false;
       const global = database.prepare("SELECT COALESCE(SUM(payload_bytes), 0) AS bytes, COUNT(*) AS count FROM entries WHERE state != 'delivered'").get() as { bytes: number; count: number };
       if (global.bytes + payloadBytes > MAX_GLOBAL_OUTBOX_BYTES || global.count >= MAX_GLOBAL_OUTBOX_ENTRIES) return false;
-      database.prepare(`INSERT INTO entries (${COLUMNS}, payload_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', NULL, 0, ?, ?, NULL, ?, ?)`).run(
+      database.prepare(`INSERT INTO entries (${COLUMNS}, payload_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'held', NULL, 0, ?, ?, NULL, ?, NULL, NULL, NULL, 0, ?)`).run(
         id, sessionId, mode, message,
         Array.isArray(images) && images.length ? JSON.stringify(images) : null,
         Array.isArray(uploads) && uploads.length ? JSON.stringify(uploads) : null,
@@ -484,8 +494,11 @@ export function startOutbox(): void {
   }
   process.once("exit", closeOutboxStore);
   const detachHello = onHostHello(() => { if (globalThis.__ompOutbox === state && state.started) pumpAll(); });
+  const detachNative = tapNativeMessageCommands((wrapper, event) => {
+    if (globalThis.__ompOutbox === state && state.started && event.type === "reply") onNativeCommand(wrapper, event);
+  });
   const detachFrames = tapSessionFrames((wrapper, event) => {
-    if (globalThis.__ompOutbox === state && state.started) onChildExit(wrapper, event);
+    if (globalThis.__ompOutbox === state && state.started) onSessionFrame(wrapper, event);
   });
   const detachMoves = onSessionMove((from) => {
     if (globalThis.__ompOutbox === state && state.started) publish(from);
@@ -493,6 +506,7 @@ export function startOutbox(): void {
   state.detach = () => {
     process.removeListener("exit", closeOutboxStore);
     detachHello();
+    detachNative();
     detachFrames();
     detachMoves();
   };
@@ -514,6 +528,12 @@ export function startOutbox(): void {
 
 /** A live instance owns its delivery. An orphaned claim is uncertain, never replayed by this dispatcher. */
 function recoverDelivering(sessionId?: string, startup = false): void {
+  // A crash can land between committing a late native success and retiring its uncertain row.
+  const accepted = db().prepare(`SELECT id, session_id FROM entries WHERE state = 'failed' AND may_have_been_sent = 1 AND native_acknowledged = 1 AND native_command_id IS NOT NULL${sessionId ? " AND session_id = ?" : ""}`)
+    .all(...(sessionId ? [sessionId] : [])) as { id: string; session_id: string }[];
+  for (const entry of accepted) {
+    if (retireAcknowledged(entry.id)) publish(entry.session_id);
+  }
   const inFlight = db().prepare(`SELECT id, session_id, dispatch_pid FROM entries WHERE state = 'delivering'${sessionId ? " AND session_id = ?" : ""}`)
     .all(...(sessionId ? [sessionId] : [])) as { id: string; session_id: string; dispatch_pid: number | null }[];
   for (const entry of inFlight) {
@@ -527,15 +547,63 @@ function recoverDelivering(sessionId?: string, startup = false): void {
         if ((error as NodeJS.ErrnoException).code === "EPERM") continue;
       }
     }
-    setState(entry.id, "failed", "omp-web restarted while this message was being delivered", true);
+    // Only a committed successful native response, never a link/broker ACK, confirms this old claim.
+    if (!retireAcknowledged(entry.id)) setState(entry.id, "failed", "omp-web restarted while this message was being delivered", true);
     publish(entry.session_id);
   }
 }
 
-/** Lifecycle bookkeeping only. Text equality is NOT delivery identity, especially after an unknown/lost reply.
- * An entry this process claimed but whose command no wrapper has begun writing is left to its dispatcher, which
- * retries it. */
-function onChildExit(wrapper: AgentSessionWrapper, event: AgentEvent): void {
+/** Commit the actual wrapper's wire identity before its write, including respawns during attachment preparation. */
+function onNativeCommand(wrapper: AgentSessionWrapper, event: NativeMessageCommandEvent, entryId?: string): void {
+  if (event.type === "dispatch") {
+    if (!entryId || outbox().preparing?.get(entryId) !== event.command) throw new Error("This outbox command is no longer being prepared");
+    const bound = db().prepare("UPDATE entries SET native_command_id = ?, native_host_id = ?, native_command = ?, native_acknowledged = 0 WHERE id = ? AND state = 'delivering'")
+      .run(event.id, wrapper.host.id, event.nativeType, entryId);
+    if (!bound.changes) throw new Error("This outbox message is no longer awaiting native dispatch");
+    return;
+  }
+  const keys = sessionKeys(wrapper.sessionId);
+  const entry = db().prepare(`SELECT ${COLUMNS} FROM entries WHERE native_command_id = ? AND native_host_id = ? AND session_id IN (${slots(keys)}) AND (state = 'delivering' OR (state = 'failed' AND may_have_been_sent = 1))`)
+    .get(event.id, wrapper.host.id, ...keys) as Row | null;
+  if (!entry || (event.nativeType !== undefined && entry.native_command !== event.nativeType)) return;
+  if (event.success) {
+    // A prior definite rejection is a fence; a duplicate/contradictory late response cannot undo it.
+    if (entry.native_acknowledged < 0) return;
+    db().prepare("UPDATE entries SET native_acknowledged = 1 WHERE id = ? AND native_command_id = ? AND native_acknowledged >= 0 AND (state = 'delivering' OR (state = 'failed' AND may_have_been_sent = 1))").run(entry.id, event.id);
+    if (entry.state === "failed" && retireAcknowledged(entry.id)) publish(entry.session_id);
+  } else if (entry.native_acknowledged === 0) {
+    // A failure after a successful native response is a run failure, not refusal of its accepted input.
+    const rejected = db().prepare("UPDATE entries SET native_acknowledged = -1 WHERE id = ? AND native_command_id = ? AND native_acknowledged = 0 AND (state = 'delivering' OR (state = 'failed' AND may_have_been_sent = 1))").run(entry.id, event.id);
+    if (rejected.changes && event.error) {
+      db().prepare("UPDATE entries SET state = 'failed', may_have_been_sent = 0, error = ?, previous_entry_ids = NULL WHERE id = ? AND state != 'delivered' AND native_acknowledged = -1")
+        .run(event.error.slice(0, 1024), entry.id);
+      publish(entry.session_id);
+    }
+  }
+}
+
+/** Retire only correlated native acceptance; old uncertain rows without an identity are deliberately untouched. */
+function retireAcknowledged(id: string): boolean {
+  const entry = row(id);
+  if (!entry?.native_command_id || entry.native_acknowledged !== 1
+    || (entry.state !== "delivering" && !(entry.state === "failed" && entry.may_have_been_sent))) return false;
+  return retire(id, { id: entry.native_command_id, acknowledged: true });
+}
+
+/** Text equality is NOT delivery identity. A native terminal success can arrive after failure or web restart;
+ * it settles only the persisted original command on its owning host/session, never a deleted or rejected row.
+ * An entry whose command no wrapper has begun writing is left to its dispatcher, which retries it. */
+function onSessionFrame(wrapper: AgentSessionWrapper, event: AgentEvent): void {
+  if (event.type === "prompt_result" && typeof event.id === "string" && event.status === "completed"
+    && event.agentInvoked !== false && event.success !== false && !event.error) {
+    const keys = sessionKeys(wrapper.sessionId);
+    const accepted = db().prepare(`SELECT id, session_id FROM entries WHERE native_command_id = ? AND native_host_id = ? AND session_id IN (${slots(keys)}) AND native_acknowledged >= 0 AND (state = 'delivering' OR (state = 'failed' AND may_have_been_sent = 1))`)
+      .all(event.id, wrapper.host.id, ...keys) as { id: string; session_id: string }[];
+    for (const entry of accepted) {
+      if (retire(entry.id, { id: event.id, acknowledged: false })) publish(entry.session_id);
+    }
+    return;
+  }
   if (event.type !== "process_exit") return;
   const preparing = outbox().preparing;
   for (const key of sessionKeys(wrapper.sessionId)) {
@@ -652,6 +720,14 @@ async function deliver(entry: Row): Promise<Outcome> {
   }
   const replacement = wrapper.watchMessageReplacement(command, baseline.data?.queuedMessages, priorWrapper === wrapper ? generation : 0, competingPending, previousEntryIds);
   publish(sessionId);
+  // A new add can dispatch while startup storage recovery is still pending: correlation cannot wait for its hooks.
+  let nativeId: string | undefined;
+  const detachNativeCommand = tapNativeMessageCommands((actual, event) => {
+    if (event.type === "dispatch" && event.command === command) {
+      onNativeCommand(actual, event, current.id);
+      nativeId = event.id;
+    } else if (event.type === "reply" && event.id === nativeId && !outbox().started) onNativeCommand(actual, event);
+  });
   try {
     // attachUploads mutates this same command before writing it: the watcher matches the final attachment block too.
     const response = await runAgentCommand(sessionId, command, current.advisor === 1, current.owner, uploadReceipts);
@@ -662,9 +738,10 @@ async function deliver(entry: Row): Promise<Outcome> {
       return refused(current, response, written);
     }
     const body = await response.json() as { data?: { agentInvoked?: boolean } };
-    if (row(current.id)?.state === "failed") return "next";
+    const state = row(current.id)?.state;
+    if (state === "failed" || state === "delivered") return "next";
     const handOff = body.data?.agentInvoked === false ? {} : await replacement.handOff();
-    // Proven dropped (spec O6) leaves the child untainted, like a delivery: no renewal before the next message.
+    // Proven drops leave the inference window untainted. Native acceptance alone cannot attribute older echoes.
     if (!handOff.error || handOff.mayHaveBeenSent === false) wrapper.confirmMessageCommandGeneration((priorWrapper === wrapper ? generation : 0) + 1);
     if (handOff.error) return fail(current, handOff.error, handOff.mayHaveBeenSent === true);
     retire(current.id);
@@ -673,6 +750,7 @@ async function deliver(entry: Row): Promise<Outcome> {
   } finally {
     preparing.delete(current.id);
     replacement.stop();
+    detachNativeCommand();
   }
 }
 
@@ -688,7 +766,10 @@ function commandOf(entry: Row, running: boolean): { type: string; streamingBehav
 
 
 function fail(entry: Row, error: string, mayHaveBeenSent: boolean): Outcome {
-  if (setState(entry.id, "failed", error, mayHaveBeenSent)) publish(entry.session_id);
+  // Replacement inference may be ambiguous (hooks rewrite input, echoes are lost, or a peer also writes).
+  // That cannot negate THIS command's successful native response. Definite pre-delivery drops still fail.
+  if (mayHaveBeenSent && retireAcknowledged(entry.id)) publish(entry.session_id);
+  else if (setState(entry.id, "failed", error, mayHaveBeenSent)) publish(entry.session_id);
   return "next";
 }
 
@@ -711,8 +792,15 @@ function retry(entry: Row): Outcome {
 async function refused(entry: Row, response: Response, sent: boolean): Promise<Outcome> {
   const body = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; hostOffline?: unknown; delivery?: unknown };
   const current = row(entry.id);
-  if (!current || current.state === "delivered" || current.state === "failed") return "next";
+  if (!current || current.state === "delivered") return "next";
   const error = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+  if (current.state === "failed") {
+    if (current.native_acknowledged === -1) {
+      db().prepare("UPDATE entries SET error = ?, may_have_been_sent = 0 WHERE id = ? AND state = 'failed' AND native_acknowledged = -1").run(error.slice(0, 1024), entry.id);
+      publish(current.session_id);
+    }
+    return "next";
+  }
   // Nothing reached omp: the session's entries wait for the host's next hello.
   if (body.hostOffline === true && (!sent || body.delivery === "refused")) return "offline";
   if (body.code === "session_busy" || body.code === "session_restarting"
